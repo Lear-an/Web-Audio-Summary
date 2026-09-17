@@ -30,7 +30,7 @@ tests/      JavaScript·Python 테스트
 - 로컬 액세스 토큰 생성
 - 서버 실행
 
-처음 설치할 때는 API 호출 없이 UI 흐름을 확인할 수 있도록 `MOCK_GEMINI=true`로 설정됩니다. 실제 Gemini를 사용하려면 `server/.env`에서 `MOCK_GEMINI=false`로 변경한 뒤 서버를 다시 실행하고, 캡처 시작 시 사이드패널에 Gemini API 키를 입력하세요.
+처음 설치할 때부터 실제 Gemini 호출을 사용하도록 `MOCK_GEMINI=false`로 설정됩니다. 캡처 시작 시 사이드패널에 Gemini API 키를 입력하세요. API 호출 없이 UI 흐름만 확인하려면 `server/.env`에서 `MOCK_GEMINI=true`로 변경한 뒤 서버를 다시 실행합니다.
 
 설치만 하고 서버를 시작하지 않으려면 명령 프롬프트에서 다음과 같이 실행합니다.
 

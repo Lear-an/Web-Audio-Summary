@@ -65,14 +65,13 @@ if not exist "%ENV_FILE%" (
         goto :failed
     )
 
-    "%VENV_PYTHON%" -c "from pathlib import Path; import secrets; p=Path(r'%ENV_FILE%'); s=p.read_text(encoding='utf-8'); s=s.replace('LOCAL_ACCESS_TOKEN=', 'LOCAL_ACCESS_TOKEN='+secrets.token_urlsafe(24), 1); s=s.replace('MOCK_GEMINI=false', 'MOCK_GEMINI=true', 1); p.write_text(s, encoding='utf-8')"
+    "%VENV_PYTHON%" -c "from pathlib import Path; import secrets; p=Path(r'%ENV_FILE%'); s=p.read_text(encoding='utf-8'); s=s.replace('LOCAL_ACCESS_TOKEN=', 'LOCAL_ACCESS_TOKEN='+secrets.token_urlsafe(24), 1); p.write_text(s, encoding='utf-8')"
     if errorlevel 1 (
         echo [ERROR] Failed to write the initial server configuration.
         goto :failed
     )
 
-    echo       First-time setup uses MOCK_GEMINI=true.
-    echo       For real Gemini calls, change MOCK_GEMINI to false.
+    echo       First-time setup uses MOCK_GEMINI=false.
     echo       Enter the Gemini API key in the extension side panel.
 ) else (
     echo [3/4] Keeping the existing server\.env configuration.
