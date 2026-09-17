@@ -8,7 +8,7 @@
   const SOFT_LIMIT = 8 * 1024 * 1024;
   const HARD_LIMIT = 10 * 1024 * 1024;
   const RESUME_LIMIT = 6 * 1024 * 1024;
-  const REQUEST_TIMEOUT_MS = 30_000;
+  const REQUEST_TIMEOUT_MS = 45_000;
   const MAX_ATTEMPTS = 3;
   const SUMMARY_INTERVAL_MS = 90_000;
   const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm"];
@@ -180,8 +180,8 @@
     if (!["127.0.0.1", "localhost"].includes(url.hostname)) {
       throw new Error("로컬 서버는 127.0.0.1 또는 localhost만 사용할 수 있습니다.");
     }
-    if ((url.port || "80") !== "8000") {
-      throw new Error("현재 Manifest가 허용한 로컬 서버 포트는 8000입니다.");
+    if ((url.port || "80") !== "8050") {
+      throw new Error("현재 Manifest가 허용한 로컬 서버 포트는 8050입니다.");
     }
     return url.origin;
   }
@@ -670,7 +670,7 @@
     session.state = SESSION_STATE.STARTING;
     session.sourceTabId = Number(payload.sourceTabId);
     session.sourceUrl = String(payload.sourceUrl || "");
-    session.serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl || "http://127.0.0.1:8000");
+    session.serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl || "http://127.0.0.1:8050");
     session.accessToken = String(payload.accessToken || "").trim();
     let geminiApiKey = String(payload.geminiApiKey || "").trim();
     payload.geminiApiKey = "";

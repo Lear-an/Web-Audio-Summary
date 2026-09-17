@@ -338,7 +338,7 @@ OpenAI 429
 ┌──────────────────────────────────┐
 │ Lecture Memo                     │
 ├──────────────────────────────────┤
-│ 서버: http://127.0.0.1:8000      │
+│ 서버: http://127.0.0.1:8050      │
 │ 로컬 액세스 토큰 [••••••••]      │
 │ OpenAI API 키     [sk-••••••]     │
 │ [캡처 시작]                       │
@@ -464,4 +464,3 @@ API 키와 결제 정보는 반환하지 않습니다.
 - GPT Live Transcribe: https://developers.openai.com/api/docs/models/gpt-live-transcribe
 - Audio API: https://developers.openai.com/api/reference/typescript/resources/audio
 - Project rate limits: https://developers.openai.com/api/reference/typescript/resources/admin/subresources/organization/subresources/projects
-

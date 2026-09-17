@@ -20,7 +20,8 @@ tests/      JavaScript·Python 테스트
 
 프로젝트 폴더의 `setup-and-run-server.cmd`를 더블클릭하면 다음 작업을 한 번에 처리합니다.
 
-- Python 설치 여부 확인
+- Python 3.11 이상 설치 여부 확인
+- Python이 없으면 `winget`으로 Python 3.11 자동 설치
 - `.venv` 가상환경 생성
 - 서버 의존성 설치 및 업데이트
 - `server/.env` 초기 설정 생성
@@ -34,6 +35,8 @@ tests/      JavaScript·Python 테스트
 ```bat
 .\setup-and-run-server.cmd --install-only
 ```
+
+Python이 설치되어 있지 않은 경우에는 Windows 10 버전 1809 이상 또는 Windows 11에서 `App Installer`와 인터넷 연결이 필요합니다. `winget`을 사용할 수 없는 환경에서는 Python을 먼저 수동 설치해야 합니다.
 
 설치 상태만 확인할 수도 있습니다.
 
@@ -139,7 +142,7 @@ Get-ChildItem extension\*.js | ForEach-Object { node --check $_.FullName }
 
 ## 보안과 제한사항
 
-- 서버는 `127.0.0.1:8000`에만 바인딩합니다.
+- 서버는 `127.0.0.1:8050`에만 바인딩합니다.
 - Gemini API 키는 `.env`나 Chrome 저장소에 기록하지 않으며 API 키, 액세스 토큰, 오디오와 자막 본문을 서버 로그에 기록하지 않습니다.
 - 오디오는 Gemini API로 전송되므로 외부 전송 사실을 사용자에게 고지해야 합니다.
 - DRM, 교차 출처 iframe, Chrome 내부 페이지의 접근 제한을 우회하지 않습니다.
