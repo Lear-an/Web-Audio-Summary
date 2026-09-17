@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="840" viewBox="0 0 1200 840">
+  <defs>
+    <radialGradient id="bg" cx="18%" cy="8%" r="95%">
+      <stop offset="0" stop-color="#16265a"/><stop offset="0.42" stop-color="#0a1021"/><stop offset="1" stop-color="#070b16"/>
+    </radialGradient>
+    <linearGradient id="video" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#151f35"/><stop offset="1" stop-color="#080d18"/>
+    </linearGradient>
+    <filter id="shadow"><feDropShadow dx="0" dy="16" stdDeviation="18" flood-opacity=".4"/></filter>
+    <style>
+      text{font-family:"Malgun Gothic","Noto Sans KR",Arial,sans-serif}.muted{fill:#8995ad}.label{fill:#8ea2ff;font-size:10px;letter-spacing:2px}.tiny{font-size:10px}.small{font-size:11px}.body{font-size:13px}.white{fill:#f4f6ff}.border{stroke:#293654;stroke-width:1}.panel{fill:#11192d}.btn{fill:#182038;stroke:#34405f}.caption{fill:#e8ecf8;font-size:13px}
+    </style>
+  </defs>
+  <rect width="1200" height="840" fill="url(#bg)"/>
+  <text x="28" y="32" class="label">IMPLEMENTED UI PREVIEW</text>
+  <text x="28" y="61" class="white" font-size="24" font-weight="700">Lecture Memo</text>
+  <text x="28" y="84" class="muted body">왼쪽은 Chrome 사이드패널, 오른쪽은 강의 화면의 자막 오버레이 예시입니다.</text>
+
+  <!-- Chrome side panel -->
+  <g transform="translate(28 108)" filter="url(#shadow)">
+    <rect width="378" height="704" rx="18" fill="#0b1020" stroke="#344263"/>
+    <text x="18" y="30" class="label">LECTURE MEMO</text>
+    <text x="18" y="54" class="white" font-size="19" font-weight="700">강의 자막 노트</text>
+    <rect x="305" y="23" width="55" height="25" rx="13" fill="none" stroke="#5ee0a0"/>
+    <circle cx="318" cy="35.5" r="3" fill="#5ee0a0"/><text x="327" y="40" fill="#5ee0a0" class="small">캡처 중</text>
+
+    <rect x="12" y="70" width="354" height="185" rx="13" fill="#11192d" stroke="#26314d"/>
+    <text x="26" y="94" class="white body" font-weight="700">로컬 서버</text>
+    <text x="26" y="116" fill="#aeb8ce" class="small">주소</text>
+    <rect x="26" y="124" width="326" height="35" rx="9" fill="#0e1528" stroke="#303b59"/>
+    <text x="37" y="146" class="muted small">http://127.0.0.1:8000</text>
+    <text x="26" y="178" fill="#aeb8ce" class="small">액세스 토큰</text>
+    <rect x="26" y="186" width="326" height="35" rx="9" fill="#0e1528" stroke="#303b59"/>
+    <text x="37" y="208" class="muted small">•••••••••••••</text>
+    <rect x="26" y="229" width="157" height="33" rx="9" fill="#4968f2" opacity=".45"/>
+    <rect x="195" y="229" width="157" height="33" rx="9" fill="#4a2430" stroke="#8f3f51"/>
+    <text x="82" y="250" fill="#c6cce0" class="small">캡처 시작</text><text x="248" y="250" class="white small">캡처 종료</text>
+    <text x="26" y="279" fill="#ffbd66" class="small">캡처 중 · 청크 18을 처리하고 있습니다.</text>
+
+    <!-- metrics -->
+    <g transform="translate(12 291)">
+      <rect width="172" height="54" rx="11" class="panel border"/><rect x="182" width="172" height="54" rx="11" class="panel border"/>
+      <rect y="62" width="172" height="54" rx="11" class="panel border"/><rect x="182" y="62" width="172" height="54" rx="11" class="panel border"/>
+      <text x="12" y="19" class="muted tiny">경과</text><text x="12" y="40" class="white" font-size="14" font-weight="700">02:48</text>
+      <text x="194" y="19" class="muted tiny">큐</text><text x="194" y="40" class="white" font-size="14" font-weight="700">176.4 KB</text>
+      <text x="12" y="81" class="muted tiny">청크</text><text x="12" y="102" class="white" font-size="14" font-weight="700">18</text>
+      <text x="194" y="81" class="muted tiny">최근 처리</text><text x="194" y="102" class="white" font-size="14" font-weight="700">3.7초</text>
+    </g>
+
+    <!-- tabs and captions -->
+    <rect x="12" y="422" width="112" height="34" rx="9" fill="#1b2540" stroke="#344263"/>
+    <text x="54" y="444" class="white small">자막</text><text x="179" y="444" class="muted small">노트</text><text x="290" y="444" class="muted small">북마크</text>
+    <rect x="12" y="466" width="274" height="35" rx="9" fill="#0e1528" stroke="#303b59"/>
+    <text x="23" y="488" class="white small">정규화</text><rect x="294" y="466" width="72" height="35" rx="9" class="btn"/><text x="318" y="488" class="white small">복사</text>
+    <g transform="translate(16 515)">
+      <text x="0" y="14" fill="#8ea2ff" class="small">02:18</text><rect x="49" y="0" width="42" height="19" rx="2" fill="#7f661c"/><text x="53" y="14" class="white body">정규화</text><text x="94" y="14" class="caption">는 데이터 중복을 줄이는</text><text x="49" y="34" class="caption">과정입니다.</text>
+      <line x1="0" y1="46" x2="346" y2="46" stroke="#202a43"/>
+      <text x="0" y="68" fill="#8ea2ff" class="small">02:24</text><text x="49" y="68" class="caption">테이블을 역할에 따라 분리하고</text><text x="49" y="88" class="caption">관계를 정의합니다.</text>
+      <line x1="0" y1="100" x2="346" y2="100" stroke="#202a43"/>
+      <text x="0" y="122" fill="#8ea2ff" class="small">02:31</text><text x="49" y="122" class="caption">기본키는 각 행을 고유하게 식별해야 합니다.</text>
+    </g>
+    <line x1="0" y1="658" x2="378" y2="658" stroke="#27314a"/>
+    <text x="14" y="686" class="muted small">내보내기</text>
+    <g transform="translate(196 669)"><rect width="38" height="25" rx="7" class="btn"/><rect x="43" width="38" height="25" rx="7" class="btn"/><rect x="86" width="38" height="25" rx="7" class="btn"/><rect x="129" width="38" height="25" rx="7" class="btn"/><text x="10" y="17" class="white tiny">MD</text><text x="53" y="17" class="white tiny">TXT</text><text x="95" y="17" class="white tiny">SRT</text><text x="138" y="17" class="white tiny">VTT</text></g>
+  </g>
+
+  <!-- lecture video -->
+  <g transform="translate(426 108)" filter="url(#shadow)">
+    <rect width="746" height="704" rx="18" fill="url(#video)" stroke="#273149"/>
+    <rect x="16" y="15" width="154" height="27" rx="14" fill="#0a101f" opacity=".9"/><text x="28" y="33" fill="#8ea2ff" class="small">강의 화면 · 02:42 / 38:10</text>
+    <rect x="89" y="117" width="568" height="350" rx="10" fill="#f5f7fb" stroke="#334160"/>
+    <text x="133" y="164" fill="#52658e" font-size="11" font-weight="700" letter-spacing="2">DATABASE DESIGN</text>
+    <text x="133" y="207" fill="#182038" font-size="30" font-weight="700">제2정규형으로 분해하기</text>
+    <rect x="133" y="249" width="204" height="130" rx="8" fill="#e9edfa" stroke="#cbd5f2"/>
+    <text x="151" y="278" fill="#334b96" font-size="14" font-weight="700">수강 테이블</text>
+    <text x="151" y="306" fill="#536078" class="small">학번 · 과목코드</text><text x="151" y="330" fill="#536078" class="small">학생명 · 과목명</text><text x="151" y="354" fill="#536078" class="small">담당교수</text>
+    <text x="362" y="320" fill="#4968f2" font-size="30">→</text>
+    <rect x="407" y="249" width="204" height="130" rx="8" fill="#e9edfa" stroke="#cbd5f2"/>
+    <text x="425" y="278" fill="#334b96" font-size="14" font-weight="700">역할별 분리</text>
+    <text x="425" y="306" fill="#536078" class="small">학생 테이블</text><text x="425" y="330" fill="#536078" class="small">과목 테이블</text><text x="425" y="354" fill="#536078" class="small">수강 관계</text>
+    <!-- overlay -->
+    <rect x="81" y="512" width="584" height="135" rx="14" fill="#070b15" fill-opacity=".93" stroke="#5a6070"/>
+    <rect x="81" y="512" width="584" height="34" rx="14" fill="#111a31"/><rect x="81" y="532" width="584" height="14" fill="#111a31"/>
+    <text x="94" y="534" fill="#aebaf0" class="tiny">CAPTURING · LECTURE MEMO</text>
+    <rect x="560" y="520" width="24" height="18" rx="5" fill="#263352"/><rect x="589" y="520" width="24" height="18" rx="5" fill="#263352"/><rect x="618" y="520" width="36" height="18" rx="5" fill="#263352"/>
+    <text x="568" y="533" class="white small">−</text><text x="596" y="533" class="white small">＋</text><text x="624" y="533" class="white tiny">숨김</text>
+    <text x="373" y="584" class="white" text-anchor="middle" font-size="19" font-weight="700">기본키는 각 행을 고유하게 식별해야 합니다.</text>
+    <text x="373" y="618" class="white" text-anchor="middle" font-size="19" font-weight="700">이제 제2정규형의 조건을 살펴보겠습니다.</text>
+  </g>
+</svg>

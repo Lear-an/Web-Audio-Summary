@@ -1,0 +1,9 @@
+#lecture-memo-overlay-host {
+  position: fixed !important;
+  left: 50% !important;
+  bottom: 8% !important;
+  z-index: 2147483647 !important;
+  transform: translateX(-50%);
+  width: min(900px, 88vw) !important;
+  pointer-events: none !important;
+}

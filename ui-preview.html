@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lecture Memo UI Preview</title>
+    <link rel="stylesheet" href="extension/sidepanel.css">
+    <style>
+      body.preview-page {
+        min-width: 0;
+        min-height: 100vh;
+        padding: 28px;
+        background:
+          radial-gradient(circle at 18% 12%, rgba(73,104,242,.2), transparent 28%),
+          radial-gradient(circle at 85% 85%, rgba(94,224,160,.12), transparent 30%),
+          #070b16;
+      }
+      .preview-title { width: min(1160px, 100%); margin: 0 auto 16px; }
+      .preview-title h1 { font-size: 24px; }
+      .preview-title p { margin: 7px 0 0; color: #8995ad; font-size: 13px; }
+      .preview-layout {
+        display: grid;
+        grid-template-columns: 380px minmax(520px, 1fr);
+        gap: 20px;
+        width: min(1160px, 100%);
+        margin: 0 auto;
+      }
+      .sidepanel-preview {
+        height: 790px;
+        overflow: hidden;
+        border: 1px solid #2f3a56;
+        border-radius: 18px;
+        background: #0b1020;
+        box-shadow: 0 24px 80px rgba(0,0,0,.42);
+      }
+      .sidepanel-preview .caption-list { max-height: 310px; }
+      .sidepanel-preview footer { position: static; margin-top: 8px; }
+      .lecture-preview {
+        position: relative;
+        display: grid;
+        place-items: center;
+        min-height: 640px;
+        overflow: hidden;
+        border: 1px solid #273149;
+        border-radius: 18px;
+        background: linear-gradient(145deg, #121a2d, #080d18 62%);
+        box-shadow: 0 24px 80px rgba(0,0,0,.35);
+      }
+      .video-badge {
+        position: absolute;
+        top: 15px;
+        left: 16px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: rgba(10,16,31,.8);
+        color: #8ea2ff;
+        font-size: 11px;
+      }
+      .lecture-slide {
+        width: 76%;
+        padding: 44px;
+        border: 1px solid #334160;
+        border-radius: 10px;
+        background: #f5f7fb;
+        color: #182038;
+        box-shadow: 0 18px 50px rgba(0,0,0,.28);
+      }
+      .lecture-slide small { color: #52658e; font-weight: 700; letter-spacing: .12em; }
+      .lecture-slide h2 { margin: 12px 0 28px; font-size: 30px; }
+      .schema { display: grid; grid-template-columns: 1fr auto 1fr; gap: 16px; align-items: center; }
+      .schema-box { padding: 18px; border-radius: 8px; background: #e9edfa; border: 1px solid #cbd5f2; }
+      .schema-box strong { display: block; margin-bottom: 8px; color: #334b96; }
+      .schema-box span { display: block; margin: 4px 0; font-size: 12px; color: #536078; }
+      .arrow { color: #4968f2; font-size: 26px; }
+      .overlay-preview {
+        position: absolute;
+        left: 50%;
+        bottom: 7%;
+        width: 78%;
+        transform: translateX(-50%);
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,.16);
+        border-radius: 14px;
+        background: rgba(7,11,21,.82);
+        color: white;
+        box-shadow: 0 12px 34px rgba(0,0,0,.38);
+        backdrop-filter: blur(8px);
+      }
+      .overlay-bar { display:flex; align-items:center; gap:8px; padding:6px 9px; background:rgba(13,20,38,.8); font-size:10px; color:#aebaf0; }
+      .overlay-bar span { flex: 1; }
+      .overlay-control { padding: 2px 7px; border-radius: 6px; background: #263352; color: white; }
+      .overlay-caption { padding: 12px 18px 15px; text-align: center; font-size: 20px; font-weight: 650; line-height: 1.5; text-shadow: 0 2px 4px black; }
+      @media (max-width: 920px) {
+        .preview-layout { grid-template-columns: 1fr; }
+        .sidepanel-preview { width: min(420px, 100%); margin: 0 auto; }
+        .lecture-preview { min-height: 520px; }
+      }
+    </style>
+  </head>
+  <body class="preview-page">
+    <div class="preview-title">
+      <p class="eyebrow">IMPLEMENTED UI PREVIEW</p>
+      <h1>Lecture Memo</h1>
+      <p>왼쪽은 Chrome 사이드패널, 오른쪽은 강의 화면의 자막 오버레이 예시입니다.</p>
+    </div>
+    <div class="preview-layout">
+      <aside class="sidepanel-preview">
+        <header class="app-header">
+          <div><p class="eyebrow">LECTURE MEMO</p><h1>강의 자막 노트</h1></div>
+          <span class="status status-capturing">캡처 중</span>
+        </header>
+        <section class="connection-card">
+          <h2>로컬 서버</h2>
+          <label>주소<input value="http://127.0.0.1:8000" disabled></label>
+          <label>액세스 토큰<input type="password" value="preview-token" disabled></label>
+          <label>Gemini API 키<input type="password" value="gemini-session-key" disabled></label>
+          <div class="button-row"><button class="primary" disabled>캡처 시작</button><button class="danger">캡처 종료</button></div>
+          <p class="message">캡처 중 · 청크 18을 처리하고 있습니다.</p>
+        </section>
+        <section class="metrics">
+          <article><span>경과</span><strong>02:48</strong></article>
+          <article><span>큐</span><strong>176.4 KB</strong></article>
+          <article><span>청크</span><strong>18</strong></article>
+          <article><span>최근 처리</span><strong>3.7초</strong></article>
+        </section>
+        <nav class="tabs"><button class="tab active">자막</button><button class="tab">노트</button><button class="tab">북마크</button></nav>
+        <main>
+          <section class="panel active">
+            <div class="toolbar"><input value="정규화" aria-label="자막 검색"><button>복사</button></div>
+            <div class="caption-list">
+              <article class="caption-row"><button class="timestamp">02:18</button><div class="caption-text"><mark>정규화</mark>는 데이터 중복을 줄이는 과정입니다.</div><span></span></article>
+              <article class="caption-row"><button class="timestamp">02:24</button><div class="caption-text">테이블을 역할에 따라 분리하고 관계를 정의합니다.</div><span></span></article>
+              <article class="caption-row"><button class="timestamp">02:31</button><div class="caption-text">기본키는 각 행을 고유하게 식별해야 합니다.</div><span></span></article>
+              <article class="caption-row provisional"><button class="timestamp">02:40</button><div class="caption-text">이제 제2정규형의 조건을 살펴보겠습니다.</div><span class="empty-state">임시</span></article>
+            </div>
+          </section>
+        </main>
+        <footer><span>내보내기</span><div class="export-buttons"><button>MD</button><button>TXT</button><button>SRT</button><button>VTT</button></div></footer>
+      </aside>
+      <section class="lecture-preview">
+        <div class="video-badge">강의 화면 · 02:42 / 38:10</div>
+        <div class="lecture-slide">
+          <small>DATABASE DESIGN</small>
+          <h2>제2정규형으로 분해하기</h2>
+          <div class="schema">
+            <div class="schema-box"><strong>수강 테이블</strong><span>학번 · 과목코드</span><span>학생명 · 과목명</span><span>담당교수</span></div>
+            <div class="arrow">→</div>
+            <div class="schema-box"><strong>역할별 분리</strong><span>학생 테이블</span><span>과목 테이블</span><span>수강 관계</span></div>
+          </div>
+        </div>
+        <div class="overlay-preview">
+          <div class="overlay-bar"><span>CAPTURING · LECTURE MEMO</span><b class="overlay-control">−</b><b class="overlay-control">＋</b><b class="overlay-control">숨김</b></div>
+          <div class="overlay-caption">기본키는 각 행을 고유하게 식별해야 합니다.<br>이제 제2정규형의 조건을 살펴보겠습니다.</div>
+        </div>
+      </section>
+    </div>
+  </body>
+</html>

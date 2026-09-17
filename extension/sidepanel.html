@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Lecture Memo</title>
+    <link rel="stylesheet" href="sidepanel.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <p class="eyebrow">LECTURE MEMO</p>
+        <h1>강의 자막 노트</h1>
+      </div>
+      <span id="statusBadge" class="status status-idle">대기</span>
+    </header>
+
+    <section class="connection-card" aria-labelledby="connectionTitle">
+      <h2 id="connectionTitle">로컬 서버</h2>
+      <label>
+        주소
+        <input id="serverUrl" type="url" value="http://127.0.0.1:8000" autocomplete="off">
+      </label>
+      <label>
+        액세스 토큰
+        <input id="accessToken" type="password" placeholder="서버 실행 화면의 토큰" autocomplete="off">
+      </label>
+      <label>
+        Gemini API 키
+        <input
+          id="geminiApiKey"
+          type="password"
+          placeholder="캡처 시작 시에만 사용"
+          autocomplete="off"
+          spellcheck="false"
+        >
+      </label>
+      <div class="button-row">
+        <button id="startButton" class="primary" type="button">캡처 시작</button>
+        <button id="stopButton" class="danger" type="button" disabled>캡처 종료</button>
+      </div>
+      <p id="connectionMessage" class="message" aria-live="polite"></p>
+    </section>
+
+    <section class="metrics" aria-label="세션 상태">
+      <article><span>경과</span><strong id="elapsedValue">00:00</strong></article>
+      <article><span>큐</span><strong id="queueValue">0 KB</strong></article>
+      <article><span>청크</span><strong id="sequenceValue">0</strong></article>
+      <article><span>최근 처리</span><strong id="latencyValue">-</strong></article>
+    </section>
+
+    <nav class="tabs" aria-label="화면 선택">
+      <button class="tab active" type="button" data-tab="captions">자막</button>
+      <button class="tab" type="button" data-tab="notes">노트</button>
+      <button class="tab" type="button" data-tab="bookmarks">북마크</button>
+    </nav>
+
+    <main>
+      <section id="captionsPanel" class="panel active">
+        <div class="toolbar">
+          <input id="searchInput" type="search" placeholder="자막 검색">
+          <button id="copyButton" type="button">복사</button>
+        </div>
+        <div id="captionsList" class="caption-list" aria-live="polite"></div>
+      </section>
+
+      <section id="notesPanel" class="panel">
+        <article class="note-card">
+          <h2>3줄 요약</h2>
+          <div id="summaryText" class="preserve-lines empty-state">요약이 아직 없습니다.</div>
+        </article>
+        <article class="note-card">
+          <h2>주요 개념</h2>
+          <ul id="conceptsList"></ul>
+        </article>
+        <article class="note-card">
+          <h2>전문 용어</h2>
+          <ul id="termsList"></ul>
+        </article>
+        <article class="note-card">
+          <h2>강사가 강조한 내용</h2>
+          <ul id="highlightsList"></ul>
+        </article>
+        <article class="note-card">
+          <h2>복습 체크리스트</h2>
+          <ul id="checklistList"></ul>
+        </article>
+      </section>
+
+      <section id="bookmarksPanel" class="panel">
+        <div class="bookmark-form">
+          <input id="bookmarkMemo" type="text" maxlength="200" placeholder="현재 시점에 남길 메모">
+          <button id="bookmarkButton" type="button">현재 위치 저장</button>
+        </div>
+        <div id="bookmarksList" class="bookmark-list"></div>
+      </section>
+    </main>
+
+    <footer>
+      <span>내보내기</span>
+      <div class="export-buttons">
+        <button type="button" data-export="md">MD</button>
+        <button type="button" data-export="txt">TXT</button>
+        <button type="button" data-export="srt">SRT</button>
+        <button type="button" data-export="vtt">VTT</button>
+      </div>
+    </footer>
+
+    <script src="protocol.js"></script>
+    <script src="core.js"></script>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>

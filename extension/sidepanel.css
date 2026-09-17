@@ -1,0 +1,160 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, Pretendard, "Noto Sans KR", system-ui, sans-serif;
+  background: #0b1020;
+  color: #e8ecf8;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  background:
+    radial-gradient(circle at 80% 0%, rgba(81, 113, 255, 0.2), transparent 35%),
+    #0b1020;
+}
+
+button, input { font: inherit; }
+
+button {
+  border: 1px solid #34405f;
+  border-radius: 9px;
+  padding: 8px 11px;
+  background: #182038;
+  color: #e8ecf8;
+  cursor: pointer;
+}
+
+button:hover:not(:disabled) { background: #222d4c; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
+
+input {
+  width: 100%;
+  border: 1px solid #303b59;
+  border-radius: 9px;
+  padding: 9px 10px;
+  background: #0e1528;
+  color: #f4f6ff;
+  outline: none;
+}
+
+input:focus { border-color: #6683ff; box-shadow: 0 0 0 2px rgba(102, 131, 255, 0.2); }
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 16px 12px;
+}
+
+.eyebrow { margin: 0 0 3px; color: #8ea2ff; font-size: 10px; letter-spacing: 0.16em; }
+h1 { margin: 0; font-size: 19px; }
+h2 { margin: 0 0 10px; font-size: 14px; }
+
+.status {
+  border-radius: 999px;
+  padding: 5px 9px;
+  font-size: 11px;
+  border: 1px solid currentColor;
+}
+
+.status-idle, .status-stopped { color: #9ba6bd; }
+.status-starting { color: #ffd166; }
+.status-capturing { color: #5ee0a0; }
+.status-paused { color: #ffb15c; }
+.status-error { color: #ff7383; }
+
+.connection-card, .note-card {
+  margin: 0 12px 12px;
+  padding: 13px;
+  border: 1px solid #26314d;
+  border-radius: 13px;
+  background: rgba(17, 25, 45, 0.88);
+}
+
+label { display: block; margin-bottom: 9px; color: #aeb8ce; font-size: 11px; }
+label input { margin-top: 5px; }
+.button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.primary { border-color: #5b78ff; background: #4968f2; }
+.danger { border-color: #8f3f51; background: #4a2430; }
+.message { min-height: 16px; margin: 9px 0 0; color: #ffbd66; font-size: 11px; line-height: 1.4; }
+
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+  padding: 0 12px 12px;
+}
+
+.metrics article {
+  padding: 10px;
+  border: 1px solid #25304b;
+  border-radius: 11px;
+  background: #11192d;
+}
+
+.metrics span { display: block; color: #8995ad; font-size: 10px; }
+.metrics strong { display: block; margin-top: 3px; font-size: 14px; }
+
+.tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 5px;
+  padding: 0 12px 10px;
+}
+
+.tab { border-color: transparent; background: transparent; color: #8f9ab1; }
+.tab.active { background: #1b2540; color: #f6f7ff; border-color: #344263; }
+
+.panel { display: none; padding: 0 12px 12px; }
+.panel.active { display: block; }
+.toolbar { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-bottom: 8px; }
+
+.caption-list, .bookmark-list {
+  min-height: 180px;
+  max-height: calc(100vh - 410px);
+  overflow: auto;
+}
+
+.caption-row, .bookmark-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 9px;
+  align-items: start;
+  padding: 9px 4px;
+  border-bottom: 1px solid #202a43;
+}
+
+.caption-row.provisional { opacity: 0.62; }
+.timestamp { padding: 0; border: 0; background: transparent; color: #8ea2ff; font-size: 11px; }
+.caption-text { line-height: 1.5; font-size: 13px; overflow-wrap: anywhere; }
+.uncertain { color: #ffd166; }
+mark { border-radius: 2px; background: #7f661c; color: #fff; }
+
+.note-card { margin-left: 0; margin-right: 0; }
+.note-card ul { margin: 0; padding-left: 18px; color: #cdd4e6; }
+.note-card li { margin: 6px 0; line-height: 1.4; }
+.preserve-lines { white-space: pre-line; line-height: 1.55; }
+.empty-state { color: #7f8aa1; font-size: 12px; }
+
+.bookmark-form { display: grid; gap: 7px; margin-bottom: 8px; }
+.bookmark-row { grid-template-columns: auto 1fr auto; }
+.delete-button { padding: 2px 6px; border: 0; background: transparent; color: #ff8290; }
+
+footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-top: 1px solid #27314a;
+  background: rgba(11, 16, 32, 0.95);
+  color: #8995ad;
+  font-size: 11px;
+  backdrop-filter: blur(8px);
+}
+
+.export-buttons { display: flex; gap: 4px; }
+.export-buttons button { padding: 5px 7px; font-size: 10px; }

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Lecture Memo",
+  "version": "0.1.0",
+  "description": "재생 중인 강의의 자막과 학습 노트를 생성합니다.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "activeTab",
+    "tabCapture",
+    "offscreen",
+    "sidePanel",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "service_worker.js"
+  },
+  "action": {
+    "default_title": "Lecture Memo 열기"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}
