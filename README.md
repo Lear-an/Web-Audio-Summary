@@ -14,6 +14,8 @@ tests/      JavaScript·Python 테스트
 
 현재 구현 기준은 [chrome-lecture-caption-summary-design-v3.md](chrome-lecture-caption-summary-design-v3.md)를 참고하세요.
 
+처음 설치하고 사용하는 방법은 [사용 설명서](사용설명서.md)를 참고하세요.
+
 ## 1. 서버 설치
 
 ### Windows 자동 설치 및 실행
