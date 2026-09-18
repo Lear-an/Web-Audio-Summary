@@ -197,6 +197,18 @@
     return value === 408 || value === 425 || value >= 500;
   }
 
+  function isSessionResumeRequired(value) {
+    const state = String(value?.state || "");
+    const code = String(value?.code || value?.actionCode || "");
+    const detail = String(value?.detail || value?.message || "");
+    return (
+      state === "SESSION_RESUME_REQUIRED" ||
+      code === "session_resume_required" ||
+      detail.includes("session_resume_required") ||
+      detail.includes("서버 세션을 먼저 복구해 주세요.")
+    );
+  }
+
   function transientRetryDelayMs(attempt) {
     const schedule = [15_000, 30_000, 45_000];
     const safeAttempt = Math.max(1, Math.floor(Number(attempt) || 1));
@@ -220,6 +232,7 @@
     formatTimestamp,
     formatClock,
     isRetryableStatus,
+    isSessionResumeRequired,
     transientRetryDelayMs,
     queueDrainTimeoutMs
   });

@@ -68,18 +68,21 @@
     elements.statusBadge.className = `status ${className}`;
     const active = isRunning();
     const awaitingNewKey = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
-    elements.startButton.textContent = awaitingNewKey ? "새 키로 계속" : "캡처 시작";
-    elements.startButton.disabled = active && !awaitingNewKey;
+    const recoveringSession = Boolean(snapshot.recoveryRequired);
+    elements.startButton.textContent = recoveringSession
+      ? "서버 세션 복구"
+      : (awaitingNewKey ? "새 키로 계속" : "캡처 시작");
+    elements.startButton.disabled = active && !awaitingNewKey && !recoveringSession;
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
     elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active;
     elements.accessToken.disabled = active;
-    elements.geminiApiKey.disabled = active && !awaitingNewKey;
-    elements.geminiApiKey.placeholder = awaitingNewKey
-      ? "계속할 새 Gemini API 키"
-      : "캡처 시작 시에만 사용";
+    elements.geminiApiKey.disabled = active && !awaitingNewKey && !recoveringSession;
+    elements.geminiApiKey.placeholder = recoveringSession
+      ? "서버 복구에 사용할 Gemini API 키"
+      : (awaitingNewKey ? "계속할 새 Gemini API 키" : "캡처 시작 시에만 사용");
     elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
   }
 
@@ -323,6 +326,27 @@
     if (response.snapshot) render(response.snapshot);
   }
 
+  async function recoverSession() {
+    const geminiApiKey = elements.geminiApiKey.value.trim();
+    if (!geminiApiKey) {
+      elements.connectionMessage.textContent = "서버 세션 복구에 사용할 Gemini API 키를 입력해 주세요.";
+      elements.geminiApiKey.focus();
+      return;
+    }
+    const tabId = Number(snapshot.sourceTabId);
+    if (!Number.isInteger(tabId)) throw new Error("기존 캡처 탭을 찾을 수 없습니다.");
+    elements.startButton.disabled = true;
+    elements.connectionMessage.textContent = "서버 세션과 보존 청크를 복구하고 있습니다.";
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.RECOVER_SESSION,
+      payload: { tabId, geminiApiKey }
+    });
+    elements.geminiApiKey.value = "";
+    if (response?.snapshot) render(response.snapshot);
+    if (!response?.ok) throw new Error(response?.error || "서버 세션을 복구하지 못했습니다.");
+  }
+
   async function addBookmark() {
     if (!Number.isInteger(Number(snapshot.sourceTabId))) {
       throw new Error("활성 캡처 세션이 없습니다.");
@@ -437,9 +461,9 @@
   }
 
   elements.startButton.addEventListener("click", () => {
-    const action = snapshot.state === SESSION_STATE.PAUSED_QUOTA
-      ? continueWithNewKey
-      : startCapture;
+    const action = snapshot.recoveryRequired
+      ? recoverSession
+      : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? continueWithNewKey : startCapture);
     action().catch((error) => {
       elements.connectionMessage.textContent = error.message;
       elements.startButton.disabled = false;

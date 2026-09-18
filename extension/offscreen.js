@@ -55,6 +55,7 @@
       inFlightChunk: null,
       processing: false,
       processTimer: null,
+      recoveryRequired: false,
       captions: [],
       bookmarks: [],
       gaps: [],
@@ -134,6 +135,7 @@
       queueBytes: audioBytes(),
       estimatedQueueBytes: Math.round(audioBytes() * 1.5),
       queueCount: session.queue.length + (session.processing ? 1 : 0),
+      recoveryRequired: Boolean(session.recoveryRequired),
       activeRecorderCount: session.activeRecorders.size,
       captions: sortedCaptions,
       bookmarks: [...session.bookmarks],
@@ -307,7 +309,10 @@
     const payload = await assertResponse(response);
     session.serverSessionId = sessionId;
     session.captions = Array.isArray(payload?.segments) ? payload.segments : [];
-    session.nextSequence = Math.max(0, Number(payload?.next_sequence) || 0);
+    session.nextSequence = Math.max(
+      Number(session.nextSequence) || 0,
+      Math.max(0, Number(payload?.next_sequence) || 0)
+    );
   }
 
   async function restoreRecoverableOutbox(geminiApiKey) {
@@ -342,7 +347,11 @@
       ...records.filter((record) => record.kind !== "session").map((record) => Number(record.sequence) + 1)
     );
     session.notice = `보존된 세션과 청크 ${pending.length}개를 복구했습니다.`;
-    if (pending.some((record) => record.state === "NEEDS_ACTION")) {
+    session.recoveryRequired = pending.some((record) => Core.isSessionResumeRequired(record));
+    if (session.recoveryRequired) {
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = "서버 세션이 초기화되었습니다. Gemini API 키를 입력하고 '서버 세션 복구'를 눌러 주세요.";
+    } else if (pending.some((record) => record.state === "NEEDS_ACTION")) {
       session.state = SESSION_STATE.PAUSED_ACTION;
       session.notice = "사용자 조치가 필요한 원본 청크가 보존되어 있습니다.";
     }
@@ -639,12 +648,18 @@
           ? "Gemini 할당량이 소진되어 원본 청크를 보존했습니다."
           : `청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
       } else {
+        const requiresSessionResume = error?.code === "session_resume_required";
         session.stats.failedChunks += 1;
-        await Outbox.updateState(chunk.id, "NEEDS_ACTION", serializeError(error));
-        chunk.state = "NEEDS_ACTION";
+        await Outbox.updateState(
+          chunk.id,
+          requiresSessionResume ? "SESSION_RESUME_REQUIRED" : "NEEDS_ACTION",
+          serializeError(error)
+        );
+        chunk.state = requiresSessionResume ? "SESSION_RESUME_REQUIRED" : "NEEDS_ACTION";
         session.queue.unshift(chunk);
         session.queuedBytes += chunk.blob.size;
         session.state = SESSION_STATE.PAUSED_ACTION;
+        session.recoveryRequired = requiresSessionResume;
         session.notice = `청크 ${chunk.sequence}을 원본 보존 상태로 전환했습니다: ${serializeError(error)}`;
         cancelWindowScheduler();
         openGap(error?.code || "chunk_needs_action");
@@ -688,6 +703,7 @@
 
   async function pauseForQuota() {
     if (session.state === SESSION_STATE.PAUSED_QUOTA) return;
+    session.recoveryRequired = false;
     session.state = SESSION_STATE.PAUSED_QUOTA;
     session.notice = "Gemini API 할당량이 소진되었습니다. 실패 청크를 보존했습니다. 새 API 키를 입력하고 '새 키로 계속'을 눌러 주세요.";
     cancelWindowScheduler();
@@ -843,6 +859,69 @@
     scheduleQueueProcessing(0);
     broadcastSnapshot();
     return { ok: true, snapshot: publicSnapshot() };
+  }
+
+  async function recoverSession(payload) {
+    if (session.state !== SESSION_STATE.PAUSED_ACTION || !session.recoveryRequired || !session.serverSessionId) {
+      throw new Error("복구가 필요한 서버 세션이 없습니다.");
+    }
+
+    let geminiApiKey = String(payload.geminiApiKey || "").trim();
+    payload.geminiApiKey = "";
+    if (!geminiApiKey) throw new Error("서버 세션 복구에 사용할 Gemini API 키를 입력해 주세요.");
+
+    const sourceTabId = Number(payload.sourceTabId);
+    if (!Number.isInteger(sourceTabId) || sourceTabId !== Number(session.sourceTabId)) {
+      throw new Error("기존 캡처 탭을 다시 선택해 주세요.");
+    }
+
+    session.notice = "서버 세션과 보존 청크를 복구하는 중입니다.";
+    broadcastSnapshot();
+
+    try {
+      await resumeServerSession(session.serverSessionId, geminiApiKey);
+      session.videoState = { ...session.videoState, ...(payload.videoState || {}) };
+
+      for (const chunk of session.queue) {
+        chunk.state = "PENDING";
+        chunk.detail = "";
+        await Outbox.updateState(chunk.id, "PENDING", "");
+      }
+
+      if (!session.stream) {
+        if (!payload.streamId) throw new Error("캡처 탭의 오디오 스트림을 다시 열지 못했습니다.");
+        await connectMediaStream(payload.streamId);
+        session.captureOriginPerf ||= performance.now();
+      }
+
+      await preserveSessionMarker("ACTIVE");
+      session.recoveryRequired = false;
+      closeGap();
+      if (audioBytes() >= HARD_LIMIT) {
+        session.state = SESSION_STATE.PAUSED_BACKPRESSURE;
+        session.notice = "서버 세션을 복구했습니다. 큐를 먼저 처리한 뒤 캡처를 재개합니다.";
+        openGap("memory_backpressure");
+      } else {
+        session.state = SESSION_STATE.CAPTURING;
+        session.notice = "서버 세션을 복구했습니다. 보존 청크부터 다시 처리합니다.";
+        if (!session.videoState?.hasVideo || !session.videoState.paused) scheduleRecordingWindows(true);
+      }
+      scheduleQueueProcessing(0);
+      broadcastSnapshot();
+      return { ok: true, snapshot: publicSnapshot() };
+    } catch (error) {
+      session.recoveryRequired = true;
+      if (error?.status === 429) {
+        await pauseForQuota();
+      } else {
+        session.state = SESSION_STATE.PAUSED_ACTION;
+        session.notice = `서버 세션 복구에 실패했습니다: ${serializeError(error)}`;
+        broadcastSnapshot();
+      }
+      return { ok: false, error: serializeError(error), snapshot: publicSnapshot() };
+    } finally {
+      geminiApiKey = "";
+    }
   }
 
   async function waitForQueueDrain(maxWaitMs = null) {
@@ -1116,6 +1195,8 @@
       switch (message.type) {
         case MESSAGE.START_SESSION:
           return startSession(message.payload || {});
+        case MESSAGE.RECOVER_SESSION:
+          return recoverSession(message.payload || {});
         case MESSAGE.UPDATE_GEMINI_KEY:
           return updateGeminiKey(message.payload || {});
         case MESSAGE.STOP_SESSION:

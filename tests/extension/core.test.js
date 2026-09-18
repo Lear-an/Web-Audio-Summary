@@ -106,6 +106,19 @@ test("isRetryableStatus never retries quota exhaustion", () => {
   assert.equal(Core.isRetryableStatus(400), false);
 });
 
+test("isSessionResumeRequired recognizes new and legacy preserved records", () => {
+  assert.equal(Core.isSessionResumeRequired({ state: "SESSION_RESUME_REQUIRED" }), true);
+  assert.equal(Core.isSessionResumeRequired({ code: "session_resume_required" }), true);
+  assert.equal(
+    Core.isSessionResumeRequired({ state: "NEEDS_ACTION", detail: "서버 세션을 먼저 복구해 주세요." }),
+    true
+  );
+  assert.equal(
+    Core.isSessionResumeRequired({ state: "NEEDS_ACTION", detail: "파일 형식이 올바르지 않습니다." }),
+    false
+  );
+});
+
 test("transientRetryDelayMs uses 15, 30, 45 second capped backoff", () => {
   assert.equal(Core.transientRetryDelayMs(1), 15_000);
   assert.equal(Core.transientRetryDelayMs(2), 30_000);

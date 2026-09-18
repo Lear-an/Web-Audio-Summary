@@ -117,6 +117,33 @@ async function startSession(payload) {
   return response;
 }
 
+async function recoverSession(payload) {
+  const tabId = Number(payload?.tabId);
+  const tab = await chrome.tabs.get(tabId);
+  assertCapturableTab(tab);
+  await prepareTab(tab);
+  await ensureOffscreenDocument();
+
+  const videoState = await getVideoState(tabId);
+  let streamId;
+  try {
+    streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  } catch (error) {
+    throw new Error(
+      `탭 오디오 권한을 얻지 못했습니다. 확장 아이콘으로 패널을 연 뒤 다시 시도해 주세요: ${serializeError(error)}`
+    );
+  }
+
+  return sendToOffscreen(MESSAGE.RECOVER_SESSION, {
+    streamId,
+    sourceTabId: tabId,
+    sourceUrl: tab.url || "",
+    sourceTitle: tab.title || "",
+    videoState,
+    geminiApiKey: payload.geminiApiKey
+  });
+}
+
 async function addBookmark(payload) {
   const tabId = Number(payload?.tabId);
   const videoState = await getVideoState(tabId);
@@ -176,6 +203,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case MESSAGE.START_SESSION:
         return startSession(message.payload || {});
+      case MESSAGE.RECOVER_SESSION:
+        return recoverSession(message.payload || {});
       case MESSAGE.UPDATE_GEMINI_KEY:
         return sendToOffscreen(MESSAGE.UPDATE_GEMINI_KEY, message.payload || {});
       case MESSAGE.STOP_SESSION:
