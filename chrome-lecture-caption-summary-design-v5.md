@@ -39,13 +39,22 @@ v5는 현재 구현된 Gemini 기반 v3 흐름을 기준으로 합니다. OpenAI
 
 ```text
 사용자 A의 Chrome 확장 ─┐
-사용자 B의 Chrome 확장 ─┼─ HTTPS ─→ Render FastAPI 서버 ──→ Gemini API
+사용자 B의 Chrome 확장 ─┼─ HTTPS ─→ Render FastAPI 서버
 사용자 C의 Chrome 확장 ─┘                    │
-                                             └─→ MongoDB Atlas
-                                                  (최종 TXT·요약만)
+                                             │ 오디오 + 사용자 Gemini 키
+                                             ▼
+                                        Gemini API
+                                             │
+                                             │ 전사·요약 응답
+                                             ▼
+                                      Render FastAPI 서버
+                                       ├─→ 확장 프로그램
+                                       │   (실시간 자막·요약)
+                                       └─→ MongoDB Atlas
+                                           (최종 TXT·요약만)
 ```
 
-각 사용자는 자신의 Gemini API 키를 사이드패널에 입력합니다. Render 서버는 사용자의 키로 Gemini를 호출하고, 생성된 전사·요약 결과를 해당 사용자의 `owner_id`에 연결합니다.
+각 사용자는 자신의 Gemini API 키를 사이드패널에 입력합니다. 확장 프로그램은 오디오를 Render의 FastAPI로 보내고, FastAPI가 해당 키로 Gemini를 호출합니다. Gemini의 전사·요약 응답은 먼저 FastAPI가 받은 뒤 확장 프로그램에 실시간으로 전달하고, 최종 결과는 FastAPI가 `owner_id`를 붙여 Atlas에 저장합니다.
 
 사용자는 Atlas에 직접 접속하지 않습니다. MongoDB URI, DB 사용자, Render 환경변수는 운영자만 관리합니다.
 
@@ -153,10 +162,14 @@ SessionRecord(
     source_url="https://www.youtube.com/watch?v=...",
     language="ko",
     gemini=<session-scoped client>,
+    transcript_segments=<server-canonical segments>,
+    latest_summary=<latest server summary>,
 )
 ```
 
 `session_id`는 추측하기 어려운 UUID를 사용하고, 모든 청크·요약·종료 요청에서 세션 소유자를 다시 검증합니다.
+
+FastAPI는 Gemini 응답을 세션에 누적하고 청크 경계 중복을 서버에서도 조정해 Atlas에 저장할 기준 자막을 만듭니다. 확장 프로그램은 실시간 표시를 위해 같은 응답을 받으며, 화면 표시 과정에서 추가 중복을 방어적으로 제거할 수 있지만 Atlas 저장의 기준 데이터는 서버 세션입니다.
 
 ### 5.2 세션 흐름
 
@@ -169,7 +182,7 @@ SessionRecord(
 → 세션 ID 발급
 → 청크 전사·중간 요약
 → 종료 시 최종 요약
-→ /archive로 최종 텍스트 Atlas 저장
+→ /archive로 최종 저장 요청
 → 저장 성공 확인 후 서버 세션 삭제
 → Gemini 클라이언트 참조 제거
 ```
@@ -442,7 +455,7 @@ DELETE /v1/sessions/{session_id}
 
 ### 9.4 최종 보관 API
 
-캡처 종료 후 확장 프로그램이 최종 텍스트를 명시적으로 저장합니다.
+캡처 종료 후 확장 프로그램은 최종 저장을 요청하고, FastAPI가 세션에 누적한 Gemini 전사·요약 결과를 조합해 명시적으로 저장합니다. 확장 프로그램이 Atlas에 직접 접근하거나, 클라이언트가 보낸 임의의 전체 자막을 그대로 신뢰하지 않습니다.
 
 ```http
 POST /v1/sessions/{session_id}/archive
@@ -451,14 +464,6 @@ POST /v1/sessions/{session_id}/archive
 ```json
 {
   "source_title": "강의 제목",
-  "transcript_txt": "전체 자막 TXT",
-  "summary": {
-    "summary": "최종 요약",
-    "concepts": [],
-    "terms": [],
-    "highlights": [],
-    "checklist": []
-  },
   "bookmarks": [],
   "duration_ms": 3600000,
   "chunk_count": 12,
@@ -466,7 +471,7 @@ POST /v1/sessions/{session_id}/archive
 }
 ```
 
-서버는 세션에서 확인한 `owner_id`와 인증 사용자 ID가 같은지 확인한 후 Atlas에 저장합니다. 저장 성공 시 다음을 반환합니다.
+서버는 세션에서 확인한 `owner_id`와 인증 사용자 ID가 같은지 확인합니다. 그 후 서버 메모리에 누적한 Gemini 전사 결과와 최신 요약, 요청에 포함된 북마크·메타데이터를 조합해 Atlas에 저장합니다. 저장 성공 시 다음을 반환합니다.
 
 ```json
 {
@@ -520,16 +525,18 @@ UI 동작:
 2. Render /health 조회
 3. Gemini 키를 포함한 세션 생성
 4. Offscreen이 300초 청크 녹음
-5. Render가 사용자 Gemini 키로 전사
-6. 확장 프로그램이 자막 경계 중복을 로컬 조정
-7. 성공한 청크 3개마다 중간 요약
-8. 429면 해당 세션만 PAUSED_QUOTA
-9. 503이면 15·30·45초 대기 후 재시도
-10. 캡처 종료 시 최종 요약
-11. 확장 프로그램이 TXT·요약·북마크를 archive로 전송
-12. Render가 owner_id를 붙여 Atlas 저장
-13. 저장 성공 응답 확인
-14. 서버 메모리 세션과 Gemini 클라이언트 제거
+5. Render FastAPI가 사용자 Gemini 키로 Gemini에 전사 요청
+6. Gemini가 전사 결과를 Render FastAPI에 반환
+7. Render FastAPI가 응답을 세션에 누적하고 서버 측 경계 중복을 조정
+8. FastAPI가 정규화한 자막을 확장 프로그램에 전달하고, 확장 프로그램은 화면 표시를 갱신
+9. 성공한 청크 3개마다 FastAPI가 중간 요약 요청
+10. 429면 해당 세션만 PAUSED_QUOTA
+11. 503이면 15·30·45초 대기 후 재시도
+12. 캡처 종료 시 FastAPI가 최종 요약
+13. 확장 프로그램이 종료·북마크 메타데이터로 archive 요청
+14. FastAPI가 누적 전사·요약을 TXT로 조합하고 owner_id를 붙여 Atlas 저장
+15. 저장 성공 응답 확인
+16. 서버 메모리 세션과 Gemini 클라이언트 제거
 ```
 
 Atlas 저장은 오디오 전사 처리와 분리합니다. 청크마다 Atlas에 저장하지 않으므로 DB 요청 수와 문서 중간 상태가 증가하지 않습니다.
@@ -637,7 +644,7 @@ AUDIO_CHUNK_SECONDS=300
 - Manifest에 운영 Render host permission 추가
 - 사이드패널에 사용자 ID·접속 코드 입력란 추가
 - `X-User-ID`와 Bearer 사용자 토큰 전송
-- 최종 자막·요약·북마크를 `/archive`로 보내는 메시지 추가
+- 종료·북마크·메타데이터를 `/archive`로 보내는 메시지 추가; 전체 자막·요약은 서버 세션에서 조합
 - Atlas 저장 성공·실패 상태 표시
 - 저장 실패 시 TXT·MD 로컬 내보내기 유지
 - 개발용 로컬 주소와 운영용 Render 주소를 구분
@@ -674,7 +681,7 @@ AUDIO_CHUNK_SECONDS=300
 
 - 서버 시작 시 Atlas 연결과 ping 확인
 - `owner_id`와 `created_at` 인덱스 생성
-- archive 성공 시 최종 텍스트와 요약이 저장됨
+- archive 성공 시 서버가 조합한 최종 텍스트와 요약이 저장됨
 - 오디오 바이트와 Gemini API 키가 Atlas 문서에 없음
 - Atlas 저장 실패 시 확장 프로그램이 성공으로 표시하지 않음
 - 사용자별 목록·상세·삭제가 서로 격리됨
