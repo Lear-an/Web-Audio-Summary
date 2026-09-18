@@ -126,7 +126,6 @@ label input { margin-top: 5px; }
   border-bottom: 1px solid #202a43;
 }
 
-.caption-row.provisional { opacity: 0.62; }
 .timestamp { padding: 0; border: 0; background: transparent; color: #8ea2ff; font-size: 11px; }
 .caption-text { line-height: 1.5; font-size: 13px; overflow-wrap: anywhere; }
 .uncertain { color: #ffd166; }

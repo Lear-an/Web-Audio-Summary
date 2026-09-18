@@ -5,12 +5,12 @@
   const DEFAULT_WINDOW_MS = 10_000;
   const DEFAULT_OVERLAP_MS = 1_000;
   const MIN_PARTIAL_CHUNK_MS = 1_000;
-  const SOFT_LIMIT = 8 * 1024 * 1024;
-  const HARD_LIMIT = 10 * 1024 * 1024;
-  const RESUME_LIMIT = 6 * 1024 * 1024;
+  const SOFT_LIMIT = 24 * 1024 * 1024;
+  const HARD_LIMIT = 32 * 1024 * 1024;
+  const RESUME_LIMIT = 12 * 1024 * 1024;
   const REQUEST_TIMEOUT_MS = 45_000;
   const MAX_ATTEMPTS = 3;
-  const SUMMARY_INTERVAL_MS = 90_000;
+  const SUMMARY_CHUNK_INTERVAL = 3;
   const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm"];
 
   function emptyNotes() {
@@ -48,16 +48,16 @@
       queue: [],
       queuedBytes: 0,
       inFlightBytes: 0,
+      inFlightChunk: null,
       processing: false,
       processTimer: null,
       captions: [],
-      provisionalCaptions: [],
       bookmarks: [],
       gaps: [],
       openGap: null,
       notes: emptyNotes(),
       summaryCursor: 0,
-      lastSummaryCaptureMs: 0,
+      successfulChunksSinceSummary: 0,
       summaryInFlight: false,
       summaryPromise: null,
       videoState: {
@@ -133,7 +133,6 @@
       queueCount: session.queue.length + (session.processing ? 1 : 0),
       activeRecorderCount: session.activeRecorders.size,
       captions: sortedCaptions,
-      provisionalCaptions: [...session.provisionalCaptions],
       bookmarks: [...session.bookmarks],
       gaps: [...session.gaps, ...(session.openGap ? [{ ...session.openGap, open: true }] : [])],
       notes: { ...session.notes },
@@ -393,7 +392,8 @@
         videoStartMs: context.videoStartMs,
         playbackRate: context.playbackRate,
         overlapMs: context.overlapMs,
-        mimeType: blob.type || session.mimeType
+        mimeType: blob.type || session.mimeType,
+        unavailableAttempts: 0
       });
       session.queue.sort((left, right) => left.sequence - right.sequence);
       session.queuedBytes += blob.size;
@@ -431,12 +431,12 @@
   function enforceMemoryLimits() {
     const bytes = audioBytes();
     if (bytes >= HARD_LIMIT && session.state === SESSION_STATE.CAPTURING) {
-      setState(SESSION_STATE.PAUSED_BACKPRESSURE, "오디오 큐가 10MB에 도달하여 캡처를 일시정지했습니다.");
+      setState(SESSION_STATE.PAUSED_BACKPRESSURE, "오디오 큐가 32MB에 도달하여 캡처를 일시정지했습니다.");
       openGap("memory_backpressure");
       cancelWindowScheduler();
       void stopAllRecorders();
     } else if (bytes >= SOFT_LIMIT && session.state === SESSION_STATE.CAPTURING) {
-      session.notice = "오디오 큐가 8MB를 넘어 처리 지연을 감시하고 있습니다.";
+      session.notice = "오디오 큐가 24MB를 넘어 처리 지연을 감시하고 있습니다.";
     }
   }
 
@@ -451,12 +451,12 @@
     }
   }
 
-  function scheduleQueueProcessing() {
+  function scheduleQueueProcessing(delayMs = 75) {
     if (session.processTimer || session.processing) return;
     session.processTimer = setTimeout(() => {
       session.processTimer = null;
       void processQueue();
-    }, 75);
+    }, Math.max(0, Number(delayMs) || 0));
   }
 
   function lowerSequenceStillRecording(sequence) {
@@ -479,7 +479,9 @@
     const chunk = session.queue.shift();
     session.queuedBytes -= chunk.blob.size;
     session.inFlightBytes = chunk.blob.size;
+    session.inFlightChunk = chunk;
     session.processing = true;
+    let nextProcessingDelayMs = 75;
     broadcastSnapshot();
 
     try {
@@ -491,24 +493,37 @@
       if (session.stats.recentLatenciesMs.length > 100) session.stats.recentLatenciesMs.shift();
       applyTranscriptResponse(chunk, response);
     } catch (error) {
-      session.stats.failedChunks += 1;
-      session.gaps.push({
-        reason: "chunk_failed",
-        start_ms: chunk.videoStartMs,
-        end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
-      });
+      if (error?.status === 429 || error?.status === 503) {
+        session.queue.unshift(chunk);
+        session.queuedBytes += chunk.blob.size;
+        if (error?.status === 503) {
+          chunk.unavailableAttempts = (chunk.unavailableAttempts || 0) + 1;
+          nextProcessingDelayMs = Core.transientRetryDelayMs(chunk.unavailableAttempts);
+          session.stats.retries += 1;
+          session.notice = `Gemini 모델 혼잡: 청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
+        }
+      } else {
+        session.stats.failedChunks += 1;
+        session.gaps.push({
+          reason: "chunk_failed",
+          start_ms: chunk.videoStartMs,
+          end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
+        });
+      }
       if (error?.status === 429) {
         await pauseForQuota();
-      } else {
+      } else if (error?.status !== 503) {
         session.notice = `청크 ${chunk.sequence} 처리 실패: ${serializeError(error)}`;
       }
     } finally {
       session.inFlightBytes = 0;
+      session.inFlightChunk = null;
       session.processing = false;
+      enforceMemoryLimits();
       maybeResumeAfterBackpressure();
       broadcastSnapshot();
       if (session.queue.length > 0 && session.state !== SESSION_STATE.PAUSED_QUOTA) {
-        scheduleQueueProcessing();
+        scheduleQueueProcessing(nextProcessingDelayMs);
       }
     }
   }
@@ -520,6 +535,7 @@
         return await uploadChunk(chunk);
       } catch (error) {
         lastError = error;
+        if (error?.status === 503) break;
         if (!Core.isRetryableStatus(error?.status)) break;
         if (attempt >= MAX_ATTEMPTS) break;
         session.stats.retries += 1;
@@ -535,12 +551,10 @@
   async function pauseForQuota() {
     if (session.state === SESSION_STATE.PAUSED_QUOTA) return;
     session.state = SESSION_STATE.PAUSED_QUOTA;
-    session.notice = "Gemini API 할당량이 소진되어 캡처를 일시정지했습니다. 사용량 또는 결제 설정을 확인한 뒤 새 캡처를 시작해 주세요.";
+    session.notice = "Gemini API 할당량이 소진되었습니다. 실패 청크를 보존했습니다. 새 API 키를 입력하고 '새 키로 계속'을 눌러 주세요.";
     cancelWindowScheduler();
     openGap("gemini_quota_exhausted");
     await stopAllRecorders();
-    session.queue.length = 0;
-    session.queuedBytes = 0;
     broadcastSnapshot();
   }
 
@@ -574,35 +588,19 @@
           end_ms: Math.round(chunk.videoStartMs + relativeEnd * chunk.playbackRate),
           text: String(segment.text || "").trim(),
           uncertain: Boolean(segment.uncertain),
-          status: "provisional"
+          status: "final"
         };
       })
       .filter((segment) => segment.text && segment.end_ms >= segment.start_ms);
 
-    if (session.provisionalCaptions.length > 0) {
-      const finalized = session.provisionalCaptions.map((segment) => ({ ...segment, status: "final" }));
-      session.captions.push(...finalized);
-    }
-
-    const reference = session.captions.slice(-4);
-    session.provisionalCaptions = Core.dedupeIncoming(reference, incoming);
+    session.captions = Core.reconcileCaptionBoundary(session.captions, incoming, 4);
     session.stats.lastSequence = chunk.sequence;
     session.notice = "";
-
-    const captureProgress = chunk.captureEndMs;
-    if (
-      captureProgress - session.lastSummaryCaptureMs >= SUMMARY_INTERVAL_MS &&
-      !session.summaryInFlight
-    ) {
-      session.lastSummaryCaptureMs = captureProgress;
+    session.successfulChunksSinceSummary += 1;
+    if (session.successfulChunksSinceSummary >= SUMMARY_CHUNK_INTERVAL && !session.summaryInFlight) {
+      session.successfulChunksSinceSummary = 0;
       void requestSummary("intermediate");
     }
-  }
-
-  function finalizeProvisionalCaptions() {
-    if (session.provisionalCaptions.length === 0) return;
-    session.captions.push(...session.provisionalCaptions.map((segment) => ({ ...segment, status: "final" })));
-    session.provisionalCaptions = [];
   }
 
   function requestSummary(kind) {
@@ -626,39 +624,52 @@
   async function performSummary(kind) {
     const newCaptions = session.captions.slice(session.summaryCursor);
     if (kind === "intermediate" && newCaptions.length === 0) return;
-    try {
-      const transcript = newCaptions
-        .map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`)
-        .join("\n")
-        .slice(-180_000);
-      const endpoint = kind === "final" ? "summaries/final" : "summaries/intermediate";
-      const response = await fetchWithTimeout(
-        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/${endpoint}`,
-        {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({
-            previous_summary: session.notes,
-            transcript,
-            bookmarks: session.bookmarks
-          })
-        },
-        60_000
-      );
-      const payload = await assertResponse(response);
-      session.notes = {
-        summary: String(payload?.summary || ""),
-        concepts: Array.isArray(payload?.concepts) ? payload.concepts : [],
-        terms: Array.isArray(payload?.terms) ? payload.terms : [],
-        highlights: Array.isArray(payload?.highlights) ? payload.highlights : [],
-        checklist: Array.isArray(payload?.checklist) ? payload.checklist : []
-      };
-      session.summaryCursor = session.captions.length;
-    } catch (error) {
-      if (error?.status === 429) {
-        await pauseForQuota();
-      } else {
+    const transcript = newCaptions
+      .map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`)
+      .join("\n")
+      .slice(-180_000);
+    const endpoint = kind === "final" ? "summaries/final" : "summaries/intermediate";
+
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(
+          `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/${endpoint}`,
+          {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({
+              previous_summary: session.notes,
+              transcript,
+              bookmarks: session.bookmarks
+            })
+          },
+          60_000
+        );
+        const payload = await assertResponse(response);
+        session.notes = {
+          summary: String(payload?.summary || ""),
+          concepts: Array.isArray(payload?.concepts) ? payload.concepts : [],
+          terms: Array.isArray(payload?.terms) ? payload.terms : [],
+          highlights: Array.isArray(payload?.highlights) ? payload.highlights : [],
+          checklist: Array.isArray(payload?.checklist) ? payload.checklist : []
+        };
+        session.summaryCursor = session.captions.length;
+        return;
+      } catch (error) {
+        if (error?.status === 429) {
+          await pauseForQuota();
+          return;
+        }
+        if (error?.status === 503 && attempt < 4) {
+          const retryDelayMs = Core.transientRetryDelayMs(attempt);
+          session.stats.retries += 1;
+          session.notice = `Gemini 모델 혼잡: 요약을 ${Math.ceil(retryDelayMs / 1000)}초 후 재시도합니다.`;
+          broadcastSnapshot();
+          await delay(retryDelayMs);
+          continue;
+        }
         session.notice = `요약 생성 실패: ${serializeError(error)}`;
+        return;
       }
     }
   }
@@ -705,24 +716,94 @@
     }
   }
 
-  async function waitForQueueDrain(maxWaitMs = 90_000) {
-    const deadline = Date.now() + maxWaitMs;
+  async function updateGeminiKey(payload) {
+    if (session.state !== SESSION_STATE.PAUSED_QUOTA || !session.serverSessionId) {
+      throw new Error("할당량 소진으로 일시정지된 세션에서만 API 키를 교체할 수 있습니다.");
+    }
+    let geminiApiKey = String(payload.geminiApiKey || "").trim();
+    payload.geminiApiKey = "";
+    if (!geminiApiKey) throw new Error("새 Gemini API 키를 입력해 주세요.");
+
+    try {
+      const response = await fetchWithTimeout(
+        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/gemini-key`,
+        {
+          method: "POST",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: JSON.stringify({ gemini_api_key: geminiApiKey })
+        }
+      );
+      await assertResponse(response);
+    } finally {
+      geminiApiKey = "";
+    }
+
+    closeGap();
+    if (audioBytes() >= HARD_LIMIT) {
+      session.state = SESSION_STATE.PAUSED_BACKPRESSURE;
+      session.notice = "새 API 키를 적용했습니다. 큐를 먼저 처리한 뒤 캡처를 재개합니다.";
+      openGap("memory_backpressure");
+    } else {
+      session.state = SESSION_STATE.CAPTURING;
+      session.notice = "새 API 키를 적용해 캡처와 청크 처리를 재개했습니다.";
+      if (!session.videoState?.hasVideo || !session.videoState.paused) scheduleRecordingWindows(true);
+    }
+    scheduleQueueProcessing(0);
+    broadcastSnapshot();
+    return { ok: true, snapshot: publicSnapshot() };
+  }
+
+  function dropQueuedChunks(reason) {
+    if (session.processTimer) clearTimeout(session.processTimer);
+    session.processTimer = null;
+    const droppedChunks = [...session.queue];
+    if (session.processing && session.inFlightChunk) droppedChunks.unshift(session.inFlightChunk);
+    const seenSequences = new Set();
+    for (const chunk of droppedChunks) {
+      if (seenSequences.has(chunk.sequence)) continue;
+      seenSequences.add(chunk.sequence);
+      session.gaps.push({
+        reason,
+        start_ms: chunk.videoStartMs,
+        end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
+      });
+    }
+    session.stats.failedChunks += seenSequences.size;
+    session.queue.length = 0;
+    session.queuedBytes = 0;
+    return seenSequences.size;
+  }
+
+  async function waitForQueueDrain(maxWaitMs = null) {
+    const pendingAtStart = session.queue.length + (session.processing ? 1 : 0);
+    const waitMs = maxWaitMs == null ? Core.queueDrainTimeoutMs(pendingAtStart) : maxWaitMs;
+    const deadline = Date.now() + waitMs;
+    let lastNoticeAt = 0;
     while ((session.queue.length > 0 || session.processing) && Date.now() < deadline) {
       if (!session.processing) scheduleQueueProcessing();
+      if (Date.now() - lastNoticeAt >= 1_000) {
+        const pending = session.queue.length + (session.processing ? 1 : 0);
+        session.notice = `캡처 종료 중: 남은 청크 ${pending}개를 처리하고 있습니다.`;
+        broadcastSnapshot();
+        lastNoticeAt = Date.now();
+      }
       await delay(100);
     }
-    if (session.queue.length > 0 || session.processing) {
-      session.notice = "종료 대기시간을 초과해 남은 청크를 누락 처리했습니다.";
-      for (const chunk of session.queue) {
-        session.gaps.push({
-          reason: "stop_timeout",
-          start_ms: chunk.videoStartMs,
-          end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
-        });
-      }
-      session.queue.length = 0;
-      session.queuedBytes = 0;
+
+    if (session.processing && Date.now() >= deadline) {
+      session.notice = "종료 제한시간에 도달해 현재 전송 중인 청크의 완료를 기다리고 있습니다.";
+      broadcastSnapshot();
+      const inFlightDeadline = Date.now() + REQUEST_TIMEOUT_MS + 5_000;
+      while (session.processing && Date.now() < inFlightDeadline) await delay(100);
     }
+
+    let droppedCount = 0;
+    if (session.queue.length > 0 || session.processing) {
+      droppedCount = dropQueuedChunks("stop_timeout");
+      session.notice = `종료 대기시간을 초과해 청크 ${droppedCount}개를 누락 처리했습니다.`;
+      broadcastSnapshot();
+    }
+    return { drained: droppedCount === 0, droppedCount };
   }
 
   async function stopSession(reason = "사용자가 캡처를 종료했습니다.") {
@@ -738,8 +819,9 @@
     broadcastSnapshot();
 
     await stopAllRecorders();
-    await waitForQueueDrain();
-    finalizeProvisionalCaptions();
+    const drainResult = quotaWasExhausted
+      ? { drained: false, droppedCount: dropQueuedChunks("quota_abandoned") }
+      : await waitForQueueDrain();
     if (session.captions.length > 0 && !quotaWasExhausted) await requestSummary("final");
     closeGap();
     await releaseMediaResources();
@@ -748,7 +830,13 @@
     session.stopping = false;
     session.state = SESSION_STATE.STOPPED;
     session.stoppedAtEpochMs = Date.now();
-    session.notice = reason;
+    if (quotaWasExhausted && drainResult.droppedCount > 0) {
+      session.notice = `${reason} 새 키 없이 종료하여 보존 청크 ${drainResult.droppedCount}개가 처리되지 않았습니다.`;
+    } else {
+      session.notice = drainResult.droppedCount > 0
+        ? `${reason} 종료 대기시간 초과로 청크 ${drainResult.droppedCount}개가 누락되었습니다.`
+        : reason;
+    }
     session.accessToken = "";
     broadcastSnapshot();
     return { ok: true, snapshot: publicSnapshot() };
@@ -870,6 +958,8 @@
       switch (message.type) {
         case MESSAGE.START_SESSION:
           return startSession(message.payload || {});
+        case MESSAGE.UPDATE_GEMINI_KEY:
+          return updateGeminiKey(message.payload || {});
         case MESSAGE.STOP_SESSION:
           return stopSession(message.payload?.reason || "사용자가 캡처를 종료했습니다.");
         case MESSAGE.GET_SESSION_SNAPSHOT:

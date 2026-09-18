@@ -16,10 +16,16 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .gemini_client import GeminiClient, GeminiInvalidRequestError, GeminiQuotaExhaustedError
+from .gemini_client import (
+    GeminiClient,
+    GeminiInvalidRequestError,
+    GeminiQuotaExhaustedError,
+    GeminiUnavailableError,
+)
 from .schemas import (
     ChunkResponse,
     HealthResponse,
+    SessionApiKeyUpdateRequest,
     SessionCreateRequest,
     SessionCreateResponse,
     SummaryRequest,
@@ -165,6 +171,14 @@ def quota_http_exception(error: GeminiQuotaExhaustedError) -> HTTPException:
     )
 
 
+def unavailable_http_exception(error: GeminiUnavailableError) -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Gemini 모델이 혼잡합니다. 오디오 청크를 보존하고 잠시 후 다시 시도합니다.",
+        headers={"Retry-After": str(error.retry_after_seconds)},
+    )
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(
@@ -200,6 +214,38 @@ async def create_session(payload: SessionCreateRequest) -> SessionCreateResponse
         language=payload.language,
         gemini=gemini_client,
     )
+    return SessionCreateResponse(session_id=session_id, model=settings.gemini_model)
+
+
+@app.post(
+    "/v1/sessions/{session_id}/gemini-key",
+    response_model=SessionCreateResponse,
+    dependencies=[Depends(authorize)],
+)
+async def update_session_gemini_key(
+    session_id: str,
+    payload: SessionApiKeyUpdateRequest,
+) -> SessionCreateResponse:
+    record = get_session(session_id)
+    api_key = payload.gemini_api_key.get_secret_value().strip()
+    if not api_key or len(api_key) > 512:
+        raise HTTPException(status_code=422, detail="Gemini API 키를 입력해 주세요.")
+    try:
+        replacement = GeminiClient(settings, api_key)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    async with record.chunk_lock:
+        async with record.summary_lock:
+            previous = record.gemini
+            record.gemini = replacement
+            record.last_activity_monotonic = time.monotonic()
+            try:
+                previous.close()
+            except Exception:
+                logger.exception("Previous Gemini client cleanup failed for session %s", session_id)
     return SessionCreateResponse(session_id=session_id, model=settings.gemini_model)
 
 
@@ -262,6 +308,8 @@ async def process_chunk(
             )
         except GeminiQuotaExhaustedError as exc:
             raise quota_http_exception(exc) from exc
+        except GeminiUnavailableError as exc:
+            raise unavailable_http_exception(exc) from exc
         except GeminiInvalidRequestError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except (ValueError, TypeError) as exc:
@@ -301,6 +349,8 @@ async def create_summary(session_id: str, kind: str, payload: SummaryRequest) ->
             )
         except GeminiQuotaExhaustedError as exc:
             raise quota_http_exception(exc) from exc
+        except GeminiUnavailableError as exc:
+            raise unavailable_http_exception(exc) from exc
         except GeminiInvalidRequestError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         except (ValueError, TypeError) as exc:

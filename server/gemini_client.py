@@ -19,6 +19,12 @@ class GeminiInvalidRequestError(RuntimeError):
     pass
 
 
+class GeminiUnavailableError(RuntimeError):
+    def __init__(self, retry_after_seconds: int = 5) -> None:
+        super().__init__("Gemini 모델이 혼잡합니다. 잠시 후 자동으로 다시 시도합니다.")
+        self.retry_after_seconds = max(1, retry_after_seconds)
+
+
 def _quota_retry_after(error: Exception) -> int | None:
     message = str(error)
     code = getattr(error, "code", None)
@@ -27,6 +33,21 @@ def _quota_retry_after(error: Exception) -> int | None:
         return None
     match = re.search(r"retry(?:Delay| in)[^0-9]*(\d+)", message, flags=re.IGNORECASE)
     return int(match.group(1)) if match else 0
+
+
+def _unavailable_retry_after(error: Exception) -> int | None:
+    message = str(error)
+    code = getattr(error, "code", None)
+    is_unavailable = (
+        code == 503
+        or "503 UNAVAILABLE" in message
+        or "status': 'UNAVAILABLE'" in message
+        or "currently experiencing high demand" in message
+    )
+    if not is_unavailable:
+        return None
+    match = re.search(r"retry(?:Delay| in)[^0-9]*(\d+)", message, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else 5
 
 
 def _is_invalid_request(error: Exception) -> bool:
@@ -123,6 +144,9 @@ class GeminiClient:
             retry_after = _quota_retry_after(exc)
             if retry_after is not None:
                 raise GeminiQuotaExhaustedError(retry_after or None) from exc
+            unavailable_retry_after = _unavailable_retry_after(exc)
+            if unavailable_retry_after is not None:
+                raise GeminiUnavailableError(unavailable_retry_after) from exc
             if _is_invalid_request(exc):
                 raise GeminiInvalidRequestError("Gemini가 오디오 전사 요청을 거부했습니다.") from exc
             raise
@@ -195,6 +219,9 @@ class GeminiClient:
             retry_after = _quota_retry_after(exc)
             if retry_after is not None:
                 raise GeminiQuotaExhaustedError(retry_after or None) from exc
+            unavailable_retry_after = _unavailable_retry_after(exc)
+            if unavailable_retry_after is not None:
+                raise GeminiUnavailableError(unavailable_retry_after) from exc
             if _is_invalid_request(exc):
                 raise GeminiInvalidRequestError("Gemini가 요약 요청을 거부했습니다.") from exc
             raise

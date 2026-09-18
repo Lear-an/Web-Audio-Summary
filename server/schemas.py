@@ -25,6 +25,10 @@ class SessionCreateResponse(BaseModel):
     model: str
 
 
+class SessionApiKeyUpdateRequest(BaseModel):
+    gemini_api_key: SecretStr
+
+
 class TranscriptSegment(BaseModel):
     relative_start_ms: int = Field(ge=0)
     relative_end_ms: int = Field(ge=0)

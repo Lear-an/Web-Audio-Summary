@@ -27,7 +27,7 @@
     bookmarksList: document.querySelector("#bookmarksList")
   };
 
-  let snapshot = { state: SESSION_STATE.IDLE, captions: [], provisionalCaptions: [], bookmarks: [], notes: {} };
+  let snapshot = { state: SESSION_STATE.IDLE, captions: [], bookmarks: [], notes: {} };
   let snapshotReceivedAt = Date.now();
 
   const statusPresentation = {
@@ -63,11 +63,16 @@
     elements.statusBadge.textContent = label;
     elements.statusBadge.className = `status ${className}`;
     const active = isRunning();
-    elements.startButton.disabled = active;
+    const awaitingNewKey = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
+    elements.startButton.textContent = awaitingNewKey ? "새 키로 계속" : "캡처 시작";
+    elements.startButton.disabled = active && !awaitingNewKey;
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     elements.serverUrl.disabled = active;
     elements.accessToken.disabled = active;
-    elements.geminiApiKey.disabled = active;
+    elements.geminiApiKey.disabled = active && !awaitingNewKey;
+    elements.geminiApiKey.placeholder = awaitingNewKey
+      ? "계속할 새 Gemini API 키"
+      : "캡처 시작 시에만 사용";
     elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
   }
 
@@ -116,10 +121,7 @@
 
   function renderCaptions() {
     const query = elements.searchInput.value.trim();
-    const all = [
-      ...(snapshot.captions || []),
-      ...(snapshot.provisionalCaptions || [])
-    ].sort((left, right) => left.start_ms - right.start_ms);
+    const all = [...(snapshot.captions || [])].sort((left, right) => left.start_ms - right.start_ms);
     const filtered = query
       ? all.filter((item) => String(item.text || "").toLocaleLowerCase().includes(query.toLocaleLowerCase()))
       : all;
@@ -137,7 +139,7 @@
     const fragment = document.createDocumentFragment();
     for (const caption of visible) {
       const row = document.createElement("article");
-      row.className = `caption-row ${caption.status === "provisional" ? "provisional" : ""}`;
+      row.className = "caption-row";
       const time = document.createElement("button");
       time.className = "timestamp";
       time.type = "button";
@@ -148,7 +150,7 @@
       appendHighlightedText(text, caption.text, query);
       const state = document.createElement("span");
       state.className = "empty-state";
-      state.textContent = caption.status === "provisional" ? "임시" : "";
+      state.textContent = caption.uncertain ? "불확실" : "";
       row.append(time, text, state);
       fragment.append(row);
     }
@@ -269,6 +271,25 @@
     if (response.snapshot) render(response.snapshot);
   }
 
+  async function continueWithNewKey() {
+    const geminiApiKey = elements.geminiApiKey.value.trim();
+    if (!geminiApiKey) {
+      elements.connectionMessage.textContent = "계속 사용할 새 Gemini API 키를 입력해 주세요.";
+      elements.geminiApiKey.focus();
+      return;
+    }
+    elements.startButton.disabled = true;
+    elements.connectionMessage.textContent = "새 Gemini API 키를 적용하고 있습니다.";
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.UPDATE_GEMINI_KEY,
+      payload: { geminiApiKey }
+    });
+    if (!response?.ok) throw new Error(response?.error || "Gemini API 키를 교체하지 못했습니다.");
+    elements.geminiApiKey.value = "";
+    if (response.snapshot) render(response.snapshot);
+  }
+
   async function addBookmark() {
     if (!Number.isInteger(Number(snapshot.sourceTabId))) {
       throw new Error("활성 캡처 세션이 없습니다.");
@@ -383,7 +404,10 @@
   }
 
   elements.startButton.addEventListener("click", () => {
-    startCapture().catch((error) => {
+    const action = snapshot.state === SESSION_STATE.PAUSED_QUOTA
+      ? continueWithNewKey
+      : startCapture;
+    action().catch((error) => {
       elements.connectionMessage.textContent = error.message;
       elements.startButton.disabled = false;
     });

@@ -65,6 +65,104 @@
     );
   }
 
+  function normalizedCutIndex(value, normalizedLength) {
+    const text = String(value || "");
+    if (normalizedLength <= 0) return 0;
+    let consumed = 0;
+    let index = 0;
+    for (const character of text) {
+      index += character.length;
+      consumed += normalizeText(character).length;
+      if (consumed >= normalizedLength) return index;
+    }
+    return text.length;
+  }
+
+  function boundaryOverlapLength(left, right, minimumLength = 4) {
+    const a = normalizeText(left);
+    const b = normalizeText(right);
+    const maximum = Math.min(a.length, b.length);
+    const minimum = Math.max(1, Math.floor(Number(minimumLength) || 4));
+    for (let length = maximum; length >= minimum; length -= 1) {
+      if (a.slice(-length) !== b.slice(0, length)) continue;
+      if (length / Math.min(a.length, b.length) < 0.25) continue;
+      return length;
+    }
+    return 0;
+  }
+
+  function mergeBoundaryText(left, right, overlapLength) {
+    const first = String(left || "").trim();
+    const second = String(right || "").trim();
+    const cutIndex = normalizedCutIndex(second, overlapLength);
+    const remainder = second.slice(cutIndex).trimStart();
+    if (!remainder) return first;
+    const separator = /\s$/.test(first) || /^[\p{P}\p{S}]/u.test(remainder) ? "" : " ";
+    return `${first}${separator}${remainder}`;
+  }
+
+  function mergedSegment(previous, incoming, text) {
+    return {
+      ...previous,
+      text,
+      start_ms: Math.min(Number(previous.start_ms) || 0, Number(incoming.start_ms) || 0),
+      end_ms: Math.max(Number(previous.end_ms) || 0, Number(incoming.end_ms) || 0),
+      uncertain: Boolean(previous.uncertain || incoming.uncertain),
+      status: "final"
+    };
+  }
+
+  function reconcileCaptionBoundary(previous, incoming, tailCount = 4) {
+    const existing = (Array.isArray(previous) ? previous : []).map((item) => ({ ...item }));
+    const candidates = (Array.isArray(incoming) ? incoming : []).map((item) => ({ ...item, status: "final" }));
+    const boundaryStart = Math.max(0, existing.length - Math.max(1, Math.floor(Number(tailCount) || 4)));
+
+    for (const candidate of candidates) {
+      const candidateText = normalizeText(candidate.text);
+      if (!candidateText) continue;
+      let reconciled = false;
+
+      for (let index = existing.length - 1; index >= boundaryStart; index -= 1) {
+        const prior = existing[index];
+        if (!rangesOverlap(prior, candidate)) continue;
+        const priorText = normalizeText(prior.text);
+        if (!priorText) continue;
+
+        const shorterLength = Math.min(priorText.length, candidateText.length);
+        const isContained = shorterLength >= 4 && (
+          priorText.includes(candidateText) || candidateText.includes(priorText)
+        );
+        if (priorText === candidateText || isContained) {
+          const preferredText = candidateText.length > priorText.length ? candidate.text : prior.text;
+          existing[index] = mergedSegment(prior, candidate, preferredText);
+          reconciled = true;
+          break;
+        }
+
+        const overlapLength = boundaryOverlapLength(prior.text, candidate.text);
+        if (overlapLength > 0) {
+          existing[index] = mergedSegment(
+            prior,
+            candidate,
+            mergeBoundaryText(prior.text, candidate.text, overlapLength)
+          );
+          reconciled = true;
+          break;
+        }
+
+        if (shorterLength >= 4 && diceSimilarity(prior.text, candidate.text) >= 0.82) {
+          const preferredText = candidateText.length > priorText.length ? candidate.text : prior.text;
+          existing[index] = mergedSegment(prior, candidate, preferredText);
+          reconciled = true;
+          break;
+        }
+      }
+
+      if (!reconciled) existing.push(candidate);
+    }
+    return existing;
+  }
+
   function clampNumber(value, minimum, maximum) {
     const parsed = Number(value);
     if (!Number.isFinite(parsed)) return minimum;
@@ -99,14 +197,30 @@
     return value === 408 || value === 425 || value >= 500;
   }
 
+  function transientRetryDelayMs(attempt) {
+    const schedule = [15_000, 30_000, 45_000];
+    const safeAttempt = Math.max(1, Math.floor(Number(attempt) || 1));
+    return schedule[Math.min(schedule.length - 1, safeAttempt - 1)];
+  }
+
+  function queueDrainTimeoutMs(queueCount) {
+    const count = Math.max(0, Math.ceil(Number(queueCount) || 0));
+    return Math.min(15 * 60_000, Math.max(5 * 60_000, count * 60_000));
+  }
+
   return Object.freeze({
     normalizeText,
     diceSimilarity,
     isLikelyDuplicate,
     dedupeIncoming,
+    boundaryOverlapLength,
+    mergeBoundaryText,
+    reconcileCaptionBoundary,
     clampNumber,
     formatTimestamp,
     formatClock,
-    isRetryableStatus
+    isRetryableStatus,
+    transientRetryDelayMs,
+    queueDrainTimeoutMs
   });
 });

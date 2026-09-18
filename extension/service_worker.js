@@ -133,10 +133,7 @@ function sendSnapshotToViews(snapshot) {
 
   const tabId = Number(snapshot?.sourceTabId);
   if (!Number.isInteger(tabId)) return;
-  const recent = [
-    ...(snapshot.captions || []).slice(-2),
-    ...(snapshot.provisionalCaptions || []).slice(-2)
-  ].slice(-2);
+  const recent = (snapshot.captions || []).slice(-2);
   chrome.tabs.sendMessage(tabId, {
     target: TARGET.CONTENT,
     type: MESSAGE.OVERLAY_UPDATE,
@@ -177,6 +174,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case MESSAGE.START_SESSION:
         return startSession(message.payload || {});
+      case MESSAGE.UPDATE_GEMINI_KEY:
+        return sendToOffscreen(MESSAGE.UPDATE_GEMINI_KEY, message.payload || {});
       case MESSAGE.STOP_SESSION:
         return sendToOffscreen(MESSAGE.STOP_SESSION, message.payload || {});
       case MESSAGE.GET_SESSION_SNAPSHOT:
