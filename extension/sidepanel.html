@@ -16,14 +16,14 @@
     </header>
 
     <section class="connection-card" aria-labelledby="connectionTitle">
-      <h2 id="connectionTitle">로컬 서버</h2>
+      <h2 id="connectionTitle">Lecture Memo 서버</h2>
       <label>
-        주소
-        <input id="serverUrl" type="url" value="http://127.0.0.1:8050" autocomplete="off">
+        사용자 ID
+        <input id="userId" type="text" value="user-001" maxlength="64" autocomplete="username">
       </label>
       <label>
-        액세스 토큰
-        <input id="accessToken" type="password" placeholder="서버 실행 화면의 토큰" autocomplete="off">
+        접속 코드
+        <input id="accessToken" type="password" placeholder="관리자에게 받은 접속 코드" autocomplete="current-password">
       </label>
       <label>
         Gemini API 키
@@ -38,6 +38,8 @@
       <div class="button-row">
         <button id="startButton" class="primary" type="button">캡처 시작</button>
         <button id="stopButton" class="danger" type="button" disabled>캡처 종료</button>
+        <button id="exportPreservedButton" type="button" hidden>보존 오디오 내보내기</button>
+        <button id="discardButton" type="button" hidden>보존 청크 폐기</button>
       </div>
       <p id="connectionMessage" class="message" aria-live="polite"></p>
     </section>
@@ -108,6 +110,7 @@
 
     <script src="protocol.js"></script>
     <script src="core.js"></script>
+    <script src="config.js"></script>
     <script src="sidepanel.js"></script>
   </body>
 </html>

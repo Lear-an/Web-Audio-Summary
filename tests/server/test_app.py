@@ -1,28 +1,28 @@
 from __future__ import annotations
 
+import asyncio
 import os
 
+import pytest
 
+
+os.environ["APP_AUTH_MODE"] = "local"
 os.environ["LOCAL_ACCESS_TOKEN"] = "test-token"
 os.environ["MOCK_GEMINI"] = "true"
-os.environ["ALLOWED_EXTENSION_ORIGIN"] = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+os.environ["MONGODB_REQUIRED"] = "false"
+os.environ["MONGODB_URI"] = ""
+os.environ["ALLOWED_EXTENSION_ORIGINS"] = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 os.environ["AUDIO_CHUNK_SECONDS"] = "10"
 os.environ["AUDIO_CHUNK_OVERLAP_SECONDS"] = "1"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server.app import app, sessions  # noqa: E402
-from server.gemini_client import (  # noqa: E402
-    GeminiQuotaExhaustedError,
-    GeminiUnavailableError,
-)
+from server.app import app, sessions, settings, store  # noqa: E402
+from server.gemini_client import GeminiQuotaExhaustedError, GeminiUnavailableError  # noqa: E402
 
 
 ORIGIN = "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-HEADERS = {
-    "Origin": ORIGIN,
-    "Authorization": "Bearer test-token",
-}
+HEADERS = {"Origin": ORIGIN, "Authorization": "Bearer test-token", "X-User-ID": "local"}
 SESSION_PAYLOAD = {
     "source_tab_id": 1,
     "source_url": "https://example.com/lecture",
@@ -31,195 +31,222 @@ SESSION_PAYLOAD = {
 }
 
 
-def test_health_and_mock_transcription_flow() -> None:
-    with TestClient(app) as client:
-        health = client.get("/health")
-        assert health.status_code == 200
-        assert health.json()["mock_mode"] is True
-        assert health.json()["chunk_seconds"] == 10
-        assert health.json()["chunk_overlap_seconds"] == 1
+@pytest.fixture(autouse=True)
+def reset_memory_store():
+    asyncio.run(store.clear())
+    sessions.clear()
+    yield
+    sessions.clear()
+    asyncio.run(store.clear())
 
-        created = client.post(
-            "/v1/sessions",
-            headers=HEADERS,
-            json=SESSION_PAYLOAD,
-        )
-        assert created.status_code == 200
-        session_id = created.json()["session_id"]
 
-        data = {
-            "sequence": "0",
-            "capture_start_ms": "0",
-            "capture_end_ms": "10000",
-            "video_start_ms": "5000",
+def create_session(client: TestClient) -> str:
+    response = client.post("/v1/sessions", headers=HEADERS, json=SESSION_PAYLOAD)
+    assert response.status_code == 200
+    return response.json()["session_id"]
+
+
+def upload_chunk(client: TestClient, session_id: str, sequence: int = 0):
+    return client.post(
+        f"/v1/sessions/{session_id}/chunks",
+        headers=HEADERS,
+        data={
+            "sequence": str(sequence),
+            "capture_start_ms": str(sequence * 9_000),
+            "capture_end_ms": str(sequence * 9_000 + 10_000),
+            "video_start_ms": str(sequence * 9_000),
             "playback_rate": "1.0",
-            "overlap_ms": "0",
+            "overlap_ms": "0" if sequence == 0 else "1000",
             "mime_type": "audio/webm;codecs=opus",
-        }
-        first = client.post(
-            f"/v1/sessions/{session_id}/chunks",
-            headers=HEADERS,
-            data=data,
-            files={"audio": ("chunk-0.webm", b"webm-test-data", "audio/webm")},
-        )
+        },
+        files={"audio": (f"chunk-{sequence}.webm", b"webm-test-data", "audio/webm")},
+    )
+
+
+def test_health_chunk_ack_and_archive_flow() -> None:
+    with TestClient(app) as client:
+        health = client.get("/health/ready")
+        assert health.status_code == 200
+        assert health.json()["storage"] == "memory"
+        assert health.json()["max_chunk_bytes"] >= 1_000_000
+
+        session_id = create_session(client)
+        first = upload_chunk(client, session_id)
         assert first.status_code == 200
-        assert first.json()["sequence"] == 0
+        assert first.json()["acked"] is True
         assert first.json()["segments"][0]["text"] == "[모의 자막] 청크 0"
 
-        duplicate = client.post(
-            f"/v1/sessions/{session_id}/chunks",
-            headers=HEADERS,
-            data=data,
-            files={"audio": ("chunk-0.webm", b"different-data", "audio/webm")},
-        )
+        duplicate = upload_chunk(client, session_id)
         assert duplicate.status_code == 200
         assert duplicate.json() == first.json()
 
-        summary = client.post(
-            f"/v1/sessions/{session_id}/summaries/final",
+        archived = client.post(
+            f"/v1/sessions/{session_id}/archive",
             headers=HEADERS,
-            json={
-                "previous_summary": {},
-                "transcript": "[00:05] 정규화는 데이터 중복을 줄이는 과정입니다.",
-                "bookmarks": [],
-            },
+            json={"source_title": "강의", "bookmarks": [], "duration_ms": 10_000, "expected_end_sequence": 1},
         )
-        assert summary.status_code == 200
-        assert "모의" in summary.json()["summary"]
+        assert archived.status_code == 200
+        assert archived.json()["saved"] is True
+        assert archived.json()["status"] == "completed"
+        assert "모의" in archived.json()["summary"]["summary"]
 
-        deleted = client.delete(f"/v1/sessions/{session_id}", headers=HEADERS)
-        assert deleted.status_code == 200
-        assert deleted.json() == {"deleted": True}
+        repeated = client.post(
+            f"/v1/sessions/{session_id}/archive",
+            headers=HEADERS,
+            json={"source_title": "강의", "bookmarks": [], "duration_ms": 10_000, "expected_end_sequence": 1},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["document_id"] == archived.json()["document_id"]
 
 
-def test_rejects_bad_token() -> None:
+def test_sequence_gap_is_structured_and_original_can_be_kept() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        response = upload_chunk(client, session_id, sequence=1)
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "sequence_gap"
+        assert response.json()["error"]["action"] == "retry_in_order"
+
+
+def test_incomplete_archive_is_saved_without_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, sequence=0).status_code == 200
+        response = client.post(
+            f"/v1/sessions/{session_id}/archive",
+            headers=HEADERS,
+            json={"source_title": "강의", "bookmarks": [], "duration_ms": 30_000, "expected_end_sequence": 2},
+        )
+        assert response.status_code == 200
+        assert response.json()["saved"] is False
+        assert response.json()["status"] == "incomplete"
+        assert response.json()["missing_sequences"] == [1]
+
+
+def test_session_can_resume_from_persisted_draft() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        old = sessions.pop(session_id)
+        old.gemini.close()
+
+        resumed = client.post(
+            f"/v1/sessions/{session_id}/resume",
+            headers=HEADERS,
+            json={"gemini_api_key": "replacement-key"},
+        )
+        assert resumed.status_code == 200
+        assert resumed.json()["resumed"] is True
+        assert resumed.json()["next_sequence"] == 1
+        assert resumed.json()["segments"][0]["text"] == "[모의 자막] 청크 0"
+
+
+def test_resume_clears_incomplete_ttl_from_session_and_chunks() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        incomplete = client.post(
+            f"/v1/sessions/{session_id}/archive",
+            headers=HEADERS,
+            json={"source_title": "강의", "bookmarks": [], "duration_ms": 20_000, "expected_end_sequence": 2},
+        )
+        assert incomplete.status_code == 200
+        assert "expire_at" in asyncio.run(store.get_session("local", session_id))
+        assert "expire_at" in asyncio.run(store.get_chunk("local", session_id, 0))
+
+        resumed = client.post(
+            f"/v1/sessions/{session_id}/resume",
+            headers=HEADERS,
+            json={"gemini_api_key": "replacement-key"},
+        )
+        assert resumed.status_code == 200
+        assert "expire_at" not in asyncio.run(store.get_session("local", session_id))
+        assert "expire_at" not in asyncio.run(store.get_chunk("local", session_id, 0))
+
+
+def test_request_size_middleware_returns_structured_error() -> None:
     with TestClient(app) as client:
         response = client.post(
+            "/v1/sessions",
+            headers={**HEADERS, "Content-Length": str(200_000_000)},
+            content=b"{}",
+        )
+        assert response.status_code == 413
+        assert response.json()["error"]["code"] == "payload_too_large"
+
+
+def test_rejects_bad_token_and_does_not_echo_key() -> None:
+    marker = "secret-marker-" + ("x" * 600)
+    with TestClient(app) as client:
+        bad_auth = client.post(
             "/v1/sessions",
             headers={"Origin": ORIGIN, "Authorization": "Bearer wrong"},
-            json={"gemini_api_key": "test-gemini-key"},
+            json=SESSION_PAYLOAD,
         )
-        assert response.status_code == 401
+        assert bad_auth.status_code == 401
+        assert bad_auth.json()["error"]["code"] == "authentication_failed"
 
-
-def test_rejects_missing_gemini_api_key() -> None:
-    with TestClient(app) as client:
-        response = client.post("/v1/sessions", headers=HEADERS, json={})
-        assert response.status_code == 422
-
-
-def test_rejects_oversized_key_without_echoing_it() -> None:
-    oversized_key = "secret-marker-" + ("x" * 600)
-    with TestClient(app) as client:
-        response = client.post(
+        oversized = client.post(
             "/v1/sessions",
             headers=HEADERS,
-            json={"gemini_api_key": oversized_key},
+            json={"gemini_api_key": marker},
         )
-        assert response.status_code == 422
-        assert oversized_key not in response.text
+        assert oversized.status_code == 422
+        assert marker not in oversized.text
 
 
-def test_each_session_uses_an_independent_gemini_client() -> None:
-    with TestClient(app) as client:
-        first = client.post("/v1/sessions", headers=HEADERS, json=SESSION_PAYLOAD)
-        second = client.post(
-            "/v1/sessions",
-            headers=HEADERS,
-            json={**SESSION_PAYLOAD, "gemini_api_key": "another-test-key"},
-        )
-        first_id = first.json()["session_id"]
-        second_id = second.json()["session_id"]
-        assert sessions[first_id].gemini is not sessions[second_id].gemini
-
-
-def test_session_gemini_key_can_be_replaced_without_changing_session() -> None:
-    with TestClient(app) as client:
-        created = client.post("/v1/sessions", headers=HEADERS, json=SESSION_PAYLOAD)
-        session_id = created.json()["session_id"]
-        previous_client = sessions[session_id].gemini
-
-        updated = client.post(
-            f"/v1/sessions/{session_id}/gemini-key",
-            headers=HEADERS,
-            json={"gemini_api_key": "replacement-test-key"},
-        )
-
-        assert updated.status_code == 200
-        assert updated.json()["session_id"] == session_id
-        assert sessions[session_id].gemini is not previous_client
-
-
-def test_session_gemini_key_replacement_rejects_missing_key() -> None:
-    with TestClient(app) as client:
-        created = client.post("/v1/sessions", headers=HEADERS, json=SESSION_PAYLOAD)
-        session_id = created.json()["session_id"]
-        response = client.post(
-            f"/v1/sessions/{session_id}/gemini-key",
-            headers=HEADERS,
-            json={},
-        )
-        assert response.status_code == 422
-
-
-def test_quota_exhaustion_is_returned_as_429(monkeypatch) -> None:
+def test_quota_and_congestion_use_structured_errors(monkeypatch) -> None:
     async def raise_quota(**_kwargs):
         raise GeminiQuotaExhaustedError(retry_after_seconds=22)
 
-    with TestClient(app) as client:
-        created = client.post(
-            "/v1/sessions",
-            headers=HEADERS,
-            json=SESSION_PAYLOAD,
-        )
-        session_id = created.json()["session_id"]
-        monkeypatch.setattr(sessions[session_id].gemini, "transcribe", raise_quota)
-        response = client.post(
-            f"/v1/sessions/{session_id}/chunks",
-            headers=HEADERS,
-            data={
-                "sequence": "0",
-                "capture_start_ms": "0",
-                "capture_end_ms": "10000",
-                "video_start_ms": "0",
-                "playback_rate": "1.0",
-                "overlap_ms": "0",
-                "mime_type": "audio/webm;codecs=opus",
-            },
-            files={"audio": ("chunk.webm", b"test-data", "audio/webm")},
-        )
-        assert response.status_code == 429
-        assert response.headers["retry-after"] == "22"
-        assert "할당량" in response.json()["detail"]
-
-
-def test_model_congestion_is_returned_as_503(monkeypatch) -> None:
     async def raise_unavailable(**_kwargs):
         raise GeminiUnavailableError(retry_after_seconds=5)
 
     with TestClient(app) as client:
-        created = client.post(
-            "/v1/sessions",
-            headers=HEADERS,
-            json=SESSION_PAYLOAD,
-        )
-        session_id = created.json()["session_id"]
-        monkeypatch.setattr(sessions[session_id].gemini, "transcribe", raise_unavailable)
-        response = client.post(
-            f"/v1/sessions/{session_id}/chunks",
-            headers=HEADERS,
-            data={
-                "sequence": "0",
-                "capture_start_ms": "0",
-                "capture_end_ms": "10000",
-                "video_start_ms": "0",
-                "playback_rate": "1.0",
-                "overlap_ms": "0",
-                "mime_type": "audio/webm;codecs=opus",
-            },
-            files={"audio": ("chunk.webm", b"test-data", "audio/webm")},
-        )
-        assert response.status_code == 503
-        assert response.headers["retry-after"] == "5"
-        assert "혼잡" in response.json()["detail"]
-        assert SESSION_PAYLOAD["gemini_api_key"] not in response.text
+        quota_session = create_session(client)
+        monkeypatch.setattr(sessions[quota_session].gemini, "transcribe", raise_quota)
+        quota = upload_chunk(client, quota_session)
+        assert quota.status_code == 429
+        assert quota.headers["retry-after"] == "22"
+        assert quota.json()["error"]["code"] == "gemini_quota_exhausted"
+        assert quota.json()["error"]["retryable"] is False
+
+        busy_session = create_session(client)
+        monkeypatch.setattr(sessions[busy_session].gemini, "transcribe", raise_unavailable)
+        busy = upload_chunk(client, busy_session)
+        assert busy.status_code == 503
+        assert busy.headers["retry-after"] == "5"
+        assert busy.json()["error"]["code"] == "gemini_overloaded"
+        assert busy.json()["error"]["retryable"] is True
+
+
+def test_multi_user_authentication_and_session_ownership() -> None:
+    previous_mode = settings.app_auth_mode
+    previous_users = settings.app_users
+    object.__setattr__(settings, "app_auth_mode", "multi_user")
+    object.__setattr__(settings, "app_users", {"user-001": "token-one", "user-002": "token-two"})
+    first_headers = {"Origin": ORIGIN, "Authorization": "Bearer token-one", "X-User-ID": "user-001"}
+    second_headers = {"Origin": ORIGIN, "Authorization": "Bearer token-two", "X-User-ID": "user-002"}
+    try:
+        with TestClient(app) as client:
+            created = client.post("/v1/sessions", headers=first_headers, json=SESSION_PAYLOAD)
+            assert created.status_code == 200
+            session_id = created.json()["session_id"]
+
+            wrong_pair = client.post(
+                "/v1/sessions",
+                headers={"Origin": ORIGIN, "Authorization": "Bearer token-one", "X-User-ID": "user-002"},
+                json=SESSION_PAYLOAD,
+            )
+            assert wrong_pair.status_code == 401
+
+            foreign = client.post(
+                f"/v1/sessions/{session_id}/resume",
+                headers=second_headers,
+                json={"gemini_api_key": "replacement-key"},
+            )
+            assert foreign.status_code == 404
+            assert foreign.json()["error"]["code"] == "session_not_found"
+    finally:
+        object.__setattr__(settings, "app_auth_mode", previous_mode)
+        object.__setattr__(settings, "app_users", previous_users)

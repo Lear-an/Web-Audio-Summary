@@ -9,11 +9,14 @@
     "tabCapture",
     "offscreen",
     "sidePanel",
-    "scripting"
+    "scripting",
+    "downloads",
+    "unlimitedStorage"
   ],
   "host_permissions": [
     "http://127.0.0.1:8050/*",
-    "http://localhost:8050/*"
+    "http://localhost:8050/*",
+    "https://replace-with-render-service.onrender.com/*"
   ],
   "background": {
     "service_worker": "service_worker.js"

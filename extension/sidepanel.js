@@ -4,11 +4,13 @@
 
   const elements = {
     statusBadge: document.querySelector("#statusBadge"),
-    serverUrl: document.querySelector("#serverUrl"),
+    userId: document.querySelector("#userId"),
     accessToken: document.querySelector("#accessToken"),
     geminiApiKey: document.querySelector("#geminiApiKey"),
     startButton: document.querySelector("#startButton"),
     stopButton: document.querySelector("#stopButton"),
+    exportPreservedButton: document.querySelector("#exportPreservedButton"),
+    discardButton: document.querySelector("#discardButton"),
     connectionMessage: document.querySelector("#connectionMessage"),
     elapsedValue: document.querySelector("#elapsedValue"),
     queueValue: document.querySelector("#queueValue"),
@@ -36,6 +38,7 @@
     CAPTURING: ["캡처 중", "status-capturing"],
     PAUSED_BACKPRESSURE: ["큐 대기", "status-paused"],
     PAUSED_QUOTA: ["할당량 소진", "status-error"],
+    PAUSED_ACTION: ["사용자 조치 필요", "status-error"],
     STOPPING: ["종료 중", "status-starting"],
     STOPPED: ["종료됨", "status-stopped"],
     ERROR: ["오류", "status-error"]
@@ -54,6 +57,7 @@
       SESSION_STATE.CAPTURING,
       SESSION_STATE.PAUSED_BACKPRESSURE,
       SESSION_STATE.PAUSED_QUOTA,
+      SESSION_STATE.PAUSED_ACTION,
       SESSION_STATE.STOPPING
     ].includes(snapshot.state);
   }
@@ -67,7 +71,10 @@
     elements.startButton.textContent = awaitingNewKey ? "새 키로 계속" : "캡처 시작";
     elements.startButton.disabled = active && !awaitingNewKey;
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
-    elements.serverUrl.disabled = active;
+    const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
+    elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
+    elements.discardButton.hidden = !needsAction;
+    elements.userId.disabled = active;
     elements.accessToken.disabled = active;
     elements.geminiApiKey.disabled = active && !awaitingNewKey;
     elements.geminiApiKey.placeholder = awaitingNewKey
@@ -229,9 +236,15 @@
   }
 
   async function startCapture() {
+    const userId = elements.userId.value.trim();
+    if (!userId) {
+      elements.connectionMessage.textContent = "관리자에게 받은 사용자 ID를 입력해 주세요.";
+      elements.userId.focus();
+      return;
+    }
     const accessToken = elements.accessToken.value.trim();
     if (!accessToken) {
-      elements.connectionMessage.textContent = "로컬 서버 실행 화면에 표시된 액세스 토큰을 입력해 주세요.";
+      elements.connectionMessage.textContent = "관리자에게 받은 접속 코드를 입력해 주세요.";
       elements.accessToken.focus();
       return;
     }
@@ -250,7 +263,8 @@
       type: MESSAGE.START_SESSION,
       payload: {
         tabId: tab.id,
-        serverBaseUrl: elements.serverUrl.value.trim(),
+        serverBaseUrl: LectureConfig.SERVER_BASE_URL,
+        userId,
         accessToken,
         geminiApiKey
       }
@@ -269,6 +283,25 @@
     });
     if (!response?.ok) throw new Error(response?.error || "캡처를 종료하지 못했습니다.");
     if (response.snapshot) render(response.snapshot);
+  }
+
+  async function discardSession() {
+    if (!confirm("보존된 원본 청크와 미완료 세션을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) return;
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.DISCARD_SESSION
+    });
+    if (!response?.ok) throw new Error(response?.error || "보존 세션을 폐기하지 못했습니다.");
+    if (response.snapshot) render(response.snapshot);
+  }
+
+  async function exportPreservedChunks() {
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.EXPORT_PRESERVED_CHUNKS
+    });
+    if (!response?.ok) throw new Error(response?.error || "보존 오디오를 내보내지 못했습니다.");
+    elements.connectionMessage.textContent = `보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`;
   }
 
   async function continueWithNewKey() {
@@ -417,6 +450,12 @@
       elements.connectionMessage.textContent = error.message;
       elements.stopButton.disabled = false;
     });
+  });
+  elements.discardButton.addEventListener("click", () => {
+    discardSession().catch((error) => { elements.connectionMessage.textContent = error.message; });
+  });
+  elements.exportPreservedButton.addEventListener("click", () => {
+    exportPreservedChunks().catch((error) => { elements.connectionMessage.textContent = error.message; });
   });
   elements.searchInput.addEventListener("input", renderCaptions);
   elements.copyButton.addEventListener("click", () => {

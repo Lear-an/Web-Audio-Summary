@@ -6,11 +6,14 @@ from pydantic import BaseModel, Field, SecretStr
 
 
 class HealthResponse(BaseModel):
-    status: str = "ok"
+    status: str
     model: str
     mock_mode: bool
+    storage: str
     chunk_seconds: int
     chunk_overlap_seconds: int
+    max_chunk_bytes: int
+    max_request_bytes: int
 
 
 class SessionCreateRequest(BaseModel):
@@ -20,9 +23,16 @@ class SessionCreateRequest(BaseModel):
     gemini_api_key: SecretStr
 
 
+class SessionResumeRequest(BaseModel):
+    gemini_api_key: SecretStr
+
+
 class SessionCreateResponse(BaseModel):
     session_id: str
     model: str
+    resumed: bool = False
+    next_sequence: int = 0
+    segments: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class SessionApiKeyUpdateRequest(BaseModel):
@@ -44,12 +54,7 @@ class ChunkResponse(BaseModel):
     session_id: str
     sequence: int
     segments: list[TranscriptSegment]
-
-
-class SummaryRequest(BaseModel):
-    previous_summary: dict[str, Any] = Field(default_factory=dict)
-    transcript: str = Field(default="", max_length=200_000)
-    bookmarks: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+    acked: bool = True
 
 
 class SummaryResponse(BaseModel):
@@ -58,3 +63,24 @@ class SummaryResponse(BaseModel):
     terms: list[str] = Field(default_factory=list, max_length=100)
     highlights: list[str] = Field(default_factory=list, max_length=100)
     checklist: list[str] = Field(default_factory=list, max_length=100)
+
+
+class ArchiveRequest(BaseModel):
+    source_title: str = Field(default="", max_length=1000)
+    bookmarks: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+    duration_ms: int = Field(default=0, ge=0)
+    expected_end_sequence: int = Field(default=0, ge=0)
+
+
+class ArchiveResponse(BaseModel):
+    saved: bool
+    status: str
+    document_id: str | None = None
+    chunk_count: int
+    missing_sequences: list[int] = Field(default_factory=list)
+    summary: SummaryResponse | None = None
+
+
+class DocumentListResponse(BaseModel):
+    items: list[dict[str, Any]]
+    next_cursor: str | None = None

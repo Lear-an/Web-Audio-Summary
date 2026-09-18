@@ -4,3 +4,4 @@ python-multipart>=0.0.9
 pydantic>=2.8,<3
 python-dotenv>=1.0,<2
 google-genai>=1.0,<2
+pymongo[srv]>=4.10,<5

@@ -1,16 +1,17 @@
 (function initializeOffscreenWorker() {
   const { TARGET, MESSAGE, SESSION_STATE } = LectureProtocol;
   const Core = LectureCore;
+  const Outbox = LectureOutbox;
+  const Config = LectureConfig;
 
   const DEFAULT_WINDOW_MS = 10_000;
   const DEFAULT_OVERLAP_MS = 1_000;
   const MIN_PARTIAL_CHUNK_MS = 1_000;
-  const SOFT_LIMIT = 24 * 1024 * 1024;
-  const HARD_LIMIT = 32 * 1024 * 1024;
-  const RESUME_LIMIT = 12 * 1024 * 1024;
+  const SOFT_LIMIT = 96 * 1024 * 1024;
+  const HARD_LIMIT = Config.OUTBOX_MAX_BYTES;
+  const RESUME_LIMIT = 64 * 1024 * 1024;
   const REQUEST_TIMEOUT_MS = 45_000;
   const MAX_ATTEMPTS = 3;
-  const SUMMARY_CHUNK_INTERVAL = 3;
   const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm"];
 
   function emptyNotes() {
@@ -28,7 +29,9 @@
       state: SESSION_STATE.IDLE,
       sourceTabId: null,
       sourceUrl: "",
+      sourceTitle: "",
       serverBaseUrl: "",
+      userId: "",
       accessToken: "",
       serverSessionId: null,
       stream: null,
@@ -38,6 +41,7 @@
       windowMs: DEFAULT_WINDOW_MS,
       windowIntervalMs: DEFAULT_WINDOW_MS - DEFAULT_OVERLAP_MS,
       overlapMs: DEFAULT_OVERLAP_MS,
+      maxChunkBytes: 6_000_000,
       startedAtEpochMs: null,
       captureOriginPerf: null,
       stoppedAtEpochMs: null,
@@ -56,10 +60,8 @@
       gaps: [],
       openGap: null,
       notes: emptyNotes(),
-      summaryCursor: 0,
-      successfulChunksSinceSummary: 0,
-      summaryInFlight: false,
-      summaryPromise: null,
+      documentId: null,
+      finalizePending: false,
       videoState: {
         hasVideo: false,
         paused: false,
@@ -107,6 +109,7 @@
       SESSION_STATE.CAPTURING,
       SESSION_STATE.PAUSED_BACKPRESSURE,
       SESSION_STATE.PAUSED_QUOTA,
+      SESSION_STATE.PAUSED_ACTION,
       SESSION_STATE.STOPPING
     ].includes(state);
   }
@@ -175,13 +178,10 @@
 
   function normalizeServerBaseUrl(rawValue) {
     const url = new URL(String(rawValue || ""));
-    if (url.protocol !== "http:") throw new Error("로컬 서버는 HTTP 주소여야 합니다.");
-    if (!["127.0.0.1", "localhost"].includes(url.hostname)) {
-      throw new Error("로컬 서버는 127.0.0.1 또는 localhost만 사용할 수 있습니다.");
-    }
-    if ((url.port || "80") !== "8050") {
-      throw new Error("현재 Manifest가 허용한 로컬 서버 포트는 8050입니다.");
-    }
+    const isLocal = url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname) && (url.port || "80") === "8050";
+    const configured = new URL(Config.SERVER_BASE_URL);
+    const isConfiguredProduction = url.protocol === "https:" && url.origin === configured.origin;
+    if (!isLocal && !isConfiguredProduction) throw new Error("확장 프로그램에 등록되지 않은 서버 주소입니다.");
     return url.origin;
   }
 
@@ -201,6 +201,7 @@
   function authHeaders(extra = {}) {
     return {
       Authorization: `Bearer ${session.accessToken}`,
+      "X-User-ID": session.userId,
       ...extra
     };
   }
@@ -213,19 +214,36 @@
       payload = null;
     }
     if (!response.ok) {
-      throw new HttpResponseError(
-        payload?.detail || payload?.error || `서버 요청 실패 (${response.status})`,
+      const error = new HttpResponseError(
+        payload?.error?.message || payload?.detail || payload?.error || `서버 요청 실패 (${response.status})`,
         response.status,
         response.headers.get("Retry-After")
       );
+      error.code = payload?.error?.code || "http_error";
+      error.action = payload?.error?.action || null;
+      throw error;
     }
     return payload;
   }
 
   async function verifyServer() {
-    const response = await fetchWithTimeout(`${session.serverBaseUrl}/health`, {}, 5_000);
-    const payload = await assertResponse(response);
-    if (payload?.status !== "ok") throw new Error("로컬 서버 상태가 정상적이지 않습니다.");
+    let payload = null;
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        const response = await fetchWithTimeout(`${session.serverBaseUrl}/health/ready`, {}, 15_000);
+        payload = await assertResponse(response);
+        break;
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 3) break;
+        session.notice = `서버를 깨우는 중입니다. 연결 재시도 ${attempt}/2`;
+        broadcastSnapshot();
+        await delay(attempt * 2_000);
+      }
+    }
+    if (!payload) throw lastError || new Error("서버에 연결하지 못했습니다.");
+    if (payload?.status !== "ok") throw new Error("서버 상태가 정상적이지 않습니다.");
     const chunkSeconds = Core.clampNumber(payload.chunk_seconds, 5, 600);
     const overlapSeconds = Core.clampNumber(payload.chunk_overlap_seconds, 0, 30);
     if (overlapSeconds >= chunkSeconds) {
@@ -234,6 +252,7 @@
     session.windowMs = Math.round(chunkSeconds * 1000);
     session.overlapMs = Math.round(overlapSeconds * 1000);
     session.windowIntervalMs = session.windowMs - session.overlapMs;
+    session.maxChunkBytes = Math.max(100_000, Number(payload.max_chunk_bytes) || 6_000_000);
   }
 
   async function createServerSession(geminiApiKey) {
@@ -250,6 +269,85 @@
     const payload = await assertResponse(response);
     if (!payload?.session_id) throw new Error("서버가 세션 ID를 반환하지 않았습니다.");
     session.serverSessionId = payload.session_id;
+    await preserveSessionMarker("ACTIVE");
+  }
+
+  async function preserveSessionMarker(state, detail = "") {
+    if (!session.serverSessionId) return;
+    const now = Date.now();
+    await Outbox.put({
+      id: `${session.serverSessionId}:session`,
+      kind: "session",
+      sessionId: session.serverSessionId,
+      sourceUrl: session.sourceUrl,
+      sourceTitle: session.sourceTitle,
+      sequence: -1,
+      size: 0,
+      state,
+      detail,
+      createdAtEpochMs: now,
+      updatedAtEpochMs: now,
+      expiresAtEpochMs: now + Config.OUTBOX_RETENTION_HOURS * 60 * 60 * 1000,
+      startedAtEpochMs: session.startedAtEpochMs,
+      stoppedAtEpochMs: session.stoppedAtEpochMs,
+      nextSequence: session.nextSequence,
+      bookmarks: session.bookmarks
+    }, Config.OUTBOX_MAX_BYTES);
+  }
+
+  async function resumeServerSession(sessionId, geminiApiKey) {
+    const response = await fetchWithTimeout(
+      `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/resume`,
+      {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ gemini_api_key: geminiApiKey })
+      }
+    );
+    const payload = await assertResponse(response);
+    session.serverSessionId = sessionId;
+    session.captions = Array.isArray(payload?.segments) ? payload.segments : [];
+    session.nextSequence = Math.max(0, Number(payload?.next_sequence) || 0);
+  }
+
+  async function restoreRecoverableOutbox(geminiApiKey) {
+    await Outbox.markExpired();
+    const latest = await Outbox.latestRecoverable(session.sourceUrl);
+    if (!latest) return false;
+    if (latest.state === "EXPIRED") {
+      session.serverSessionId = latest.sessionId;
+      const expiredRecords = await Outbox.listSession(latest.sessionId);
+      session.queue = expiredRecords.filter((record) => record.kind !== "session");
+      session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.blob?.size || chunk.size || 0), 0);
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = "72시간이 지난 보존 청크가 있습니다. 내보내기 후 폐기하거나 세션을 정리해 주세요.";
+      return true;
+    }
+    await resumeServerSession(latest.sessionId, geminiApiKey);
+    const records = await Outbox.listSession(latest.sessionId);
+    const marker = records.find((record) => record.kind === "session");
+    if (marker) {
+      session.sourceTitle = marker.sourceTitle || session.sourceTitle;
+      session.startedAtEpochMs = marker.startedAtEpochMs || session.startedAtEpochMs;
+      session.stoppedAtEpochMs = marker.stoppedAtEpochMs || null;
+      session.bookmarks = Array.isArray(marker.bookmarks) ? marker.bookmarks : [];
+      session.finalizePending = marker.state === "FINALIZE_PENDING";
+    }
+    const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED"].includes(record.state));
+    session.queue = pending.map((record) => ({ ...record, unavailableAttempts: record.unavailableAttempts || 0 }));
+    session.queue.sort((left, right) => left.sequence - right.sequence);
+    session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.blob?.size || chunk.size || 0), 0);
+    session.nextSequence = Math.max(
+      session.nextSequence,
+      ...records.filter((record) => record.kind !== "session").map((record) => Number(record.sequence) + 1)
+    );
+    session.notice = `보존된 세션과 청크 ${pending.length}개를 복구했습니다.`;
+    if (pending.some((record) => record.state === "NEEDS_ACTION")) {
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = "사용자 조치가 필요한 원본 청크가 보존되어 있습니다.";
+    }
+    if (!session.finalizePending) await preserveSessionMarker("ACTIVE");
+    return true;
   }
 
   function chooseMimeType() {
@@ -382,10 +480,22 @@
     const durationMs = captureEndMs - context.captureStartMs;
     const blob = new Blob(context.parts, { type: context.recorder.mimeType || session.mimeType });
 
-    if (durationMs >= MIN_PARTIAL_CHUNK_MS && blob.size > 0) {
-      session.queue.push({
+    try {
+      if (durationMs >= MIN_PARTIAL_CHUNK_MS && blob.size > 0) {
+      const oversized = blob.size > session.maxChunkBytes;
+      if (blob.size > session.maxChunkBytes) {
+        session.state = SESSION_STATE.PAUSED_ACTION;
+        session.notice = `청크 ${context.sequence}이 서버 제한을 초과했습니다. 원본을 보존하고 캡처를 중단합니다.`;
+        cancelWindowScheduler();
+      }
+      const chunk = {
+        id: Outbox.recordId(session.serverSessionId, context.sequence),
+        kind: "chunk",
+        sessionId: session.serverSessionId,
+        sourceUrl: session.sourceUrl,
         sequence: context.sequence,
         blob,
+        size: blob.size,
         captureStartMs: context.captureStartMs,
         captureEndMs,
         durationMs,
@@ -393,14 +503,36 @@
         playbackRate: context.playbackRate,
         overlapMs: context.overlapMs,
         mimeType: blob.type || session.mimeType,
-        unavailableAttempts: 0
-      });
-      session.queue.sort((left, right) => left.sequence - right.sequence);
-      session.queuedBytes += blob.size;
+        unavailableAttempts: 0,
+        state: oversized ? "NEEDS_ACTION" : "PENDING",
+        createdAtEpochMs: Date.now(),
+        updatedAtEpochMs: Date.now(),
+        expiresAtEpochMs: Date.now() + Config.OUTBOX_RETENTION_HOURS * 60 * 60 * 1000
+      };
+      try {
+        const estimate = await navigator.storage?.estimate?.();
+        if (
+          estimate?.quota &&
+          Number(estimate.usage || 0) + blob.size > Number(estimate.quota)
+        ) {
+          throw new Error("브라우저 저장 공간이 부족합니다.");
+        }
+        await Outbox.put(chunk, Config.OUTBOX_MAX_BYTES);
+        session.queue.push(chunk);
+        session.queue.sort((left, right) => left.sequence - right.sequence);
+        session.queuedBytes += blob.size;
+      } catch (error) {
+        session.state = SESSION_STATE.PAUSED_ACTION;
+        session.notice = `오디오 보관 한도에 도달했습니다: ${serializeError(error)}`;
+        cancelWindowScheduler();
+        session.queue.push(chunk);
+        session.queuedBytes += blob.size;
+      }
+      }
+    } finally {
+      context.parts.length = 0;
+      context.resolveDone();
     }
-
-    context.parts.length = 0;
-    context.resolveDone();
     enforceMemoryLimits();
     scheduleQueueProcessing();
     broadcastSnapshot();
@@ -431,12 +563,12 @@
   function enforceMemoryLimits() {
     const bytes = audioBytes();
     if (bytes >= HARD_LIMIT && session.state === SESSION_STATE.CAPTURING) {
-      setState(SESSION_STATE.PAUSED_BACKPRESSURE, "오디오 큐가 32MB에 도달하여 캡처를 일시정지했습니다.");
+      setState(SESSION_STATE.PAUSED_BACKPRESSURE, "오디오 큐가 128MiB에 도달하여 캡처를 일시정지했습니다.");
       openGap("memory_backpressure");
       cancelWindowScheduler();
       void stopAllRecorders();
     } else if (bytes >= SOFT_LIMIT && session.state === SESSION_STATE.CAPTURING) {
-      session.notice = "오디오 큐가 24MB를 넘어 처리 지연을 감시하고 있습니다.";
+      session.notice = "오디오 큐가 96MiB를 넘어 처리 지연을 감시하고 있습니다.";
     }
   }
 
@@ -468,7 +600,7 @@
       session.processing ||
       session.queue.length === 0 ||
       !session.serverSessionId ||
-      session.state === SESSION_STATE.PAUSED_QUOTA
+      [SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)
     ) return;
     session.queue.sort((left, right) => left.sequence - right.sequence);
     if (lowerSequenceStillRecording(session.queue[0].sequence)) {
@@ -486,34 +618,40 @@
 
     try {
       const startedAt = performance.now();
+      await Outbox.updateState(chunk.id, "SENDING");
       const response = await uploadWithRetry(chunk);
       const latencyMs = Math.round(performance.now() - startedAt);
       session.stats.lastLatencyMs = latencyMs;
       session.stats.recentLatenciesMs.push(latencyMs);
       if (session.stats.recentLatenciesMs.length > 100) session.stats.recentLatenciesMs.shift();
       applyTranscriptResponse(chunk, response);
+      await Outbox.remove(chunk.id);
     } catch (error) {
-      if (error?.status === 429 || error?.status === 503) {
+      const retryable = !error?.status || error?.status === 503 || Core.isRetryableStatus(error?.status);
+      if (error?.status === 429 || retryable) {
         session.queue.unshift(chunk);
         session.queuedBytes += chunk.blob.size;
-        if (error?.status === 503) {
-          chunk.unavailableAttempts = (chunk.unavailableAttempts || 0) + 1;
-          nextProcessingDelayMs = Core.transientRetryDelayMs(chunk.unavailableAttempts);
-          session.stats.retries += 1;
-          session.notice = `Gemini 모델 혼잡: 청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
-        }
+        chunk.unavailableAttempts = (chunk.unavailableAttempts || 0) + 1;
+        nextProcessingDelayMs = Core.transientRetryDelayMs(chunk.unavailableAttempts);
+        session.stats.retries += 1;
+        await Outbox.updateState(chunk.id, error?.status === 429 ? "PAUSED_QUOTA" : "RETRY_WAIT", serializeError(error));
+        session.notice = error?.status === 429
+          ? "Gemini 할당량이 소진되어 원본 청크를 보존했습니다."
+          : `청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
       } else {
         session.stats.failedChunks += 1;
-        session.gaps.push({
-          reason: "chunk_failed",
-          start_ms: chunk.videoStartMs,
-          end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
-        });
+        await Outbox.updateState(chunk.id, "NEEDS_ACTION", serializeError(error));
+        chunk.state = "NEEDS_ACTION";
+        session.queue.unshift(chunk);
+        session.queuedBytes += chunk.blob.size;
+        session.state = SESSION_STATE.PAUSED_ACTION;
+        session.notice = `청크 ${chunk.sequence}을 원본 보존 상태로 전환했습니다: ${serializeError(error)}`;
+        cancelWindowScheduler();
+        openGap(error?.code || "chunk_needs_action");
+        await stopAllRecorders();
       }
       if (error?.status === 429) {
         await pauseForQuota();
-      } else if (error?.status !== 503) {
-        session.notice = `청크 ${chunk.sequence} 처리 실패: ${serializeError(error)}`;
       }
     } finally {
       session.inFlightBytes = 0;
@@ -522,7 +660,7 @@
       enforceMemoryLimits();
       maybeResumeAfterBackpressure();
       broadcastSnapshot();
-      if (session.queue.length > 0 && session.state !== SESSION_STATE.PAUSED_QUOTA) {
+      if (session.queue.length > 0 && ![SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)) {
         scheduleQueueProcessing(nextProcessingDelayMs);
       }
     }
@@ -593,85 +731,10 @@
       })
       .filter((segment) => segment.text && segment.end_ms >= segment.start_ms);
 
-    session.captions = Core.reconcileCaptionBoundary(session.captions, incoming, 4);
+    session.captions = session.captions.filter((item) => item.sequence !== chunk.sequence).concat(incoming);
+    session.captions.sort((left, right) => left.start_ms - right.start_ms);
     session.stats.lastSequence = chunk.sequence;
     session.notice = "";
-    session.successfulChunksSinceSummary += 1;
-    if (session.successfulChunksSinceSummary >= SUMMARY_CHUNK_INTERVAL && !session.summaryInFlight) {
-      session.successfulChunksSinceSummary = 0;
-      void requestSummary("intermediate");
-    }
-  }
-
-  function requestSummary(kind) {
-    if (!session.serverSessionId) return Promise.resolve();
-    if (session.summaryPromise) {
-      if (kind === "final") {
-        return session.summaryPromise.then(() => requestSummary("final"));
-      }
-      return session.summaryPromise;
-    }
-
-    session.summaryInFlight = true;
-    session.summaryPromise = performSummary(kind).finally(() => {
-      session.summaryInFlight = false;
-      session.summaryPromise = null;
-      broadcastSnapshot();
-    });
-    return session.summaryPromise;
-  }
-
-  async function performSummary(kind) {
-    const newCaptions = session.captions.slice(session.summaryCursor);
-    if (kind === "intermediate" && newCaptions.length === 0) return;
-    const transcript = newCaptions
-      .map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`)
-      .join("\n")
-      .slice(-180_000);
-    const endpoint = kind === "final" ? "summaries/final" : "summaries/intermediate";
-
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
-      try {
-        const response = await fetchWithTimeout(
-          `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/${endpoint}`,
-          {
-            method: "POST",
-            headers: authHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({
-              previous_summary: session.notes,
-              transcript,
-              bookmarks: session.bookmarks
-            })
-          },
-          60_000
-        );
-        const payload = await assertResponse(response);
-        session.notes = {
-          summary: String(payload?.summary || ""),
-          concepts: Array.isArray(payload?.concepts) ? payload.concepts : [],
-          terms: Array.isArray(payload?.terms) ? payload.terms : [],
-          highlights: Array.isArray(payload?.highlights) ? payload.highlights : [],
-          checklist: Array.isArray(payload?.checklist) ? payload.checklist : []
-        };
-        session.summaryCursor = session.captions.length;
-        return;
-      } catch (error) {
-        if (error?.status === 429) {
-          await pauseForQuota();
-          return;
-        }
-        if (error?.status === 503 && attempt < 4) {
-          const retryDelayMs = Core.transientRetryDelayMs(attempt);
-          session.stats.retries += 1;
-          session.notice = `Gemini 모델 혼잡: 요약을 ${Math.ceil(retryDelayMs / 1000)}초 후 재시도합니다.`;
-          broadcastSnapshot();
-          await delay(retryDelayMs);
-          continue;
-        }
-        session.notice = `요약 생성 실패: ${serializeError(error)}`;
-        return;
-      }
-    }
   }
 
   async function startSession(payload) {
@@ -681,35 +744,59 @@
     session.state = SESSION_STATE.STARTING;
     session.sourceTabId = Number(payload.sourceTabId);
     session.sourceUrl = String(payload.sourceUrl || "");
-    session.serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl || "http://127.0.0.1:8050");
+    session.sourceTitle = String(payload.sourceTitle || "");
+    session.serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl || Config.SERVER_BASE_URL);
+    session.userId = String(payload.userId || "").trim();
     session.accessToken = String(payload.accessToken || "").trim();
     let geminiApiKey = String(payload.geminiApiKey || "").trim();
     payload.geminiApiKey = "";
     session.videoState = { ...session.videoState, ...(payload.videoState || {}) };
     session.startedAtEpochMs = Date.now();
-    if (!session.accessToken) throw new Error("로컬 서버 액세스 토큰을 입력해 주세요.");
+    if (!session.userId) throw new Error("사용자 ID를 입력해 주세요.");
+    if (!session.accessToken) throw new Error("접속 코드를 입력해 주세요.");
     if (!geminiApiKey) throw new Error("Gemini API 키를 입력해 주세요.");
     broadcastSnapshot();
 
     try {
       await verifyServer();
-      await createServerSession(geminiApiKey);
+      await navigator.storage?.persist?.().catch(() => false);
+      const resumed = await restoreRecoverableOutbox(geminiApiKey);
+      if (!resumed) await createServerSession(geminiApiKey);
       geminiApiKey = "";
+      if (session.finalizePending) {
+        session.notice = "보류된 최종 요약과 저장을 다시 시도하고 있습니다.";
+        broadcastSnapshot();
+        const archive = await archiveServerSessionWithRetry();
+        session.state = SESSION_STATE.STOPPED;
+        session.notice = archive?.saved
+          ? `최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
+          : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
+        session.accessToken = "";
+        session.userId = "";
+        broadcastSnapshot();
+        return { ok: true, snapshot: publicSnapshot() };
+      }
+      if (session.state === SESSION_STATE.PAUSED_ACTION) {
+        broadcastSnapshot();
+        return { ok: true, snapshot: publicSnapshot() };
+      }
       session.mimeType = chooseMimeType();
       await connectMediaStream(payload.streamId);
       session.captureOriginPerf = performance.now();
-      session.state = SESSION_STATE.CAPTURING;
-      session.notice = session.videoState.hasVideo && session.videoState.paused
-        ? "영상 재생을 기다리고 있습니다."
-        : "캡처 중";
-      if (!session.videoState.hasVideo || !session.videoState.paused) {
-        scheduleRecordingWindows(true);
+      if (session.state !== SESSION_STATE.PAUSED_ACTION) {
+        session.state = SESSION_STATE.CAPTURING;
+        session.notice = session.videoState.hasVideo && session.videoState.paused
+          ? "영상 재생을 기다리고 있습니다."
+          : "캡처 중";
+        if (!session.videoState.hasVideo || !session.videoState.paused) {
+          scheduleRecordingWindows(true);
+        }
+        if (session.queue.length > 0) scheduleQueueProcessing(0);
       }
       broadcastSnapshot();
       return { ok: true, snapshot: publicSnapshot() };
     } catch (error) {
       geminiApiKey = "";
-      await deleteServerSession();
       await releaseMediaResources();
       setError(error);
       throw error;
@@ -733,7 +820,12 @@
           body: JSON.stringify({ gemini_api_key: geminiApiKey })
         }
       );
-      await assertResponse(response);
+      try {
+        await assertResponse(response);
+      } catch (error) {
+        if (error?.code !== "session_resume_required") throw error;
+        await resumeServerSession(session.serverSessionId, geminiApiKey);
+      }
     } finally {
       geminiApiKey = "";
     }
@@ -751,27 +843,6 @@
     scheduleQueueProcessing(0);
     broadcastSnapshot();
     return { ok: true, snapshot: publicSnapshot() };
-  }
-
-  function dropQueuedChunks(reason) {
-    if (session.processTimer) clearTimeout(session.processTimer);
-    session.processTimer = null;
-    const droppedChunks = [...session.queue];
-    if (session.processing && session.inFlightChunk) droppedChunks.unshift(session.inFlightChunk);
-    const seenSequences = new Set();
-    for (const chunk of droppedChunks) {
-      if (seenSequences.has(chunk.sequence)) continue;
-      seenSequences.add(chunk.sequence);
-      session.gaps.push({
-        reason,
-        start_ms: chunk.videoStartMs,
-        end_ms: Math.round(chunk.videoStartMs + chunk.durationMs * chunk.playbackRate)
-      });
-    }
-    session.stats.failedChunks += seenSequences.size;
-    session.queue.length = 0;
-    session.queuedBytes = 0;
-    return seenSequences.size;
   }
 
   async function waitForQueueDrain(maxWaitMs = null) {
@@ -797,13 +868,64 @@
       while (session.processing && Date.now() < inFlightDeadline) await delay(100);
     }
 
-    let droppedCount = 0;
-    if (session.queue.length > 0 || session.processing) {
-      droppedCount = dropQueuedChunks("stop_timeout");
-      session.notice = `종료 대기시간을 초과해 청크 ${droppedCount}개를 누락 처리했습니다.`;
+    const pendingCount = session.queue.length + (session.processing ? 1 : 0);
+    if (pendingCount > 0) {
+      session.notice = `종료 대기시간을 초과했습니다. 청크 ${pendingCount}개는 IndexedDB에 보존됩니다.`;
       broadcastSnapshot();
     }
-    return { drained: droppedCount === 0, droppedCount };
+    return { drained: pendingCount === 0, pendingCount };
+  }
+
+  async function archiveServerSession() {
+    if (!session.serverSessionId) return null;
+    const response = await fetchWithTimeout(
+      `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/archive`,
+      {
+        method: "POST",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({
+          source_title: session.sourceTitle,
+          bookmarks: session.bookmarks,
+          duration_ms: Math.max(0, (session.stoppedAtEpochMs || Date.now()) - (session.startedAtEpochMs || Date.now())),
+          expected_end_sequence: session.nextSequence
+        })
+      },
+      60_000
+    );
+    const payload = await assertResponse(response);
+    if (payload?.summary) {
+      session.notes = {
+        summary: String(payload.summary.summary || ""),
+        concepts: Array.isArray(payload.summary.concepts) ? payload.summary.concepts : [],
+        terms: Array.isArray(payload.summary.terms) ? payload.summary.terms : [],
+        highlights: Array.isArray(payload.summary.highlights) ? payload.summary.highlights : [],
+        checklist: Array.isArray(payload.summary.checklist) ? payload.summary.checklist : []
+      };
+    }
+    session.documentId = payload?.document_id || null;
+    if (payload?.saved) {
+      await Outbox.remove(`${session.serverSessionId}:session`);
+    } else {
+      await preserveSessionMarker("INCOMPLETE", `누락 청크: ${(payload?.missing_sequences || []).join(", ")}`);
+    }
+    return payload;
+  }
+
+  async function archiveServerSessionWithRetry() {
+    let lastError = null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        return await archiveServerSession();
+      } catch (error) {
+        lastError = error;
+        if (error?.status === 429 || (error?.status && error.status !== 503) || attempt >= 3) break;
+        const waitMs = Core.transientRetryDelayMs(attempt + 1);
+        session.notice = `최종 저장이 지연되어 ${Math.ceil(waitMs / 1000)}초 후 다시 시도합니다.`;
+        broadcastSnapshot();
+        await delay(waitMs);
+      }
+    }
+    throw lastError || new Error("최종 저장에 실패했습니다.");
   }
 
   async function stopSession(reason = "사용자가 캡처를 종료했습니다.") {
@@ -811,7 +933,7 @@
       return { ok: true, snapshot: publicSnapshot() };
     }
     if (session.stopping) return { ok: true, snapshot: publicSnapshot() };
-    const quotaWasExhausted = session.state === SESSION_STATE.PAUSED_QUOTA;
+    const processingWasBlocked = [SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state);
     session.stopping = true;
     session.state = SESSION_STATE.STOPPING;
     session.notice = reason;
@@ -819,42 +941,31 @@
     broadcastSnapshot();
 
     await stopAllRecorders();
-    const drainResult = quotaWasExhausted
-      ? { drained: false, droppedCount: dropQueuedChunks("quota_abandoned") }
+    const drainResult = processingWasBlocked
+      ? { drained: false, pendingCount: session.queue.length + (session.processing ? 1 : 0) }
       : await waitForQueueDrain();
-    if (session.captions.length > 0 && !quotaWasExhausted) await requestSummary("final");
     closeGap();
+    session.stoppedAtEpochMs = Date.now();
+    try {
+      const archive = await archiveServerSessionWithRetry();
+      session.notice = archive?.saved
+        ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
+        : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
+    } catch (error) {
+      await preserveSessionMarker("FINALIZE_PENDING", serializeError(error));
+      session.notice = `${reason} 최종 저장은 보류됐습니다: ${serializeError(error)}`;
+    }
     await releaseMediaResources();
-    await deleteServerSession();
 
     session.stopping = false;
     session.state = SESSION_STATE.STOPPED;
-    session.stoppedAtEpochMs = Date.now();
-    if (quotaWasExhausted && drainResult.droppedCount > 0) {
-      session.notice = `${reason} 새 키 없이 종료하여 보존 청크 ${drainResult.droppedCount}개가 처리되지 않았습니다.`;
-    } else {
-      session.notice = drainResult.droppedCount > 0
-        ? `${reason} 종료 대기시간 초과로 청크 ${drainResult.droppedCount}개가 누락되었습니다.`
-        : reason;
+    if (!drainResult.drained && !session.notice.includes("미완료")) {
+      session.notice += ` 청크 ${drainResult.pendingCount || 0}개는 IndexedDB에 남아 있습니다.`;
     }
     session.accessToken = "";
+    session.userId = "";
     broadcastSnapshot();
     return { ok: true, snapshot: publicSnapshot() };
-  }
-
-  async function deleteServerSession() {
-    if (!session.serverSessionId || !session.serverBaseUrl || !session.accessToken) return;
-    try {
-      await fetchWithTimeout(
-        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}`,
-        { method: "DELETE", headers: authHeaders() },
-        5_000
-      );
-    } catch {
-      // 세션 종료 중 서버 정리 실패는 로컬 미디어 정리를 막지 않습니다.
-    } finally {
-      session.serverSessionId = null;
-    }
   }
 
   async function releaseMediaResources() {
@@ -873,6 +984,53 @@
       } catch {}
     }
     session.audioContext = null;
+  }
+
+  async function discardSession() {
+    if (!session.serverSessionId) return { ok: true, snapshot: publicSnapshot() };
+    cancelWindowScheduler();
+    await stopAllRecorders();
+    await releaseMediaResources();
+    const records = await Outbox.listSession(session.serverSessionId);
+    await Promise.all(records.map((record) => Outbox.remove(record.id)));
+    try {
+      const response = await fetchWithTimeout(
+        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}`,
+        { method: "DELETE", headers: authHeaders() },
+        10_000
+      );
+      await assertResponse(response);
+    } catch (error) {
+      session.notice = `로컬 원본은 폐기했지만 서버 초안 삭제 확인에 실패했습니다: ${serializeError(error)}`;
+    }
+    session.queue = [];
+    session.queuedBytes = 0;
+    session.serverSessionId = null;
+    session.state = SESSION_STATE.STOPPED;
+    session.stoppedAtEpochMs = Date.now();
+    session.notice ||= "보존된 원본 청크와 미완료 세션을 폐기했습니다.";
+    broadcastSnapshot();
+    return { ok: true, snapshot: publicSnapshot() };
+  }
+
+  async function exportPreservedChunks() {
+    if (!session.serverSessionId) throw new Error("내보낼 보존 세션이 없습니다.");
+    const records = await Outbox.listSession(session.serverSessionId);
+    const chunks = records.filter((record) => record.kind === "chunk" && record.blob instanceof Blob);
+    for (const chunk of chunks) {
+      const url = URL.createObjectURL(chunk.blob);
+      try {
+        await chrome.downloads.download({
+          url,
+          filename: `lecture-memo-${session.serverSessionId}-chunk-${chunk.sequence}.webm`,
+          conflictAction: "uniquify",
+          saveAs: false
+        });
+      } finally {
+        setTimeout(() => URL.revokeObjectURL(url), 30_000);
+      }
+    }
+    return { ok: true, count: chunks.length };
   }
 
   async function resetRecordingWindows(restart, notice) {
@@ -970,6 +1128,10 @@
           return addBookmark(message.payload || {});
         case MESSAGE.DELETE_BOOKMARK:
           return deleteBookmark(message.payload || {});
+        case MESSAGE.EXPORT_PRESERVED_CHUNKS:
+          return exportPreservedChunks();
+        case MESSAGE.DISCARD_SESSION:
+          return discardSession();
         case MESSAGE.TAB_REMOVED:
           if (Number(message.payload?.tabId) === session.sourceTabId) {
             void stopSession("캡처 중인 탭이 닫혔습니다.");

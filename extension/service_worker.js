@@ -105,7 +105,9 @@ async function startSession(payload) {
     streamId,
     sourceTabId: tabId,
     sourceUrl: tab.url || "",
+    sourceTitle: tab.title || "",
     serverBaseUrl: payload.serverBaseUrl,
+    userId: payload.userId,
     accessToken: payload.accessToken,
     geminiApiKey: payload.geminiApiKey,
     videoState
@@ -196,6 +198,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return addBookmark(message.payload || {});
       case MESSAGE.DELETE_BOOKMARK:
         return sendToOffscreen(MESSAGE.DELETE_BOOKMARK, message.payload || {});
+      case MESSAGE.EXPORT_PRESERVED_CHUNKS:
+        return sendToOffscreen(MESSAGE.EXPORT_PRESERVED_CHUNKS);
+      case MESSAGE.DISCARD_SESSION:
+        return sendToOffscreen(MESSAGE.DISCARD_SESSION);
       default:
         return { ok: false, error: `알 수 없는 메시지: ${message.type}` };
     }

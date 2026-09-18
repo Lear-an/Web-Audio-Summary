@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: web-audio-summary
+    runtime: python
+    plan: free
+    autoDeployTrigger: off
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: uvicorn server.app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health/live
+    envVars:
+      - key: GEMINI_MODEL
+        value: gemini-3.6-flash
+      - key: APP_AUTH_MODE
+        value: multi_user
+      - key: APP_USER_1_ID
+        sync: false
+      - key: APP_USER_1_TOKEN
+        sync: false
+      - key: ALLOWED_EXTENSION_ORIGINS
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DATABASE
+        value: lecture_memo
+      - key: MOCK_GEMINI
+        value: "false"
+      - key: AUDIO_CHUNK_SECONDS
+        value: "300"
+      - key: AUDIO_CHUNK_OVERLAP_SECONDS
+        value: "5"
+      - key: MAX_CHUNK_BYTES
+        value: "6000000"
+      - key: MAX_REQUEST_BYTES
+        value: "6500000"
+      - key: MONGODB_REQUIRED
+        value: "true"
+      - key: INCOMPLETE_DRAFT_RETENTION_DAYS
+        value: "7"
