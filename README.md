@@ -64,12 +64,12 @@ python -m server.app
 1. MongoDB Atlas에서 데이터베이스 사용자와 연결 문자열을 준비합니다.
 2. Render에서 이 GitHub 저장소의 Web Service를 만들고 `render.yaml`을 사용합니다.
 3. Render 환경변수에 `MONGODB_URI`, 사용자별 `APP_USER_n_ID/TOKEN`, `ALLOWED_EXTENSION_ORIGINS`를 입력합니다.
-4. `extension/config.js`의 `SERVER_BASE_URL`을 실제 Render HTTPS URL로 교체합니다.
-5. `extension/manifest.json`의 placeholder host permission을 같은 Render URL로 교체합니다.
+4. `extension/config.js`의 `SERVER_BASE_URL`에는 실제 Render HTTPS URL이 반영되어 있습니다.
+5. `extension/manifest.json`의 Render host permission에도 같은 URL이 반영되어 있습니다.
 6. Chrome Developer Dashboard의 공개 키를 manifest의 `key`로 넣어 확장 ID를 고정합니다.
 7. 고정된 확장 ID를 `chrome-extension://<확장-id>` 형식으로 Render의 `ALLOWED_EXTENSION_ORIGINS`에 등록합니다.
 
-실제 Render URL과 manifest 공개 키는 공개 저장소에 임의 값으로 넣을 수 없어 현재 코드에 placeholder로 남아 있습니다. Render Auto-Deploy는 꺼져 있으며, CI 통과 뒤 관리자가 수동 배포하는 정책입니다.
+Render URL은 현재 `https://web-audio-summary.onrender.com`으로 반영되어 있습니다. Chrome Developer Dashboard의 manifest 공개 키와 확장 ID만 아직 운영자 입력값으로 남아 있습니다. Render Auto-Deploy는 꺼져 있으며, CI 통과 뒤 관리자가 수동 배포하는 정책입니다.
 
 필수 Render 비밀 환경변수 예시는 다음과 같습니다.
 
