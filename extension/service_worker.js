@@ -109,7 +109,6 @@ async function startSession(payload) {
     serverBaseUrl: payload.serverBaseUrl,
     userId: payload.userId,
     accessToken: payload.accessToken,
-    geminiApiKey: payload.geminiApiKey,
     videoState
   });
 
@@ -139,8 +138,7 @@ async function recoverSession(payload) {
     sourceTabId: tabId,
     sourceUrl: tab.url || "",
     sourceTitle: tab.title || "",
-    videoState,
-    geminiApiKey: payload.geminiApiKey
+    videoState
   });
 }
 
@@ -205,8 +203,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return startSession(message.payload || {});
       case MESSAGE.RECOVER_SESSION:
         return recoverSession(message.payload || {});
-      case MESSAGE.UPDATE_GEMINI_KEY:
-        return sendToOffscreen(MESSAGE.UPDATE_GEMINI_KEY, message.payload || {});
+      case MESSAGE.RETRY_SESSION:
+        return sendToOffscreen(MESSAGE.RETRY_SESSION);
       case MESSAGE.STOP_SESSION:
         return sendToOffscreen(MESSAGE.STOP_SESSION, message.payload || {});
       case MESSAGE.GET_SESSION_SNAPSHOT:

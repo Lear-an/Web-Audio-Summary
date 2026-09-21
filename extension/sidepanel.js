@@ -6,7 +6,6 @@
     statusBadge: document.querySelector("#statusBadge"),
     userId: document.querySelector("#userId"),
     accessToken: document.querySelector("#accessToken"),
-    geminiApiKey: document.querySelector("#geminiApiKey"),
     startButton: document.querySelector("#startButton"),
     stopButton: document.querySelector("#stopButton"),
     exportPreservedButton: document.querySelector("#exportPreservedButton"),
@@ -67,22 +66,16 @@
     elements.statusBadge.textContent = label;
     elements.statusBadge.className = `status ${className}`;
     const active = isRunning();
-    const awaitingNewKey = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
+    const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
     const recoveringSession = Boolean(snapshot.recoveryRequired);
-    elements.startButton.textContent = recoveringSession
-      ? "서버 세션 복구"
-      : (awaitingNewKey ? "새 키로 계속" : "캡처 시작");
-    elements.startButton.disabled = active && !awaitingNewKey && !recoveringSession;
+    elements.startButton.textContent = recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작");
+    elements.startButton.disabled = active && !recoveringSession && !retryingQuota;
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
     elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active;
     elements.accessToken.disabled = active;
-    elements.geminiApiKey.disabled = active && !awaitingNewKey && !recoveringSession;
-    elements.geminiApiKey.placeholder = recoveringSession
-      ? "서버 복구에 사용할 Gemini API 키"
-      : (awaitingNewKey ? "계속할 새 Gemini API 키" : "캡처 시작 시에만 사용");
     elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
   }
 
@@ -251,12 +244,6 @@
       elements.accessToken.focus();
       return;
     }
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
-      return;
-    }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("현재 탭을 찾을 수 없습니다.");
     elements.connectionMessage.textContent = "캡처를 준비하고 있습니다.";
@@ -268,12 +255,10 @@
         tabId: tab.id,
         serverBaseUrl: LectureConfig.SERVER_BASE_URL,
         userId,
-        accessToken,
-        geminiApiKey
+        accessToken
       }
     });
     if (!response?.ok) throw new Error(response?.error || "캡처를 시작하지 못했습니다.");
-    elements.geminiApiKey.value = "";
     if (response.snapshot) render(response.snapshot);
   }
 
@@ -307,32 +292,7 @@
     elements.connectionMessage.textContent = `보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`;
   }
 
-  async function continueWithNewKey() {
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "계속 사용할 새 Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
-      return;
-    }
-    elements.startButton.disabled = true;
-    elements.connectionMessage.textContent = "새 Gemini API 키를 적용하고 있습니다.";
-    const response = await chrome.runtime.sendMessage({
-      target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.UPDATE_GEMINI_KEY,
-      payload: { geminiApiKey }
-    });
-    if (!response?.ok) throw new Error(response?.error || "Gemini API 키를 교체하지 못했습니다.");
-    elements.geminiApiKey.value = "";
-    if (response.snapshot) render(response.snapshot);
-  }
-
   async function recoverSession() {
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "서버 세션 복구에 사용할 Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
-      return;
-    }
     const tabId = Number(snapshot.sourceTabId);
     if (!Number.isInteger(tabId)) throw new Error("기존 캡처 탭을 찾을 수 없습니다.");
     elements.startButton.disabled = true;
@@ -340,11 +300,21 @@
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
       type: MESSAGE.RECOVER_SESSION,
-      payload: { tabId, geminiApiKey }
+      payload: { tabId }
     });
-    elements.geminiApiKey.value = "";
     if (response?.snapshot) render(response.snapshot);
     if (!response?.ok) throw new Error(response?.error || "서버 세션을 복구하지 못했습니다.");
+  }
+
+  async function retrySession() {
+    elements.startButton.disabled = true;
+    elements.connectionMessage.textContent = "보존 청크 처리를 다시 시도합니다.";
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.RETRY_SESSION
+    });
+    if (response?.snapshot) render(response.snapshot);
+    if (!response?.ok) throw new Error(response?.error || "청크 처리를 다시 시작하지 못했습니다.");
   }
 
   async function addBookmark() {
@@ -463,7 +433,7 @@
   elements.startButton.addEventListener("click", () => {
     const action = snapshot.recoveryRequired
       ? recoverSession
-      : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? continueWithNewKey : startCapture);
+      : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? retrySession : startCapture);
     action().catch((error) => {
       elements.connectionMessage.textContent = error.message;
       elements.startButton.disabled = false;

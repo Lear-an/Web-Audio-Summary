@@ -8,13 +8,19 @@ services:
     startCommand: uvicorn server.app:app --host 0.0.0.0 --port $PORT --workers 1
     healthCheckPath: /health/live
     envVars:
-      - key: GEMINI_MODEL
-        value: gemini-3.6-flash
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_TRANSCRIBE_MODEL
+        value: gpt-transcribe
+      - key: OPENAI_TEXT_MODEL
+        value: gpt-5.6-luna
+      - key: SAFETY_IDENTIFIER_SECRET
+        generateValue: true
       - key: APP_AUTH_MODE
         value: multi_user
       - key: APP_USER_1_ID
         sync: false
-      - key: APP_USER_1_TOKEN
+      - key: APP_USER_1_TOKEN_SHA256
         sync: false
       - key: ALLOWED_EXTENSION_ORIGINS
         sync: false
@@ -22,17 +28,23 @@ services:
         sync: false
       - key: MONGODB_DATABASE
         value: lecture_memo
-      - key: MOCK_GEMINI
+      - key: MOCK_OPENAI
         value: "false"
       - key: AUDIO_CHUNK_SECONDS
-        value: "300"
+        value: "60"
       - key: AUDIO_CHUNK_OVERLAP_SECONDS
-        value: "5"
+        value: "2"
       - key: MAX_CHUNK_BYTES
         value: "6000000"
       - key: MAX_REQUEST_BYTES
         value: "6500000"
       - key: MONGODB_REQUIRED
         value: "true"
-      - key: INCOMPLETE_DRAFT_RETENTION_DAYS
+      - key: DRAFT_RETENTION_DAYS
         value: "7"
+      - key: MAX_REGISTERED_USERS
+        value: "10"
+      - key: MAX_CONCURRENT_USERS
+        value: "5"
+      - key: OPENAI_MAX_IN_FLIGHT
+        value: "3"

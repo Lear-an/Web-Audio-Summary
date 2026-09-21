@@ -65,16 +65,23 @@ if not exist "%ENV_FILE%" (
         goto :failed
     )
 
-    "%VENV_PYTHON%" -c "from pathlib import Path; import secrets; p=Path(r'%ENV_FILE%'); s=p.read_text(encoding='utf-8'); s=s.replace('LOCAL_ACCESS_TOKEN=', 'LOCAL_ACCESS_TOKEN='+secrets.token_urlsafe(24), 1); p.write_text(s, encoding='utf-8')"
+    "%VENV_PYTHON%" -c "from pathlib import Path; import secrets; p=Path(r'%ENV_FILE%'); s=p.read_text(encoding='utf-8'); s=s.replace('LOCAL_ACCESS_TOKEN=', 'LOCAL_ACCESS_TOKEN='+secrets.token_urlsafe(24), 1).replace('SAFETY_IDENTIFIER_SECRET=', 'SAFETY_IDENTIFIER_SECRET='+secrets.token_urlsafe(32), 1).replace('MOCK_OPENAI=false', 'MOCK_OPENAI=true', 1); p.write_text(s, encoding='utf-8')"
     if errorlevel 1 (
         echo [ERROR] Failed to write the initial server configuration.
         goto :failed
     )
 
-    echo       First-time setup uses MOCK_GEMINI=false.
-    echo       Enter the Gemini API key in the extension side panel.
+    echo       First-time local setup uses MOCK_OPENAI=true.
+    echo       To use the real API, set OPENAI_API_KEY and MOCK_OPENAI=false in server\.env.
 ) else (
     echo [3/4] Keeping the existing server\.env configuration.
+)
+
+rem Migrate an older Gemini configuration to safe GPT local defaults without printing secrets.
+"%VENV_PYTHON%" -c "from pathlib import Path; import re,secrets; p=Path(r'%ENV_FILE%'); s=p.read_text(encoding='utf-8'); s=re.sub(r'(?m)^AUDIO_CHUNK_SECONDS=300\s*$', 'AUDIO_CHUNK_SECONDS=60', s); s=re.sub(r'(?m)^AUDIO_CHUNK_OVERLAP_SECONDS=5\s*$', 'AUDIO_CHUNK_OVERLAP_SECONDS=2', s); additions=[]; additions += [] if re.search(r'(?m)^OPENAI_API_KEY=',s) else ['OPENAI_API_KEY=']; additions += [] if re.search(r'(?m)^OPENAI_TRANSCRIBE_MODEL=',s) else ['OPENAI_TRANSCRIBE_MODEL=gpt-transcribe']; additions += [] if re.search(r'(?m)^OPENAI_TEXT_MODEL=',s) else ['OPENAI_TEXT_MODEL=gpt-5.6-luna']; additions += [] if re.search(r'(?m)^MOCK_OPENAI=',s) else ['MOCK_OPENAI=true']; additions += [] if re.search(r'(?m)^SAFETY_IDENTIFIER_SECRET=',s) else ['SAFETY_IDENTIFIER_SECRET='+secrets.token_urlsafe(32)]; p.write_text(s.rstrip()+'\n'+('\n'.join(additions)+'\n' if additions else ''), encoding='utf-8')"
+if errorlevel 1 (
+    echo [ERROR] Failed to migrate server\.env to the V8 format.
+    goto :failed
 )
 
 if "%INSTALL_ONLY%"=="1" (

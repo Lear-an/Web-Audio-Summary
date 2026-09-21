@@ -4,13 +4,13 @@
   const Outbox = LectureOutbox;
   const Config = LectureConfig;
 
-  const DEFAULT_WINDOW_MS = 10_000;
-  const DEFAULT_OVERLAP_MS = 1_000;
+  const DEFAULT_WINDOW_MS = 60_000;
+  const DEFAULT_OVERLAP_MS = 2_000;
   const MIN_PARTIAL_CHUNK_MS = 1_000;
   const SOFT_LIMIT = 96 * 1024 * 1024;
   const HARD_LIMIT = Config.OUTBOX_MAX_BYTES;
   const RESUME_LIMIT = 64 * 1024 * 1024;
-  const REQUEST_TIMEOUT_MS = 45_000;
+  const REQUEST_TIMEOUT_MS = 480_000;
   const MAX_ATTEMPTS = 3;
   const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm"];
 
@@ -246,7 +246,7 @@
     }
     if (!payload) throw lastError || new Error("서버에 연결하지 못했습니다.");
     if (payload?.status !== "ok") throw new Error("서버 상태가 정상적이지 않습니다.");
-    const chunkSeconds = Core.clampNumber(payload.chunk_seconds, 5, 600);
+    const chunkSeconds = Core.clampNumber(payload.chunk_seconds, 15, 180);
     const overlapSeconds = Core.clampNumber(payload.chunk_overlap_seconds, 0, 30);
     if (overlapSeconds >= chunkSeconds) {
       throw new Error("서버의 오디오 청크 겹침 설정이 청크 길이보다 짧아야 합니다.");
@@ -257,15 +257,15 @@
     session.maxChunkBytes = Math.max(100_000, Number(payload.max_chunk_bytes) || 6_000_000);
   }
 
-  async function createServerSession(geminiApiKey) {
+  async function createServerSession() {
     const response = await fetchWithTimeout(`${session.serverBaseUrl}/v1/sessions`, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         source_tab_id: session.sourceTabId,
         source_url: session.sourceUrl,
-        language: "ko",
-        gemini_api_key: geminiApiKey
+        source_title: session.sourceTitle,
+        language: "auto"
       })
     });
     const payload = await assertResponse(response);
@@ -297,13 +297,13 @@
     }, Config.OUTBOX_MAX_BYTES);
   }
 
-  async function resumeServerSession(sessionId, geminiApiKey) {
+  async function resumeServerSession(sessionId) {
     const response = await fetchWithTimeout(
       `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(sessionId)}/resume`,
       {
         method: "POST",
         headers: authHeaders({ "Content-Type": "application/json" }),
-        body: JSON.stringify({ gemini_api_key: geminiApiKey })
+        body: JSON.stringify({})
       }
     );
     const payload = await assertResponse(response);
@@ -315,7 +315,7 @@
     );
   }
 
-  async function restoreRecoverableOutbox(geminiApiKey) {
+  async function restoreRecoverableOutbox() {
     await Outbox.markExpired();
     const latest = await Outbox.latestRecoverable(session.sourceUrl);
     if (!latest) return false;
@@ -328,7 +328,7 @@
       session.notice = "72시간이 지난 보존 청크가 있습니다. 내보내기 후 폐기하거나 세션을 정리해 주세요.";
       return true;
     }
-    await resumeServerSession(latest.sessionId, geminiApiKey);
+    await resumeServerSession(latest.sessionId);
     const records = await Outbox.listSession(latest.sessionId);
     const marker = records.find((record) => record.kind === "session");
     if (marker) {
@@ -350,7 +350,7 @@
     session.recoveryRequired = pending.some((record) => Core.isSessionResumeRequired(record));
     if (session.recoveryRequired) {
       session.state = SESSION_STATE.PAUSED_ACTION;
-      session.notice = "서버 세션이 초기화되었습니다. Gemini API 키를 입력하고 '서버 세션 복구'를 눌러 주세요.";
+      session.notice = "서버 세션이 초기화되었습니다. '서버 세션 복구'를 눌러 주세요.";
     } else if (pending.some((record) => record.state === "NEEDS_ACTION")) {
       session.state = SESSION_STATE.PAUSED_ACTION;
       session.notice = "사용자 조치가 필요한 원본 청크가 보존되어 있습니다.";
@@ -645,7 +645,7 @@
         session.stats.retries += 1;
         await Outbox.updateState(chunk.id, error?.status === 429 ? "PAUSED_QUOTA" : "RETRY_WAIT", serializeError(error));
         session.notice = error?.status === 429
-          ? "Gemini 할당량이 소진되어 원본 청크를 보존했습니다."
+          ? "OpenAI 운영 한도에 도달하여 원본 청크를 보존했습니다. 관리자에게 문의해 주세요."
           : `청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
       } else {
         const requiresSessionResume = error?.code === "session_resume_required";
@@ -705,9 +705,9 @@
     if (session.state === SESSION_STATE.PAUSED_QUOTA) return;
     session.recoveryRequired = false;
     session.state = SESSION_STATE.PAUSED_QUOTA;
-    session.notice = "Gemini API 할당량이 소진되었습니다. 실패 청크를 보존했습니다. 새 API 키를 입력하고 '새 키로 계속'을 눌러 주세요.";
+    session.notice = "OpenAI 운영 한도에 도달했습니다. 실패 청크를 보존했습니다. 관리자에게 문의해 주세요.";
     cancelWindowScheduler();
-    openGap("gemini_quota_exhausted");
+    openGap("openai_quota_exhausted");
     await stopAllRecorders();
     broadcastSnapshot();
   }
@@ -764,21 +764,17 @@
     session.serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl || Config.SERVER_BASE_URL);
     session.userId = String(payload.userId || "").trim();
     session.accessToken = String(payload.accessToken || "").trim();
-    let geminiApiKey = String(payload.geminiApiKey || "").trim();
-    payload.geminiApiKey = "";
     session.videoState = { ...session.videoState, ...(payload.videoState || {}) };
     session.startedAtEpochMs = Date.now();
     if (!session.userId) throw new Error("사용자 ID를 입력해 주세요.");
     if (!session.accessToken) throw new Error("접속 코드를 입력해 주세요.");
-    if (!geminiApiKey) throw new Error("Gemini API 키를 입력해 주세요.");
     broadcastSnapshot();
 
     try {
       await verifyServer();
       await navigator.storage?.persist?.().catch(() => false);
-      const resumed = await restoreRecoverableOutbox(geminiApiKey);
-      if (!resumed) await createServerSession(geminiApiKey);
-      geminiApiKey = "";
+      const resumed = await restoreRecoverableOutbox();
+      if (!resumed) await createServerSession();
       if (session.finalizePending) {
         session.notice = "보류된 최종 요약과 저장을 다시 시도하고 있습니다.";
         broadcastSnapshot();
@@ -812,63 +808,16 @@
       broadcastSnapshot();
       return { ok: true, snapshot: publicSnapshot() };
     } catch (error) {
-      geminiApiKey = "";
       await releaseMediaResources();
       setError(error);
       throw error;
     }
   }
 
-  async function updateGeminiKey(payload) {
-    if (session.state !== SESSION_STATE.PAUSED_QUOTA || !session.serverSessionId) {
-      throw new Error("할당량 소진으로 일시정지된 세션에서만 API 키를 교체할 수 있습니다.");
-    }
-    let geminiApiKey = String(payload.geminiApiKey || "").trim();
-    payload.geminiApiKey = "";
-    if (!geminiApiKey) throw new Error("새 Gemini API 키를 입력해 주세요.");
-
-    try {
-      const response = await fetchWithTimeout(
-        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}/gemini-key`,
-        {
-          method: "POST",
-          headers: authHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ gemini_api_key: geminiApiKey })
-        }
-      );
-      try {
-        await assertResponse(response);
-      } catch (error) {
-        if (error?.code !== "session_resume_required") throw error;
-        await resumeServerSession(session.serverSessionId, geminiApiKey);
-      }
-    } finally {
-      geminiApiKey = "";
-    }
-
-    closeGap();
-    if (audioBytes() >= HARD_LIMIT) {
-      session.state = SESSION_STATE.PAUSED_BACKPRESSURE;
-      session.notice = "새 API 키를 적용했습니다. 큐를 먼저 처리한 뒤 캡처를 재개합니다.";
-      openGap("memory_backpressure");
-    } else {
-      session.state = SESSION_STATE.CAPTURING;
-      session.notice = "새 API 키를 적용해 캡처와 청크 처리를 재개했습니다.";
-      if (!session.videoState?.hasVideo || !session.videoState.paused) scheduleRecordingWindows(true);
-    }
-    scheduleQueueProcessing(0);
-    broadcastSnapshot();
-    return { ok: true, snapshot: publicSnapshot() };
-  }
-
   async function recoverSession(payload) {
     if (session.state !== SESSION_STATE.PAUSED_ACTION || !session.recoveryRequired || !session.serverSessionId) {
       throw new Error("복구가 필요한 서버 세션이 없습니다.");
     }
-
-    let geminiApiKey = String(payload.geminiApiKey || "").trim();
-    payload.geminiApiKey = "";
-    if (!geminiApiKey) throw new Error("서버 세션 복구에 사용할 Gemini API 키를 입력해 주세요.");
 
     const sourceTabId = Number(payload.sourceTabId);
     if (!Number.isInteger(sourceTabId) || sourceTabId !== Number(session.sourceTabId)) {
@@ -879,7 +828,7 @@
     broadcastSnapshot();
 
     try {
-      await resumeServerSession(session.serverSessionId, geminiApiKey);
+      await resumeServerSession(session.serverSessionId);
       session.videoState = { ...session.videoState, ...(payload.videoState || {}) };
 
       for (const chunk of session.queue) {
@@ -919,9 +868,22 @@
         broadcastSnapshot();
       }
       return { ok: false, error: serializeError(error), snapshot: publicSnapshot() };
-    } finally {
-      geminiApiKey = "";
     }
+  }
+
+  async function retrySession() {
+    if (session.state !== SESSION_STATE.PAUSED_QUOTA || !session.serverSessionId) {
+      throw new Error("다시 시도할 보존 세션이 없습니다.");
+    }
+    closeGap();
+    session.state = audioBytes() >= HARD_LIMIT ? SESSION_STATE.PAUSED_BACKPRESSURE : SESSION_STATE.CAPTURING;
+    session.notice = "보존 청크 처리를 다시 시도합니다.";
+    if (session.state === SESSION_STATE.CAPTURING && (!session.videoState?.hasVideo || !session.videoState.paused)) {
+      scheduleRecordingWindows(true);
+    }
+    scheduleQueueProcessing(0);
+    broadcastSnapshot();
+    return { ok: true, snapshot: publicSnapshot() };
   }
 
   async function waitForQueueDrain(maxWaitMs = null) {
@@ -966,7 +928,7 @@
           source_title: session.sourceTitle,
           bookmarks: session.bookmarks,
           duration_ms: Math.max(0, (session.stoppedAtEpochMs || Date.now()) - (session.startedAtEpochMs || Date.now())),
-          expected_end_sequence: session.nextSequence
+          expected_chunk_count: session.nextSequence
         })
       },
       60_000
@@ -1197,8 +1159,8 @@
           return startSession(message.payload || {});
         case MESSAGE.RECOVER_SESSION:
           return recoverSession(message.payload || {});
-        case MESSAGE.UPDATE_GEMINI_KEY:
-          return updateGeminiKey(message.payload || {});
+        case MESSAGE.RETRY_SESSION:
+          return retrySession();
         case MESSAGE.STOP_SESSION:
           return stopSession(message.payload?.reason || "사용자가 캡처를 종료했습니다.");
         case MESSAGE.GET_SESSION_SNAPSHOT:
