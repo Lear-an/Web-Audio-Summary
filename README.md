@@ -11,7 +11,7 @@ Chrome 확장 프로그램
   ├─ IndexedDB: ACK 전 오디오 청크 임시 보관
   └─ HTTPS → Render FastAPI → OpenAI API
                               └→ MongoDB Atlas
-                                  (전사 초안·최종 TXT·요약)
+                                  (부분·완료 문서의 전사 텍스트·요약)
 ```
 
 - 사용자는 관리자에게 받은 사용자 ID와 접속 코드만 입력합니다.
@@ -26,6 +26,10 @@ Chrome 확장 프로그램
 - 서버 시작 시 기존 Atlas 세션·문서에 남은 URL도 같은 규칙으로 정리합니다.
 - 보존 세션 폐기는 서버 초안 삭제가 확인된 뒤 로컬 청크를 삭제합니다. 서버 삭제 실패 시 청크를 유지하며, 서버에 남은 부분 문서는 재개 불가 상태로 표시합니다.
 
+## V8 설계 대비 남은 구현
+
+V8 설계서는 목표 동작까지 포함합니다. 현재 코드는 인증 실패 횟수 제한, 동시 사용자 5명 제한의 경합 방지, 12 MB 초과 시 `input_too_large` 상태 보존을 아직 구현하지 않았습니다. `daily_usage`의 텍스트 토큰·예상 비용 집계와 선택적 텍스트 모델 fallback도 미구현입니다. 문서 목록·상세 API는 있지만 확장 프로그램의 복구 세션 목록 및 저장 문서 목록·상세 화면은 아직 없습니다.
+
 ## 저장소 구성
 
 ```text
@@ -36,33 +40,9 @@ render.yaml     Render 무료 Web Service 설정
 .github/        GitHub Actions CI
 ```
 
-## 로컬 개발
+## 사용자 이용
 
-Windows에서는 프로젝트 루트의 `setup-and-run-server.cmd`를 더블클릭하면 Python 확인·설치, 가상환경 생성, 패키지 설치, 로컬 토큰 생성과 서버 실행을 순서대로 처리합니다.
-
-PowerShell에서 실행할 때는 현재 폴더 실행 표시가 필요합니다.
-
-```powershell
-.\setup-and-run-server.cmd
-```
-
-설치만 하려면 다음 명령을 사용합니다.
-
-```powershell
-.\setup-and-run-server.cmd --install-only
-```
-
-수동 설치는 Python 3.11 이상에서 가능합니다.
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r server\requirements.txt
-Copy-Item server\.env.example server\.env
-python -m server.app
-```
-
-기본 로컬 주소는 `http://127.0.0.1:8050`입니다. 최초 자동 생성되는 `server/.env`는 60초 청크, 2초 겹침, `MOCK_OPENAI=true`입니다. 실제 호출은 `OPENAI_API_KEY`를 입력하고 `MOCK_OPENAI=false`로 변경합니다.
+운영 서버는 Render에서 실행됩니다. 사용자는 Python이나 로컬 서버를 설치할 필요 없이 Chrome에 `extension` 폴더를 로드하고, 관리자에게 받은 사용자 ID와 접속 코드를 입력하면 됩니다. 확장 프로그램 설치와 캡처 방법은 [사용 설명서](사용설명서.md)를 참고하세요.
 
 ## Render·Atlas 운영 준비
 
@@ -94,22 +74,28 @@ SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 - OpenAI quota `429`: 자동 재시도를 중단하고 원본 청크를 보존합니다. 운영자가 결제·한도를 해결한 뒤 `처리 다시 시도`를 누릅니다.
 - OpenAI rate limit/`503`: 청크를 보존하고 `Retry-After` 또는 15초·30초·45초 간격으로 재시도합니다.
 - Render/네트워크/Atlas 장애: ACK하지 않으며 IndexedDB 원본을 유지합니다.
-- Render 재시작으로 서버 세션이 초기화된 경우: `서버 세션 복구`를 누르면 `/resume` 후 보존 청크를 순서대로 재전송합니다.
+- Render 재시작으로 메모리의 처리 상태가 초기화된 경우: Atlas의 세션 초안은 유지됩니다. `서버 세션 복구`를 누르면 `/resume` 후 보존 청크를 순서대로 재전송합니다.
 - 처리 lease가 만료돼 다른 시도가 시작된 경우: 늦게 끝난 이전 시도는 새 청크 결과를 덮어쓰지 않으며 보존 원본으로 재시도합니다.
 - 종료 시 누락 청크 존재: 최종 요약 없이 Atlas에 `incomplete`로 자동 보관합니다.
 - 브라우저 재시작: 동일한 강의 URL에서 캡처를 시작하면 보존 세션을 찾아 `/resume`으로 이어갑니다.
 - 72시간 경과: 청크를 `EXPIRED`로 표시하며 사용자가 직접 내보내거나 폐기할 때까지 삭제하지 않습니다.
 - 보존 세션 폐기: 사용자 ID와 접속 코드를 입력한 뒤 서버 삭제를 확인합니다. 네트워크·인증 오류가 나면 로컬 청크가 남아 재시도할 수 있습니다.
 
-## 테스트
+## 개발·테스트 (선택)
+
+코드를 수정하거나 로컬 서버를 시험할 때만 Python 개발 환경을 준비합니다. Windows에서는 프로젝트 루트에서 `setup-and-run-server.cmd --install-only`로 가상환경과 서버 의존성을 설치할 수 있습니다. 테스트용 패키지는 아래 명령으로 추가합니다.
 
 ```powershell
-node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js
+.\setup-and-run-server.cmd --install-only
+.\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest -q
+node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js
 Get-ChildItem extension\*.js | ForEach-Object { node --check $_.FullName }
 ```
 
-GitHub Actions도 Python 3.12와 Node.js 22에서 같은 검사를 실행합니다.
+로컬 서버 실행이 필요하면 `server/.env`를 설정한 뒤 `.\setup-and-run-server.cmd`를 실행합니다. 자동 설치 스크립트는 최초 설정에 `MOCK_OPENAI=true`와 로컬 접속 토큰을 사용합니다. 실제 OpenAI 호출은 `OPENAI_API_KEY`, `SAFETY_IDENTIFIER_SECRET`을 설정하고 `MOCK_OPENAI=false`로 변경해야 합니다.
+
+GitHub Actions는 `main`·`ver_gpt` 푸시와 PR에서 Python 3.12·Node.js 22로 같은 검사를 실행합니다. Atlas 통합 테스트는 `MONGODB_TEST_URI`가 없는 CI에서는 건너뜁니다.
 
 실제 MongoDB 트랜잭션 검증에는 비운영 테스트 클러스터가 필요합니다. 로컬 환경의 `MONGODB_TEST_URI` 또는 Git에서 제외되는 `tests/server/.env.test.local`에 새 URI를 설정하면 `python -m pytest tests/server/test_mongo_integration.py -q`로 고유한 임시 DB에서 재개·삭제를 확인한 뒤 해당 DB를 정리합니다. 변수가 없으면 이 테스트는 건너뜁니다. 운영 클러스터의 URI는 사용하지 마세요.
 

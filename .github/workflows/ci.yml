@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ver_gpt]
   pull_request:
 
 jobs:
@@ -19,4 +19,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - run: node --test tests/extension/core.test.js tests/extension/outbox.test.js
+      - run: node --test tests/extension/core.test.js tests/extension/outbox.test.js tests/extension/discard.test.js tests/extension/offscreen_discard.test.js
+      - run: for file in extension/*.js; do node --check "$file"; done
