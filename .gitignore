@@ -1,5 +1,6 @@
 .env
 server/.env
+tests/server/.env.test.local
 .venv/
 venv/
 __pycache__/

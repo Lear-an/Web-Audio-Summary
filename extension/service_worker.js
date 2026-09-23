@@ -228,7 +228,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MESSAGE.EXPORT_PRESERVED_CHUNKS:
         return sendToOffscreen(MESSAGE.EXPORT_PRESERVED_CHUNKS);
       case MESSAGE.DISCARD_SESSION:
-        return sendToOffscreen(MESSAGE.DISCARD_SESSION);
+        return sendToOffscreen(MESSAGE.DISCARD_SESSION, message.payload || {});
       default:
         return { ok: false, error: `알 수 없는 메시지: ${message.type}` };
     }

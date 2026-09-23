@@ -184,6 +184,7 @@ MAX_SESSION_DURATION_SECONDS=14400
 - 종료 시 `expected_chunk_count`는 생성된 전체 청크 개수입니다.
 - 유효 범위는 `0 <= sequence < expected_chunk_count`입니다.
 - 각 청크는 길이 60초, 시작 간격(stride)은 58초입니다. `media_start_ms`는 영상 시간축 기준이며 서버는 이를 절대 자막 시각의 기준으로 사용합니다.
+- 절대 자막 시각은 `round(media_start_ms + relative_ms × playback_rate)`로 계산합니다. 겹침 판정 범위도 `overlap_ms × playback_rate`로 환산해 배속 재생 시 화면 자막과 Atlas 문서가 같은 영상 시각을 사용합니다.
 - overlap 구간에서 정규화한 직전·현재 세그먼트가 같으면 현재 세그먼트를 제거합니다. 원문이 달라 자동 병합이 불확실한 경우 둘 다 보존합니다.
 
 ```text
@@ -230,13 +231,14 @@ OPENAI_QUEUE_WAIT_SECONDS=30
   "source_title": "sanitized title",
   "resume_available_until": "datetime",
   "expire_at": "datetime",
+  "partial_sync_pending": false,
   "last_error_code": null,
   "created_at": "datetime",
   "updated_at": "datetime"
 }
 ```
 
-`document_id`는 세션 생성 시 발급합니다. 재개는 만료 판정과 lease 획득을 한 번의 원자적 갱신으로 수행하며, 성공 시 세션·청크의 `expire_at`을 제거하거나 갱신합니다.
+`document_id`는 세션 생성 시 발급합니다. MongoDB 재개는 세션 만료 판정, 필요한 READY 청크 확인, 세션·청크의 `expire_at` 제거, 활성 사용자 lease 갱신을 한 트랜잭션으로 수행합니다. 누락 청크 또는 트랜잭션 충돌이 있으면 성공 응답을 반환하지 않습니다. 로컬 메모리 저장소는 같은 작업을 잠금으로 보호합니다.
 
 ### 7.2 `lecture_session_chunks`
 
@@ -263,7 +265,7 @@ OPENAI_QUEUE_WAIT_SECONDS=30
 }
 ```
 
-처리 시작은 상태와 만료된 lease를 조건으로 한 원자적 claim입니다. `(session_id, sequence)` 유니크 인덱스와 처리 lease로 재시작·배포 후 중복 DB 반영을 막습니다.
+처리 시작은 상태와 만료된 lease를 조건으로 한 원자적 claim입니다. 결과와 오류 상태를 기록할 때도 `status=processing`과 해당 `attempt_id`를 조건으로 갱신합니다. lease 만료 뒤 새 시도가 시작되었다면 늦게 끝난 이전 시도는 DB 결과를 덮어쓰지 못하고 재시도 가능 응답을 반환합니다. `(session_id, sequence)` 유니크 인덱스와 처리 lease로 재시작·배포 후 중복 DB 반영을 막습니다.
 
 ### 7.3 `lecture_documents`
 
@@ -278,7 +280,7 @@ OPENAI_QUEUE_WAIT_SECONDS=30
   "requested_at": "datetime",
   "completed_at": null,
   "source": {
-    "url": "original URL",
+    "url": "sanitized canonical URL",
     "canonical_url": "canonical URL",
     "url_hash": "sha256",
     "host": "www.youtube.com",
@@ -306,6 +308,8 @@ OPENAI_QUEUE_WAIT_SECONDS=30
 
 READY 청크가 생길 때마다 서버는 같은 `document_id`의 부분 문서를 upsert합니다. 이 upsert가 성공한 뒤에만 브라우저에 ACK를 반환합니다. 부분 문서는 **7일 후에도 삭제하지 않습니다**. 7일 후 재개용 세션·청크 초안만 TTL 대상으로 삼고 문서는 `resume_status=expired`로 표시합니다.
 
+청크가 `ready`로 저장된 뒤 세션 순번 또는 부분 문서 갱신이 실패하면 ACK하지 않습니다. 동일 청크 재전송에서는 오디오 해시를 확인하고 `next_sequence`와 부분 문서를 다시 갱신한 뒤 기존 전사를 ACK합니다. 부분 문서가 `completed`로 확정된 뒤에는 늦은 부분 문서 쓰기로 상태를 되돌리지 않습니다.
+
 최종 저장 전 BSON 크기를 계산합니다. `MAX_DOCUMENT_BYTES=12000000`을 넘으면 자르지 않고 부분 문서를 유지하며 `summary_status=input_too_large`, 세션을 `finalize_pending`으로 둡니다. 장시간 강의가 늘면 segments 전용 컬렉션 분리를 검토합니다.
 
 ### 7.4 `service_state`
@@ -319,7 +323,7 @@ READY 청크가 생길 때마다 서버는 같은 `document_id`의 부분 문서
 }
 ```
 
-최근 공급자 오류와 재시도 정보를 저장해 재시작 후에도 운영자가 원인을 확인할 수 있게 합니다. quota 오류는 확장 프로그램이 자동 반복을 중단하고 운영자 조치 후 명시적으로 다시 시도합니다.
+최근 공급자 오류와 재시도 정보를 저장해 재시작 후에도 운영자가 원인을 확인할 수 있게 합니다. quota 오류는 확장 프로그램이 자동 반복을 중단하고 운영자 조치 후 명시적으로 다시 시도합니다.w
 
 ### 7.5 `daily_usage`
 
@@ -358,6 +362,8 @@ daily_usage:            unique(owner_id, day), (day)
 - `utm_*`, `fbclid` 등 추적 파라미터를 제거합니다.
 - 지원 사이트는 영상 식별에 필요한 쿼리만 allowlist합니다.
 - 정규화 URL의 SHA-256을 저장하고 해시 필드에 인덱스를 둡니다.
+- 현재 YouTube 도메인은 영상 식별용 `v`만 허용하며 다른 도메인은 쿼리를 저장하지 않습니다. URL 사용자 정보도 제거하고, 서버의 세션·문서에는 정리된 URL만 저장합니다. 브라우저의 로컬 복구 매칭에는 원래 탭 URL을 사용할 수 있습니다.
+- 서버 시작 시 기존 세션·문서의 URL도 같은 규칙으로 정리합니다.
 - 제목과 클라이언트 메타데이터는 길이·제어문자·HTML을 검증합니다.
 
 ## 8. API 설계
@@ -399,10 +405,10 @@ archive 순서:
 6. 누락이 없을 때만 finalize lease 획득
 7. 전체 한국어 자막 조합과 BSON·요약 입력 크기 검사
 8. Luna 최종 요약 한 번 실행
-9. 같은 문서를 `completed`로 전환
+9. 요약 본문·요약 메타데이터·`summary_status=completed`·`status=completed`를 같은 문서의 단일 원자적 쓰기로 확정
 10. 완료 저장 성공 후 세션·청크 초안 삭제
 
-완료 문서가 이미 있으면 먼저 반환합니다. finalization 도중 실패하면 자막 문서를 유지하고 `finalize_pending`과 오류 코드를 기록합니다.
+요약이 포함된 완료 문서가 이미 있으면 초안 정리를 다시 시도한 뒤 기존 결과를 반환합니다. finalization 도중 실패하면 자막 문서를 유지하고 `finalize_pending`과 오류 코드를 기록합니다. 요약이 없는 문서를 완료 응답으로 반환하지 않습니다.
 
 ### 8.4 문서 조회
 
@@ -424,6 +430,8 @@ DELETE /v1/sessions/{session_id}
 - 복구 초안만 삭제하면 부분 문서는 유지하고 `resume_status=expired`로 바꿉니다.
 - 브라우저 outbox는 확장 프로그램에서 별도 확인 후 삭제합니다.
 - completed 문서 삭제는 복구 불가능하다는 확인 UI를 거칩니다.
+
+확장 프로그램은 사용자 ID·접속 코드를 받아 서버 초안 삭제를 확인한 뒤 outbox를 지웁니다. 서버 삭제에 실패하면 로컬 청크와 세션 ID를 유지하고 재시도를 안내합니다. 서버 초안과 부분 문서의 재개 상태 갱신은 한 트랜잭션으로 처리합니다.
 
 ## 9. 상태 전이와 불변조건
 
@@ -451,7 +459,7 @@ DELETE /v1/sessions/{session_id}
 - 세션 상태·재개 요청 시
 - archive/finalize 요청 시
 
-reconciliation은 만료된 processing lease를 해제하고, 오래된 processing 상태를 retryable로 되돌리고, 7일이 지난 초안의 문서를 `resume_status=expired`로 갱신합니다. 백그라운드 정리는 보조 수단입니다.
+reconciliation은 만료된 processing lease를 해제하고, 오래된 processing 상태를 retryable로 되돌립니다. 마지막 갱신 후 `SESSION_IDLE_TTL_SECONDS`가 지난 활성 세션은 `incomplete`와 7일 뒤 `expire_at`으로 전환하고 청크 초안에도 만료 시각을 기록합니다. 해당 부분 문서 갱신에 실패하면 `partial_sync_pending`을 남겨 다음 시작·조회·재개·종료 시 다시 시도합니다. 7일이 지난 초안의 문서는 삭제하지 않고 `resume_status=expired`로 갱신합니다. 백그라운드 정리는 보조 수단입니다.
 
 ## 11. 확장 프로그램 UI
 
@@ -509,6 +517,8 @@ MAX_REQUEST_BYTES=6500000
 MAX_SESSION_DURATION_SECONDS=14400
 MAX_DOCUMENT_BYTES=12000000
 DRAFT_RETENTION_DAYS=7
+SESSION_IDLE_TTL_SECONDS=1800
+PROCESSING_LEASE_SECONDS=180
 DAILY_AUDIO_MINUTES_LIMIT_PER_USER=0
 DAILY_AUDIO_MINUTES_LIMIT_TOTAL=0
 ```
@@ -570,15 +580,20 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 6번째 활성 사용자는 `too_many_active_users`를 받고 오디오를 잃지 않습니다.
 - 60초 청크·2초 overlap과 0 기반 누락 검사가 정확합니다.
 - 동일 청크 재전송은 OpenAI 결과를 중복 저장하지 않습니다.
+- 청크가 READY로 저장된 직후 세션 순번 또는 부분 문서 저장이 실패해도, 재전송 시 두 상태를 복구한 뒤에만 ACK합니다.
+- 처리 lease가 만료돼 새 시도가 시작되면 이전 `attempt_id`의 늦은 결과가 READY 청크를 덮어쓰지 못합니다.
+- 배속 재생 시 실시간 자막과 Atlas 문서의 영상 시간값이 일치합니다.
 - 한국어·영어·혼합 강의가 스키마를 만족합니다.
 - 누락이 있으면 부분 문서만 저장되고 최종 요약은 호출되지 않습니다.
 - 모든 청크가 준비된 경우에만 최종 요약이 한 번 DB 결과로 반영됩니다.
+- `completed` 문서는 요약 본문과 요약 메타데이터를 같은 원자적 쓰기로 포함합니다.
 
 ### 복구·데이터 수명
 
 - 429/503/timeout 후 오디오가 outbox와 Atlas 상태에 남습니다.
 - 재시작 뒤 만료된 처리 lease가 복구됩니다.
 - Render 절전 후 첫 조회가 stale 세션을 정리합니다.
+- stale 세션의 부분 문서 갱신이 실패하면 다음 reconciliation에서 다시 시도합니다.
 - 7일 후 초안은 만료되지만 부분 문서는 남습니다.
 - 재개와 TTL 만료가 겹쳐도 처리 중 초안이 삭제되지 않습니다.
 - 완료 저장 전에는 초안이 삭제되지 않습니다.

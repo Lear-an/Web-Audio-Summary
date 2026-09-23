@@ -2,6 +2,7 @@
   const { TARGET, MESSAGE, SESSION_STATE } = LectureProtocol;
   const Core = LectureCore;
   const Outbox = LectureOutbox;
+  const Discard = LectureDiscard;
   const Config = LectureConfig;
 
   const DEFAULT_WINDOW_MS = 60_000;
@@ -1027,22 +1028,39 @@
     session.audioContext = null;
   }
 
-  async function discardSession() {
+  async function discardSession(payload = {}) {
     if (!session.serverSessionId) return { ok: true, snapshot: publicSnapshot() };
     cancelWindowScheduler();
     await stopAllRecorders();
     await releaseMediaResources();
-    const records = await Outbox.listSession(session.serverSessionId);
-    await Promise.all(records.map((record) => Outbox.remove(record.id)));
+    const userId = String(payload.userId || session.userId || "").trim();
+    const accessToken = String(payload.accessToken || session.accessToken || "").trim();
+    if (!userId || !accessToken) {
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = "서버 초안을 삭제하려면 사용자 ID와 접속 코드를 다시 입력해 주세요. 로컬 청크는 보존했습니다.";
+      broadcastSnapshot();
+      return { ok: false, error: session.notice, snapshot: publicSnapshot() };
+    }
     try {
-      const response = await fetchWithTimeout(
-        `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}`,
-        { method: "DELETE", headers: authHeaders() },
-        10_000
+      await Discard.deleteServerThenLocal(
+        async () => {
+          const response = await fetchWithTimeout(
+            `${session.serverBaseUrl}/v1/sessions/${encodeURIComponent(session.serverSessionId)}`,
+            { method: "DELETE", headers: { Authorization: `Bearer ${accessToken}`, "X-User-ID": userId } },
+            10_000
+          );
+          if (response.status !== 404) await assertResponse(response);
+        },
+        () => Outbox.listSession(session.serverSessionId),
+        (record) => Outbox.remove(record.id)
       );
-      await assertResponse(response);
     } catch (error) {
-      session.notice = `로컬 원본은 폐기했지만 서버 초안 삭제 확인에 실패했습니다: ${serializeError(error)}`;
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = error.serverDeleted
+        ? `서버 초안은 삭제됐지만 로컬 청크 정리가 끝나지 않았습니다. 다시 시도해 주세요: ${serializeError(error)}`
+        : `서버 초안 삭제에 실패했습니다. 로컬 청크는 보존했습니다: ${serializeError(error)}`;
+      broadcastSnapshot();
+      return { ok: false, error: session.notice, snapshot: publicSnapshot() };
     }
     session.queue = [];
     session.queuedBytes = 0;
@@ -1174,7 +1192,7 @@
         case MESSAGE.EXPORT_PRESERVED_CHUNKS:
           return exportPreservedChunks();
         case MESSAGE.DISCARD_SESSION:
-          return discardSession();
+          return discardSession(message.payload || {});
         case MESSAGE.TAB_REMOVED:
           if (Number(message.payload?.tabId) === session.sourceTabId) {
             void stopSession("캡처 중인 탭이 닫혔습니다.");

@@ -59,27 +59,49 @@ sessions: dict[str, SessionRecord] = {}
 def _lease_until(seconds: int): return utcnow() + timedelta(seconds=seconds)
 
 
-async def _write_partial(owner_id: str, session_id: str, *, status: str = "incomplete", missing: list[int] | None = None, expected: int | None = None, archive: ArchiveRequest | None = None) -> dict[str, Any]:
+async def _write_partial(owner_id: str, session_id: str, *, status: str = "incomplete", missing: list[int] | None = None, expected: int | None = None, archive: ArchiveRequest | None = None, summary: SummaryResponse | None = None, summary_meta: dict[str, Any] | None = None) -> dict[str, Any]:
     draft = await store.get_session(owner_id, session_id)
     if not draft: raise ApiError(404, "session_not_found", "세션을 찾을 수 없습니다.")
     chunks = [row for row in await store.list_chunks(owner_id, session_id) if row.get("status") == "ready"]
     segments = _absolute_segments(chunks)
     now = utcnow()
     existing = await store.get_document_for_session(owner_id, session_id)
+    if existing and (
+        (existing.get("status") == "completed" and status != "completed")
+        or (existing.get("status") == "finalize_pending" and status == "incomplete" and archive is None)
+    ):
+        return existing
     value = {
         "schema_version": 8, "document_id": draft["document_id"], "session_id": session_id, "owner_id": owner_id,
-        "status": status, "source": {"url": draft.get("source_url", ""), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
+        "status": status, "source": {"url": _canonical_url(draft.get("source_url", "")), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
         "requested_at": draft.get("created_at", now), "updated_at": now, "completed_at": now if status == "completed" else None,
         "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": "\n".join(v["text"] for v in segments), "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "summary_status": "completed" if status == "completed" else ("processing" if status == "finalize_pending" else "not_run"),
-        "summary": (existing or {}).get("summary"), "bookmarks": archive.bookmarks if archive else (existing or {}).get("bookmarks", []),
+        "summary": summary.model_dump() if summary else (existing or {}).get("summary"), "bookmarks": archive.bookmarks if archive else (existing or {}).get("bookmarks", []),
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
-        "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": draft.get("expire_at"),
+        "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": None if status == "completed" else draft.get("expire_at"),
     }
+    if summary_meta is not None:
+        value["summary_provider"] = {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v1", "schema_version": 1}
     encoded = json.dumps(value, default=str, ensure_ascii=False).encode("utf-8")
     if len(encoded) > settings.max_document_bytes: raise ApiError(413, "document_too_large", "문서 크기가 Atlas 저장 한도를 초과합니다.")
     return await store.upsert_document(value)
+
+
+async def _reconcile_state() -> None:
+    now = utcnow()
+    await store.reconcile(now)
+    cutoff = now - timedelta(seconds=settings.session_idle_ttl_seconds)
+    expire_at = now + timedelta(days=settings.incomplete_draft_retention_days)
+    for draft in await store.expire_stale_sessions(cutoff, expire_at):
+        try:
+            await _write_partial(draft["owner_id"], draft["session_id"])
+            await store.update_session(draft["owner_id"], draft["session_id"], {"partial_sync_pending": False})
+            sessions.pop(draft["session_id"], None)
+            await store.release_user_lease(draft["owner_id"])
+        except Exception:
+            logger.exception("stale session reconciliation failed: %s", draft["session_id"])
 
 
 async def expire_idle_sessions() -> None:
@@ -102,7 +124,7 @@ async def expire_idle_sessions() -> None:
 async def lifespan(_: FastAPI):
     if settings.app_auth_mode == "local" and settings.generated_access_token: logger.warning("Lecture Memo local access token: %s", settings.local_access_token)
     if settings.mock_openai: logger.warning("MOCK_OPENAI=true: 실제 OpenAI API를 호출하지 않습니다.")
-    await store.initialize(); await store.reconcile(utcnow())
+    await store.initialize(); await store.scrub_source_urls(_source_metadata); await _reconcile_state()
     task = asyncio.create_task(expire_idle_sessions())
     try: yield
     finally:
@@ -163,9 +185,15 @@ async def authorize(authorization: Annotated[str | None, Header()] = None, x_use
 
 def _canonical_url(raw: str) -> str:
     try:
-        value = urlsplit(raw.strip()); blocked = {"token", "access_token", "auth", "key", "signature", "sig"}
-        query = [(k, v) for k, v in parse_qsl(value.query, keep_blank_values=True) if k.lower() not in blocked and not k.lower().startswith("utm_")]
-        return urlunsplit((value.scheme.lower(), value.netloc.lower(), value.path, urlencode(query), ""))
+        value = urlsplit(raw.strip())
+        if value.scheme.lower() not in {"http", "https"} or not value.hostname: return ""
+        host = value.hostname.lower()
+        port = value.port
+        netloc = f"{host}:{port}" if port else host
+        query = []
+        if host == "youtube.com" or host.endswith(".youtube.com"):
+            query = [(k, v) for k, v in parse_qsl(value.query, keep_blank_values=True) if k.lower() == "v"]
+        return urlunsplit((value.scheme.lower(), netloc, value.path, urlencode(query), ""))
     except Exception: return ""
 
 
@@ -202,9 +230,9 @@ async def _active_record(user: AuthenticatedUser, session_id: str) -> SessionRec
 def _absolute_segments(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for chunk in chunks:
-        base = int(chunk.get("media_start_ms", 0)); overlap = int(chunk.get("overlap_ms", 0))
+        base = int(chunk.get("media_start_ms", 0)); rate = float(chunk.get("playback_rate", 1)); overlap = round(int(chunk.get("overlap_ms", 0)) * rate)
         for raw in chunk.get("segments", []):
-            item = dict(raw); item["start_ms"] = base + int(item.pop("relative_start_ms", 0)); item["end_ms"] = base + int(item.pop("relative_end_ms", 0)); item["sequence"] = chunk["sequence"]
+            item = dict(raw); item["start_ms"] = round(base + int(item.pop("relative_start_ms", 0)) * rate); item["end_ms"] = round(base + int(item.pop("relative_end_ms", 0)) * rate); item["sequence"] = chunk["sequence"]
             normalized = re.sub(r"\W+", "", item.get("text", "")).lower()
             if result and item["start_ms"] < base + overlap and normalized and normalized == re.sub(r"\W+", "", result[-1].get("text", "")).lower(): continue
             result.append(item)
@@ -244,19 +272,22 @@ async def create_session(payload: SessionCreateRequest, user: AuthenticatedUser 
     if not await store.acquire_user_lease(user.user_id, _lease_until(settings.active_user_lease_seconds), settings.max_concurrent_users, now): raise ApiError(429, "concurrent_user_limit", "현재 동시 사용자 한도에 도달했습니다.", retryable=True, retry_after_seconds=60)
     session_id, document_id = str(uuid.uuid4()), str(uuid.uuid4())
     source = _source_metadata(payload.source_url)
-    row = {"schema_version": 8, "session_id": session_id, "document_id": document_id, "owner_id": user.user_id, "source_tab_id": payload.source_tab_id, "source_url": payload.source_url, "canonical_url": source["canonical_url"], "source_url_hash": source["url_hash"], "source_host": source["host"], "source_video_id": source["video_id"], "source_title": payload.source_title, "language": payload.language, "status": "recording", "next_sequence": 0, "created_at": now, "updated_at": now}
-    await store.create_session(row); sessions[session_id] = SessionRecord(session_id, document_id, user.user_id, payload.source_url, payload.source_title, payload.language)
+    row = {"schema_version": 8, "session_id": session_id, "document_id": document_id, "owner_id": user.user_id, "source_tab_id": payload.source_tab_id, "source_url": source["canonical_url"], "canonical_url": source["canonical_url"], "source_url_hash": source["url_hash"], "source_host": source["host"], "source_video_id": source["video_id"], "source_title": payload.source_title, "language": payload.language, "status": "recording", "next_sequence": 0, "created_at": now, "updated_at": now}
+    await store.create_session(row); sessions[session_id] = SessionRecord(session_id, document_id, user.user_id, source["canonical_url"], payload.source_title, payload.language)
     return SessionCreateResponse(session_id=session_id, document_id=document_id, model=settings.openai_text_model)
 
 
 @app.post("/v1/sessions/{session_id}/resume", response_model=SessionCreateResponse)
 async def resume_session(session_id: str, _payload: SessionResumeRequest, user: AuthenticatedUser = Depends(authorize)) -> SessionCreateResponse:
-    await store.reconcile(utcnow())
-    draft = await _owned_draft(user, session_id)
-    if draft.get("status") == "completed": raise ApiError(409, "session_completed", "이미 완료된 세션입니다.")
-    if draft.get("expire_at") and draft["expire_at"] <= utcnow(): raise ApiError(410, "session_expired", "세션 복구 기간이 만료되었습니다.", action="start_new_session")
-    if not await store.acquire_user_lease(user.user_id, _lease_until(settings.active_user_lease_seconds), settings.max_concurrent_users, utcnow()): raise ApiError(429, "concurrent_user_limit", "현재 동시 사용자 한도에 도달했습니다.", retryable=True)
-    await store.activate_drafts(user.user_id, session_id); chunks = [v for v in await store.list_chunks(user.user_id, session_id) if v.get("status") == "ready"]
+    await _reconcile_state()
+    now = utcnow()
+    outcome, draft, chunks = await store.resume_drafts(user.user_id, session_id, now, now + timedelta(seconds=settings.active_user_lease_seconds), settings.max_concurrent_users)
+    if outcome == "missing": raise ApiError(404, "session_not_found", "세션을 찾을 수 없습니다.")
+    if outcome == "completed": raise ApiError(409, "session_completed", "이미 완료된 세션입니다.")
+    if outcome == "expired": raise ApiError(410, "session_expired", "세션 복구 기간이 만료되었습니다.", action="start_new_session")
+    if outcome == "limit": raise ApiError(429, "concurrent_user_limit", "현재 동시 사용자 한도에 도달했습니다.", retryable=True)
+    if outcome != "ready": raise ApiError(409, "session_resume_incomplete", "서버 초안이 불완전합니다.", retryable=True, action="retry_later")
+    chunks = [v for v in chunks if v.get("status") == "ready"]
     sessions[session_id] = SessionRecord(session_id, draft["document_id"], user.user_id, draft.get("source_url", ""), draft.get("source_title", ""), draft.get("language", "auto"))
     return SessionCreateResponse(session_id=session_id, document_id=draft["document_id"], model=settings.openai_text_model, resumed=True, next_sequence=int(draft.get("next_sequence", 0)), segments=_absolute_segments(chunks))
 
@@ -273,29 +304,38 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
         old = await store.get_chunk(user.user_id, session_id, sequence)
         if old and old.get("status") == "ready":
             if old.get("audio_sha256") != digest: raise ApiError(409, "chunk_conflict", "같은 순번의 청크 내용이 다릅니다.", action="keep_chunk")
+            if expected <= sequence:
+                await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
+            await _write_partial(user.user_id, session_id)
             return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in old.get("segments", [])])
         if sequence != expected: raise ApiError(409, "sequence_gap", f"다음 청크 순번은 {expected}입니다.", retryable=True, action="retry_in_order", chunk_id=chunk_id)
         claim = {"owner_id": user.user_id, "session_id": session_id, "sequence": sequence, "audio_sha256": digest, "attempt_id": str(uuid.uuid4()), "lease_until": _lease_until(settings.processing_lease_seconds), "capture_start_ms": capture_start_ms, "capture_end_ms": capture_end_ms, "media_start_ms": video_start_ms, "playback_rate": playback_rate, "overlap_ms": overlap_ms, "mime_type": mime_type}
         state, cached = await store.claim_chunk(claim, now)
         if state == "conflict": raise ApiError(409, "chunk_conflict", "같은 순번의 청크 내용이 다릅니다.", action="keep_chunk")
         if state == "busy": raise ApiError(409, "chunk_processing", "같은 청크가 이미 처리 중입니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
-        if state == "ready": return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in cached.get("segments", [])])
+        if state == "ready":
+            if expected <= sequence:
+                await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
+            await _write_partial(user.user_id, session_id)
+            return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in cached.get("segments", [])])
         try:
             await _check_daily_budget(user.user_id, duration_ms, chunk_id)
         except ApiError as error:
-            await store.upsert_chunk({**claim, "status": "blocked", "last_error": error.code})
+            await store.finish_chunk(claim, {"status": "blocked", "last_error": error.code})
             raise
         try:
             await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
         except TimeoutError:
-            await store.upsert_chunk({**claim, "status": "retry_wait", "last_error": "ai_backpressure"}); raise ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=15)
+            await store.finish_chunk(claim, {"status": "retry_wait", "last_error": "ai_backpressure"}); raise ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=15)
         try:
             result = await gateway.transcribe(audio_bytes=audio_bytes, mime_type=mime_type, sequence=sequence, duration_ms=duration_ms, safety_identifier=_safety_id(user.user_id), language_hint=record.language)
         except Exception as exc:
-            error = _provider_error(exc, chunk_id); await store.record_provider_state(error.code, error.retry_after_seconds); await store.upsert_chunk({**claim, "status": "retry_wait" if error.retryable else "blocked", "last_error": error.code}); raise error from exc
+            error = _provider_error(exc, chunk_id); await store.record_provider_state(error.code, error.retry_after_seconds); await store.finish_chunk(claim, {"status": "retry_wait" if error.retryable else "blocked", "last_error": error.code}); raise error from exc
         finally: openai_slots.release()
         segments = [v.model_dump() for v in result.transcript.segments]
-        await store.upsert_chunk({**claim, "status": "ready", "segments": segments, "detected_language": result.language, "original_text": result.original_text, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-v1", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
+        saved = await store.finish_chunk(claim, {"status": "ready", "segments": segments, "detected_language": result.language, "original_text": result.original_text, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-v1", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
+        if not saved:
+            raise ApiError(409, "chunk_processing", "다른 처리 시도가 이 청크를 갱신했습니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
         await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1}); await _write_partial(user.user_id, session_id)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": duration_ms, "transcription_requests": 1})
         return ChunkResponse(session_id=session_id, sequence=sequence, segments=result.transcript.segments)
@@ -303,11 +343,13 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
 
 @app.post("/v1/sessions/{session_id}/archive", response_model=ArchiveResponse)
 async def archive_session(session_id: str, payload: ArchiveRequest, user: AuthenticatedUser = Depends(authorize)) -> ArchiveResponse:
-    await store.reconcile(utcnow())
+    await _reconcile_state()
     if payload.duration_ms > settings.max_session_duration_seconds * 1000:
         raise ApiError(422, "session_too_long", "세션 길이가 운영 상한을 초과했습니다.", action="keep_chunks")
     existing = await store.get_document_for_session(user.user_id, session_id)
-    if existing and existing.get("status") == "completed": return ArchiveResponse(saved=True, status="completed", document_id=existing["document_id"], chunk_count=existing.get("chunk_state", {}).get("ready_count", 0), summary=existing.get("summary"))
+    if existing and existing.get("status") == "completed" and existing.get("summary"):
+        await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
+        return ArchiveResponse(saved=True, status="completed", document_id=existing["document_id"], chunk_count=existing.get("chunk_state", {}).get("ready_count", 0), summary=existing["summary"])
     draft = await _owned_draft(user, session_id); chunks = [v for v in await store.list_chunks(user.user_id, session_id) if v.get("status") == "ready"]
     expected = max(payload.expected_chunk_count, max((int(v["sequence"]) for v in chunks), default=-1) + 1); present = {int(v["sequence"]) for v in chunks}; missing = [v for v in range(expected) if v not in present]
     if missing:
@@ -321,7 +363,7 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
         await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
         try: summary, summary_meta = await gateway.summarize(transcript=transcript, bookmarks=payload.bookmarks, safety_identifier=_safety_id(user.user_id))
         finally: openai_slots.release()
-        doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload); doc.update({"summary": summary.model_dump(), "summary_status": "completed", "summary_provider": {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v1", "schema_version": 1}, "completed_at": utcnow(), "resume_status": "not_needed", "resume_available_until": None}); await store.upsert_document(doc)
+        doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload, summary=summary, summary_meta=summary_meta)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"summary_requests": 1}); await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
         return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), summary=summary)
     except ApiError: raise
@@ -332,7 +374,7 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
 
 @app.get("/v1/documents", response_model=DocumentListResponse)
 async def list_documents(limit: int = 50, user: AuthenticatedUser = Depends(authorize)) -> DocumentListResponse:
-    await store.reconcile(utcnow())
+    await _reconcile_state()
     rows = await store.list_documents(user.user_id, min(max(limit, 1), 100))
     items = [{k: v for k, v in row.items() if k not in {"transcript", "summary", "summary_provider", "bookmarks"}} for row in rows]
     return DocumentListResponse(items=items)
@@ -340,7 +382,7 @@ async def list_documents(limit: int = 50, user: AuthenticatedUser = Depends(auth
 
 @app.get("/v1/documents/{document_id}")
 async def get_document(document_id: str, user: AuthenticatedUser = Depends(authorize)) -> dict[str, Any]:
-    await store.reconcile(utcnow())
+    await _reconcile_state()
     row = await store.get_document(user.user_id, document_id)
     if not row: raise ApiError(404, "document_not_found", "문서를 찾을 수 없습니다.")
     return row
@@ -355,7 +397,11 @@ async def delete_document(document_id: str, user: AuthenticatedUser = Depends(au
 
 @app.delete("/v1/sessions/{session_id}")
 async def delete_session(session_id: str, user: AuthenticatedUser = Depends(authorize)) -> dict[str, bool]:
-    await _owned_draft(user, session_id); sessions.pop(session_id, None); await store.delete_drafts(user.user_id, session_id); await store.release_user_lease(user.user_id); return {"deleted": True}
+    await _owned_draft(user, session_id)
+    await store.delete_drafts_and_expire_document(user.user_id, session_id)
+    sessions.pop(session_id, None)
+    await store.release_user_lease(user.user_id)
+    return {"deleted": True}
 
 
 if __name__ == "__main__":

@@ -74,8 +74,8 @@
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
     elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
-    elements.userId.disabled = active;
-    elements.accessToken.disabled = active;
+    elements.userId.disabled = active && !needsAction;
+    elements.accessToken.disabled = active && !needsAction;
     elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
   }
 
@@ -275,12 +275,19 @@
 
   async function discardSession() {
     if (!confirm("보존된 원본 청크와 미완료 세션을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) return;
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      elements.connectionMessage.textContent = "서버 초안을 삭제하려면 사용자 ID와 접속 코드를 다시 입력해 주세요.";
+      return;
+    }
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.DISCARD_SESSION
+      type: MESSAGE.DISCARD_SESSION,
+      payload: { userId, accessToken }
     });
+    if (response?.snapshot) render(response.snapshot);
     if (!response?.ok) throw new Error(response?.error || "보존 세션을 폐기하지 못했습니다.");
-    if (response.snapshot) render(response.snapshot);
   }
 
   async function exportPreservedChunks() {

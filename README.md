@@ -2,9 +2,9 @@
 
 Chrome에서 재생 중인 강의 탭의 오디오를 60초 창·2초 겹침으로 캡처해 OpenAI로 전사하고, 종료 시 최종 요약을 생성하는 Manifest V3 확장 프로그램입니다. V8은 Render의 FastAPI 서버와 MongoDB Atlas를 이용해 등록 10명·동시 활성 5명을 기본 지원합니다.
 
-설계 기준은 [V5 설계서](chrome-lecture-caption-summary-design-v5.md), 설치·사용 순서는 [사용 설명서](사용설명서.md)를 참고하세요.
+설계 기준은 [V8 설계서](chrome-lecture-caption-summary-design-v8.md), 설치·사용 순서는 [사용 설명서](사용설명서.md)를 참고하세요.
 
-## V5 구조
+## V8 구조
 
 ```text
 Chrome 확장 프로그램
@@ -16,10 +16,15 @@ Chrome 확장 프로그램
 
 - 사용자는 관리자에게 받은 사용자 ID와 접속 코드만 입력합니다.
 - OpenAI 키는 운영자가 Render Secret으로 관리하며 확장 프로그램·Atlas·GitHub에 저장하지 않습니다.
-- 성공한 전사는 Atlas에 저장된 뒤에만 ACK됩니다. ACK 전 원본 오디오는 IndexedDB에 남습니다.
-- 중간 요약은 만들지 않고 캡처 종료 시 최종 요약을 한 번만 생성합니다.
+- 성공한 전사와 부분 문서가 Atlas에 저장된 뒤에만 ACK됩니다. 중간에 저장이 실패하면 동일 청크 재전송으로 세션 순번과 부분 문서를 복구하며, ACK 전 원본 오디오는 IndexedDB에 남습니다.
+- 중간 요약은 만들지 않고 캡처 종료 시 최종 요약 결과를 문서에 한 번 확정합니다. 장애 후 재시도에서는 OpenAI 호출이 다시 발생할 수 있습니다.
+- 최종 요약과 `completed` 상태는 한 번의 문서 쓰기로 확정합니다. 배속 재생의 자막 시각은 영상 시간축으로 환산해 저장합니다.
 - 미처리 오디오는 최대 128 MiB, 72시간 보존하며 사용자 확인 없이 자동 삭제하지 않습니다.
-- 완료 문서 저장 직후 Atlas 초안을 삭제하고, 미완료 초안은 7일간 보존합니다.
+- 완료 문서 저장 직후 Atlas 초안을 삭제하고, 미완료 초안은 7일간 보존합니다. Render 재시작 뒤 오래된 세션도 시작·조회·재개·종료 시 정리하며 부분 문서는 유지합니다.
+- 세션 재개 시 만료 판정·초안 TTL 해제·활성 사용자 lease를 MongoDB 트랜잭션으로 확정합니다. 필요한 READY 청크가 사라졌다면 재개 성공으로 응답하지 않습니다.
+- 서버는 원본 URL 대신 정리된 URL만 세션·문서에 저장합니다. YouTube는 영상 식별용 `v`만 유지하고 다른 사이트의 쿼리·fragment·URL 사용자 정보는 제거합니다.
+- 서버 시작 시 기존 Atlas 세션·문서에 남은 URL도 같은 규칙으로 정리합니다.
+- 보존 세션 폐기는 서버 초안 삭제가 확인된 뒤 로컬 청크를 삭제합니다. 서버 삭제 실패 시 청크를 유지하며, 서버에 남은 부분 문서는 재개 불가 상태로 표시합니다.
 
 ## 저장소 구성
 
@@ -90,19 +95,23 @@ SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 - OpenAI rate limit/`503`: 청크를 보존하고 `Retry-After` 또는 15초·30초·45초 간격으로 재시도합니다.
 - Render/네트워크/Atlas 장애: ACK하지 않으며 IndexedDB 원본을 유지합니다.
 - Render 재시작으로 서버 세션이 초기화된 경우: `서버 세션 복구`를 누르면 `/resume` 후 보존 청크를 순서대로 재전송합니다.
+- 처리 lease가 만료돼 다른 시도가 시작된 경우: 늦게 끝난 이전 시도는 새 청크 결과를 덮어쓰지 않으며 보존 원본으로 재시도합니다.
 - 종료 시 누락 청크 존재: 최종 요약 없이 Atlas에 `incomplete`로 자동 보관합니다.
 - 브라우저 재시작: 동일한 강의 URL에서 캡처를 시작하면 보존 세션을 찾아 `/resume`으로 이어갑니다.
 - 72시간 경과: 청크를 `EXPIRED`로 표시하며 사용자가 직접 내보내거나 폐기할 때까지 삭제하지 않습니다.
+- 보존 세션 폐기: 사용자 ID와 접속 코드를 입력한 뒤 서버 삭제를 확인합니다. 네트워크·인증 오류가 나면 로컬 청크가 남아 재시도할 수 있습니다.
 
 ## 테스트
 
 ```powershell
-node --test tests\extension\*.test.js
+node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js
 .\.venv\Scripts\python.exe -m pytest -q
 Get-ChildItem extension\*.js | ForEach-Object { node --check $_.FullName }
 ```
 
 GitHub Actions도 Python 3.12와 Node.js 22에서 같은 검사를 실행합니다.
+
+실제 MongoDB 트랜잭션 검증에는 비운영 테스트 클러스터가 필요합니다. 로컬 환경의 `MONGODB_TEST_URI` 또는 Git에서 제외되는 `tests/server/.env.test.local`에 새 URI를 설정하면 `python -m pytest tests/server/test_mongo_integration.py -q`로 고유한 임시 DB에서 재개·삭제를 확인한 뒤 해당 DB를 정리합니다. 변수가 없으면 이 테스트는 건너뜁니다. 운영 클러스터의 URI는 사용하지 마세요.
 
 ## 보안 주의사항
 
