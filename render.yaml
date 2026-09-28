@@ -13,7 +13,7 @@ services:
       - key: OPENAI_TRANSCRIBE_MODEL
         value: gpt-transcribe
       - key: OPENAI_TEXT_MODEL
-        value: gpt-5.6-luna
+        value: gpt-6-luna
       - key: SAFETY_IDENTIFIER_SECRET
         generateValue: true
       - key: APP_AUTH_MODE

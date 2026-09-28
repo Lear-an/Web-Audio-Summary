@@ -73,7 +73,7 @@ _configured_local_token = os.getenv("LOCAL_ACCESS_TOKEN", "").strip()
 class Settings:
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "").strip()
     openai_transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe").strip()
-    openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.6-luna").strip()
+    openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-6-luna").strip()
     openai_text_fallback_model: str = os.getenv("OPENAI_TEXT_FALLBACK_MODEL", "gpt-5.6-terra").strip()
     text_fallback_enabled: bool = _as_bool(os.getenv("TEXT_FALLBACK_ENABLED"), False)
     mock_openai: bool = _as_bool(os.getenv("MOCK_OPENAI"), False)

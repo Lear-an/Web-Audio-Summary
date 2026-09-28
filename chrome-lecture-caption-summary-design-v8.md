@@ -6,6 +6,7 @@ V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계�
 
 - 등록 가능 계정은 기본 **10명**, 실제 동시 활성 사용자는 **5명**입니다. 두 제한은 별도 설정입니다.
 - OpenAI API 키는 운영자가 Render Secret으로 한 번만 설정합니다.
+- `gpt-transcribe`가 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다.
 - 사용자는 사용자 ID와 접속 코드만 입력합니다.
 - 북마크 기능은 제품 UI와 신규 전사·요약 데이터 범위에서 제외합니다.
 - 청크는 60초, 겹침은 2초입니다.
@@ -55,7 +56,7 @@ Render FastAPI Web Service
   ├─ 최대 동시 사용자 5명
   ├─ 청크 검증·영속 lease·재시도 분류
   ├─ OpenAI gpt-transcribe 전사
-  ├─ OpenAI gpt-5.6-luna 한국어 변환·최종 요약
+  ├─ OpenAI GPT-6 Luna 한국어 변환·최종 요약
   └─ MongoDB Atlas
        ├─ lecture_sessions
        ├─ lecture_session_chunks
@@ -69,7 +70,7 @@ Render FastAPI Web Service
 | 확장 프로그램 | 오디오 캡처, outbox 보존, 순차 업로드, 사용자 UI |
 | FastAPI | 인증, 검증, 큐 제어, OpenAI 호출, 상태 전이, 저장 |
 | gpt-transcribe | 원언어 전사와 세그먼트 타임스탬프 |
-| gpt-5.6-luna | 비한국어 전사의 한국어 변환, 종료 시 최종 요약 |
+| GPT-6 Luna (`gpt-6-luna`) | 비한국어 전사의 한국어 변환, 종료 시 최종 요약 |
 | Atlas | 처리 상태, 전사, 부분·완료 문서, 공급자 상태, 사용량 |
 
 캡처 시작 한 번을 하나의 영상 요청으로 봅니다. 서버는 세션 생성 시 `session_id`와 `document_id`를 함께 발급합니다. 동일 URL을 다시 캡처해도 새 문서를 만들며 기존 문서를 덮어쓰지 않습니다.
@@ -110,7 +111,7 @@ SAFETY_IDENTIFIER_SECRET=<랜덤 비밀값>
 ### 5.1 언어 처리
 
 - 한국어 음성은 전사 결과를 한국어 자막으로 사용합니다.
-- 비한국어 음성은 원문을 보존하고 Luna로 자연스러운 한국어 자막을 만듭니다.
+- 비한국어 음성은 원문을 보존하고 GPT-6 Luna로 자연스러운 한국어 자막을 만듭니다.
 - 혼합 언어의 코드·제품명·고유명사는 가능한 한 원문 표기를 유지합니다.
 - 번역 reasoning effort는 `none`, 최종 요약은 `low`가 기본입니다.
 - 한국어·영어·혼합 기술 강의 검증 코퍼스로 품질 회귀 테스트를 합니다.
@@ -128,9 +129,9 @@ SAFETY_IDENTIFIER_SECRET=<랜덤 비밀값>
 
 ### 5.3 한국어 변환과 최종 요약
 
-Luna는 Responses API로 호출합니다.
+GPT-6 Luna는 오디오 입력을 지원하지 않으므로 오디오 전사는 `gpt-transcribe`가 계속 담당하고, 번역·요약은 Responses API로 호출합니다.
 
-- `model=gpt-5.6-luna`
+- `model=gpt-6-luna`
 - `store=false`
 - 도구 호출 비활성화
 - 엄격한 JSON Schema Structured Outputs
@@ -146,7 +147,7 @@ OPENAI_TEXT_FALLBACK_MODEL=gpt-5.6-terra
 TEXT_FALLBACK_ENABLED=false
 ```
 
-주관적인 품질 판단만으로 자동 fallback하지 않으며 fallback 비용을 별도로 기록합니다.
+fallback은 향후 선택 기능이며 현재 코드에는 호출 로직이 구현되어 있지 않습니다. 현재 운영 요청은 번역·요약 모두 GPT-6 Luna를 사용합니다. fallback을 구현할 때는 주관적인 품질 판단만으로 자동 전환하지 않고, fallback 비용을 별도로 기록합니다.
 
 ### 5.4 공급자 재시도
 
@@ -300,7 +301,7 @@ OPENAI_QUEUE_WAIT_SECONDS=30
     "missing_sequences": [2]
   },
   "summary": null,
-  "requested_model": "gpt-5.6-luna",
+  "requested_model": "gpt-6-luna",
   "resolved_model": null,
   "prompt_version": "summary-v1",
   "schema_version": 8,
@@ -418,7 +419,7 @@ archive 순서:
 5. 누락이 있으면 `incomplete` 반환하고 최종 요약 생략
 6. 누락이 없을 때만 finalize lease 획득
 7. 전체 한국어 자막 조합과 BSON·요약 입력 크기 검사
-8. Luna 최종 요약 한 번 실행
+8. GPT-6 Luna 최종 요약 한 번 실행
 9. 요약 본문·요약 메타데이터·`summary_status=completed`·`status=completed`를 같은 문서의 단일 원자적 쓰기로 확정
 10. 완료 저장 성공 후 세션·청크 초안 삭제
 
@@ -545,7 +546,7 @@ MONGODB_URI=<Render Secret>
 MONGODB_DATABASE=lecture_memo
 OPENAI_API_KEY=<Render Secret>
 OPENAI_TRANSCRIBE_MODEL=gpt-transcribe
-OPENAI_TEXT_MODEL=gpt-5.6-luna
+OPENAI_TEXT_MODEL=gpt-6-luna
 OPENAI_TRANSCRIBE_TIMEOUT_SECONDS=90
 OPENAI_TEXT_TIMEOUT_SECONDS=60
 CLIENT_REQUEST_TIMEOUT_SECONDS=480
@@ -619,7 +620,7 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 5. 0 기반 sequence와 `expected_chunk_count`
 6. Atlas 기반 chunk processing lease
 7. gpt-transcribe verbose JSON·segment timestamp 계약
-8. Luna Responses API의 `store:false`, structured output, prompt 방어
+8. GPT-6 Luna Responses API의 `store:false`, structured output, prompt 방어
 9. 부분 문서 upsert와 7일 후 `resume_status=expired`
 10. archive 순서, finalize lease, 크기 검사
 11. 메타데이터 목록·상세·삭제 API 분리
@@ -691,18 +692,14 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 
 ## 18. 비용 참고
 
-2026-09-21 공개 가격 기준으로 5명이 매일 40분씩 30일 사용하면 원본은 월 6,000분입니다. 60초 창을 58초 간격으로 시작하므로 약 `60/58`배인 6,207분이 과금 대상 전사 시간의 보수적 근삿값입니다.
+2026-09-28 OpenAI 공개 표준 가격(입력 272K 토큰 이하) 기준 GPT-6 Luna는 입력 100만 토큰당 $0.10, 캐시 입력 $0.01, 캐시 쓰기 $0.125, 출력 $0.50입니다. 이전 GPT-5.6 Luna 가격($0.20 입력·$1.20 출력)과 비교하면 입력 단가는 50%, 출력 단가는 약 58% 낮습니다. 예시로 입력·출력 각 100만 토큰이면 $0.60이며, 이전 모델의 $1.40보다 $0.80 저렴합니다. 한 요청의 입력이 272K 토큰을 넘으면 입력·캐시 요금은 2배, 출력은 1.5배가 적용됩니다.
 
-```text
-전사: 6,207분 × $0.0045/분 ≈ $27.93/월
-Luna 번역·요약 포함 추정: 약 $30~33/월
-```
-
-실제 금액은 비한국어 비율, 토큰 수, fallback, 재시도에 따라 달라지며 Render와 Atlas 비용은 별도입니다. 일일 예산 제한과 `daily_usage`를 먼저 적용한 뒤 실측값으로 보정합니다.
+오디오 전사는 `gpt-transcribe` 과금이고 GPT-6 Luna 단가가 적용되지 않습니다. 이전 월 총액 추정은 GPT-5.6 Luna 가격을 전제로 했으므로 더 이상 기준으로 사용하지 않습니다. 실제 월 비용은 전사 분량과 번역·요약 입력/출력 토큰 사용량을 `daily_usage`에 기록한 뒤 다시 산정하며, Render와 Atlas 비용은 별도입니다.
 
 ## 19. 공식 참고 문서
 
-- OpenAI GPT-5.6 Luna: https://developers.openai.com/api/docs/models/gpt-5.6-luna
+- OpenAI GPT-6 Luna: https://developers.openai.com/api/docs/models/gpt-6-luna
+- OpenAI GPT-5.6 Luna (가격 비교 참고): https://developers.openai.com/api/docs/models/gpt-5.6-luna
 - OpenAI Audio Transcriptions API: https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create
 - OpenAI Responses API: https://developers.openai.com/api/reference/resources/responses/methods/create
 - OpenAI 데이터 제어: https://developers.openai.com/api/docs/guides/your-data

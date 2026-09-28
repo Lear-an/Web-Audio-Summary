@@ -1,6 +1,6 @@
 # Lecture Memo
 
-Chrome에서 재생 중인 강의 탭의 오디오를 60초 창·2초 겹침으로 캡처해 OpenAI로 전사하고, 종료 시 최종 요약을 생성하는 Manifest V3 확장 프로그램입니다. V8은 Render의 FastAPI 서버와 MongoDB Atlas를 이용해 등록 10명·동시 활성 5명을 기본 지원합니다.
+Chrome에서 재생 중인 강의 탭의 오디오를 60초 창·2초 겹침으로 캡처해 `gpt-transcribe`로 전사하고, GPT-6 Luna(`gpt-6-luna`)로 비한국어 자막을 한국어로 변환하고 종료 시 최종 요약을 생성하는 Manifest V3 확장 프로그램입니다. V8은 Render의 FastAPI 서버와 MongoDB Atlas를 이용해 등록 10명·동시 활성 5명을 기본 지원합니다.
 
 설계 기준은 [V8 설계서](chrome-lecture-caption-summary-design-v8.md), 설치·사용 순서는 [사용 설명서](사용설명서.md)를 참고하세요.
 
@@ -16,6 +16,7 @@ Chrome 확장 프로그램
 
 - 사용자는 관리자에게 받은 사용자 ID와 접속 코드만 입력합니다.
 - OpenAI 키는 운영자가 Render Secret으로 관리하며 확장 프로그램·Atlas·GitHub에 저장하지 않습니다.
+- GPT-6 Luna는 번역·최종 요약에 사용하며, 오디오 전사는 오디오 입력을 지원하는 `gpt-transcribe`가 담당합니다.
 - 성공한 전사와 부분 문서가 Atlas에 저장된 뒤에만 ACK됩니다. 중간에 저장이 실패하면 동일 청크 재전송으로 세션 순번과 부분 문서를 복구하며, ACK 전 원본 오디오는 IndexedDB에 남습니다.
 - 중간 요약은 만들지 않고 캡처 종료 시 최종 요약 결과를 문서에 한 번 확정합니다. 장애 후 재시도에서는 OpenAI 호출이 다시 발생할 수 있습니다.
 - 최종 요약과 `completed` 상태는 한 번의 문서 쓰기로 확정합니다. 배속 재생의 자막 시각은 영상 시간축으로 환산해 저장합니다.
@@ -48,7 +49,7 @@ render.yaml     Render 무료 Web Service 설정
 
 1. MongoDB Atlas에서 데이터베이스 사용자와 연결 문자열을 준비합니다.
 2. Render에서 이 GitHub 저장소의 Web Service를 만들고 `render.yaml`을 사용합니다.
-3. Render 환경변수에 `OPENAI_API_KEY`, `MONGODB_URI`, 사용자별 `APP_USER_n_ID/TOKEN_SHA256`, `ALLOWED_EXTENSION_ORIGINS`를 입력합니다.
+3. Render 환경변수에 `OPENAI_API_KEY`, `OPENAI_TEXT_MODEL=gpt-6-luna`, `MONGODB_URI`, 사용자별 `APP_USER_n_ID/TOKEN_SHA256`, `ALLOWED_EXTENSION_ORIGINS`를 입력합니다.
 4. `extension/config.js`의 `SERVER_BASE_URL`에는 실제 Render HTTPS URL이 반영되어 있습니다.
 5. `extension/manifest.json`의 Render host permission에도 같은 URL이 반영되어 있습니다.
 6. Chrome Developer Dashboard의 공개 키를 manifest의 `key`로 넣어 확장 ID를 고정합니다.
