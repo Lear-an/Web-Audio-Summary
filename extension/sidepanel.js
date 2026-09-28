@@ -1,21 +1,31 @@
 (function initializeSidePanel() {
   const { TARGET, MESSAGE, SESSION_STATE } = LectureProtocol;
   const Core = LectureCore;
+  const DOCUMENTS_REQUEST_TIMEOUT_MS = 75_000;
 
   const elements = {
     statusBadge: document.querySelector("#statusBadge"),
     userId: document.querySelector("#userId"),
     accessToken: document.querySelector("#accessToken"),
-    geminiApiKey: document.querySelector("#geminiApiKey"),
+    credentialArea: document.querySelector(".credential-area"),
+    credentialFields: document.querySelector("#credentialFields"),
+    credentialSummary: document.querySelector("#credentialSummary"),
+    credentialUserSummary: document.querySelector("#credentialUserSummary"),
+    changeCredentialsButton: document.querySelector("#changeCredentialsButton"),
     startButton: document.querySelector("#startButton"),
     stopButton: document.querySelector("#stopButton"),
     exportPreservedButton: document.querySelector("#exportPreservedButton"),
     discardButton: document.querySelector("#discardButton"),
     connectionMessage: document.querySelector("#connectionMessage"),
+    serverConnection: document.querySelector("#serverConnection"),
+    serverConnectionText: document.querySelector("#serverConnectionText"),
+    storageReadiness: document.querySelector("#storageReadiness"),
+    storageReadinessText: document.querySelector("#storageReadinessText"),
+    providerStatus: document.querySelector("#providerStatus"),
+    providerStatusText: document.querySelector("#providerStatusText"),
     elapsedValue: document.querySelector("#elapsedValue"),
     queueValue: document.querySelector("#queueValue"),
     sequenceValue: document.querySelector("#sequenceValue"),
-    latencyValue: document.querySelector("#latencyValue"),
     searchInput: document.querySelector("#searchInput"),
     copyButton: document.querySelector("#copyButton"),
     captionsList: document.querySelector("#captionsList"),
@@ -24,13 +34,23 @@
     termsList: document.querySelector("#termsList"),
     highlightsList: document.querySelector("#highlightsList"),
     checklistList: document.querySelector("#checklistList"),
-    bookmarkMemo: document.querySelector("#bookmarkMemo"),
-    bookmarkButton: document.querySelector("#bookmarkButton"),
-    bookmarksList: document.querySelector("#bookmarksList")
+    refreshDocumentsButton: document.querySelector("#refreshDocumentsButton"),
+    documentsMessage: document.querySelector("#documentsMessage"),
+    documentsList: document.querySelector("#documentsList"),
+    documentDetail: document.querySelector("#documentDetail"),
+    backToDocumentsButton: document.querySelector("#backToDocumentsButton"),
+    documentTitle: document.querySelector("#documentTitle"),
+    documentMeta: document.querySelector("#documentMeta"),
+    documentSummary: document.querySelector("#documentSummary"),
+    documentTranscript: document.querySelector("#documentTranscript")
   };
 
-  let snapshot = { state: SESSION_STATE.IDLE, captions: [], bookmarks: [], notes: {} };
+  let snapshot = { state: SESSION_STATE.IDLE, captions: [], notes: {}, providerStatus: { state: "not_checked" } };
   let snapshotReceivedAt = Date.now();
+  let startActionPending = false;
+  let localConnectionMessage = "";
+  let credentialsCollapsed = false;
+  let documentsRequestController = null;
 
   const statusPresentation = {
     IDLE: ["대기", "status-idle"],
@@ -67,32 +87,90 @@
     elements.statusBadge.textContent = label;
     elements.statusBadge.className = `status ${className}`;
     const active = isRunning();
-    const awaitingNewKey = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
-    const recoveringSession = Boolean(snapshot.recoveryRequired);
-    elements.startButton.textContent = recoveringSession
-      ? "서버 세션 복구"
-      : (awaitingNewKey ? "새 키로 계속" : "캡처 시작");
-    elements.startButton.disabled = active && !awaitingNewKey && !recoveringSession;
+    const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
+    const recoveringSession = Boolean(snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION);
+    const processingPreserved = Boolean(!snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state));
+    elements.startButton.textContent = processingPreserved ? "보존 청크 처리" : (recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작"));
+    elements.startButton.disabled = startActionPending || (active && !recoveringSession && !retryingQuota && !processingPreserved);
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
-    elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
+    elements.exportPreservedButton.hidden = !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
-    elements.userId.disabled = active;
-    elements.accessToken.disabled = active;
-    elements.geminiApiKey.disabled = active && !awaitingNewKey && !recoveringSession;
-    elements.geminiApiKey.placeholder = recoveringSession
-      ? "서버 복구에 사용할 Gemini API 키"
-      : (awaitingNewKey ? "계속할 새 Gemini API 키" : "캡처 시작 시에만 사용");
-    elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
+    elements.userId.disabled = active && !needsAction;
+    elements.accessToken.disabled = active && !needsAction;
+    elements.changeCredentialsButton.disabled = active && !needsAction;
+    renderCredentials();
+    elements.connectionMessage.textContent = localConnectionMessage || snapshot.error || snapshot.notice;
+  }
+
+  function credentialsComplete() {
+    return Boolean(elements.userId.value.trim() && elements.accessToken.value.trim());
+  }
+
+  function renderCredentials() {
+    const collapsed = credentialsCollapsed && credentialsComplete();
+    elements.credentialFields.hidden = collapsed;
+    elements.credentialSummary.hidden = !collapsed;
+    elements.changeCredentialsButton.hidden = !collapsed;
+    elements.credentialUserSummary.textContent = elements.userId.value.trim();
+  }
+
+  function expandCredentials(focusTarget = null) {
+    credentialsCollapsed = false;
+    renderCredentials();
+    if (focusTarget) focusTarget.focus();
+  }
+
+  function setConnectionMessage(message) {
+    localConnectionMessage = String(message || "");
+    elements.connectionMessage.textContent = localConnectionMessage;
+  }
+
+  function renderServerConnection(state, detail = "") {
+    const labels = {
+      checking: "연결 확인 중",
+      connected: "연결 완료",
+      degraded: "응답 상태 비정상",
+      unavailable: "연결 확인 필요"
+    };
+    elements.serverConnection.dataset.state = state;
+    elements.serverConnectionText.textContent = labels[state] || labels.unavailable;
+    elements.serverConnection.title = detail || "";
+  }
+
+  function renderStorageReadiness(state, detail = "") {
+    const labels = {
+      checking: "확인 중",
+      ready: "준비 완료",
+      unavailable: "확인 필요",
+      unknown: "캡처 시작 시 확인"
+    };
+    elements.storageReadiness.dataset.state = state;
+    elements.storageReadinessText.textContent = labels[state] || labels.unknown;
+    elements.storageReadiness.title = detail || "";
+  }
+
+  function renderProviderStatus(providerStatus = {}) {
+    const state = providerStatus?.state || "not_checked";
+    const labels = {
+      not_checked: "실제 요청 전",
+      mock_mode: "모의 모드",
+      success: "최근 GPT 처리 성공",
+      quota_exhausted: "할당량 소진",
+      rate_limited: "요청 속도 제한",
+      overloaded: "GPT 일시 과부하",
+      invalid_request: "요청 형식 오류",
+      request_failed: "GPT 요청 실패"
+    };
+    elements.providerStatus.dataset.state = state;
+    elements.providerStatusText.textContent = labels[state] || labels.request_failed;
+    elements.providerStatus.title = providerStatus?.detail || "상태 시험을 위한 GPT 요청은 보내지 않습니다.";
   }
 
   function renderMetrics() {
     elements.elapsedValue.textContent = Core.formatClock(snapshot.elapsedMs || 0);
     elements.queueValue.textContent = formatBytes(snapshot.estimatedQueueBytes || snapshot.queueBytes || 0);
     elements.sequenceValue.textContent = String((snapshot.stats?.lastSequence ?? -1) + 1);
-    elements.latencyValue.textContent = snapshot.stats?.lastLatencyMs == null
-      ? "-"
-      : `${(snapshot.stats.lastLatencyMs / 1000).toFixed(1)}초`;
   }
 
   function appendHighlightedText(container, text, query) {
@@ -125,7 +203,7 @@
       type: MESSAGE.SEEK_TO,
       payload: { tabId: snapshot.sourceTabId, timestampMs }
     }).catch((error) => {
-      elements.connectionMessage.textContent = error.message;
+      setConnectionMessage(error.message);
     });
   }
 
@@ -195,71 +273,34 @@
     renderList(elements.checklistList, notes.checklist, "복습 항목이 아직 없습니다.");
   }
 
-  function renderBookmarks() {
-    elements.bookmarksList.replaceChildren();
-    const bookmarks = snapshot.bookmarks || [];
-    if (bookmarks.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "empty-state";
-      empty.textContent = "저장한 북마크가 없습니다.";
-      elements.bookmarksList.append(empty);
-      return;
-    }
-    const fragment = document.createDocumentFragment();
-    for (const bookmark of bookmarks) {
-      const row = document.createElement("article");
-      row.className = "bookmark-row";
-      const time = document.createElement("button");
-      time.className = "timestamp";
-      time.type = "button";
-      time.textContent = Core.formatClock(bookmark.timestamp_ms);
-      time.addEventListener("click", () => seekTo(bookmark.timestamp_ms));
-      const memo = document.createElement("div");
-      memo.className = "caption-text";
-      memo.textContent = bookmark.memo || "메모 없음";
-      const remove = document.createElement("button");
-      remove.className = "delete-button";
-      remove.type = "button";
-      remove.textContent = "삭제";
-      remove.addEventListener("click", () => deleteBookmark(bookmark.id));
-      row.append(time, memo, remove);
-      fragment.append(row);
-    }
-    elements.bookmarksList.append(fragment);
-  }
-
   function render(nextSnapshot) {
+    if (nextSnapshot) localConnectionMessage = "";
     snapshot = { ...snapshot, ...(nextSnapshot || {}) };
     snapshotReceivedAt = Date.now();
+    renderProviderStatus(snapshot.providerStatus);
     renderStatus();
     renderMetrics();
     renderCaptions();
     renderNotes();
-    renderBookmarks();
   }
 
   async function startCapture() {
     const userId = elements.userId.value.trim();
     if (!userId) {
-      elements.connectionMessage.textContent = "관리자에게 받은 사용자 ID를 입력해 주세요.";
-      elements.userId.focus();
+      setConnectionMessage("관리자에게 받은 사용자 ID를 입력해 주세요.");
+      expandCredentials(elements.userId);
       return;
     }
     const accessToken = elements.accessToken.value.trim();
     if (!accessToken) {
-      elements.connectionMessage.textContent = "관리자에게 받은 접속 코드를 입력해 주세요.";
-      elements.accessToken.focus();
-      return;
-    }
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
+      setConnectionMessage("관리자에게 받은 접속 코드를 입력해 주세요.");
+      expandCredentials(elements.accessToken);
       return;
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("현재 탭을 찾을 수 없습니다.");
-    elements.connectionMessage.textContent = "캡처를 준비하고 있습니다.";
+    setConnectionMessage("캡처를 준비하고 있습니다.");
+    renderStorageReadiness("checking");
     elements.startButton.disabled = true;
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
@@ -268,12 +309,18 @@
         tabId: tab.id,
         serverBaseUrl: LectureConfig.SERVER_BASE_URL,
         userId,
-        accessToken,
-        geminiApiKey
+        accessToken
       }
     });
-    if (!response?.ok) throw new Error(response?.error || "캡처를 시작하지 못했습니다.");
-    elements.geminiApiKey.value = "";
+    if (!response?.ok) {
+      const errorMessage = response?.error || "캡처를 시작하지 못했습니다.";
+      if (/401|인증|접속 코드|사용자 ID/i.test(errorMessage)) expandCredentials(elements.accessToken);
+      throw new Error(errorMessage);
+    }
+    if (response.readinessOnly) {
+      setConnectionMessage(response.message || "서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요.");
+      return;
+    }
     if (response.snapshot) render(response.snapshot);
   }
 
@@ -290,12 +337,19 @@
 
   async function discardSession() {
     if (!confirm("보존된 원본 청크와 미완료 세션을 삭제할까요? 이 작업은 되돌릴 수 없습니다.")) return;
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      setConnectionMessage("서버 초안을 삭제하려면 사용자 ID와 접속 코드를 다시 입력해 주세요.");
+      return;
+    }
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.DISCARD_SESSION
+      type: MESSAGE.DISCARD_SESSION,
+      payload: { userId, accessToken }
     });
+    if (response?.snapshot) render(response.snapshot);
     if (!response?.ok) throw new Error(response?.error || "보존 세션을 폐기하지 못했습니다.");
-    if (response.snapshot) render(response.snapshot);
   }
 
   async function exportPreservedChunks() {
@@ -304,74 +358,54 @@
       type: MESSAGE.EXPORT_PRESERVED_CHUNKS
     });
     if (!response?.ok) throw new Error(response?.error || "보존 오디오를 내보내지 못했습니다.");
-    elements.connectionMessage.textContent = `보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`;
-  }
-
-  async function continueWithNewKey() {
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "계속 사용할 새 Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
-      return;
-    }
-    elements.startButton.disabled = true;
-    elements.connectionMessage.textContent = "새 Gemini API 키를 적용하고 있습니다.";
-    const response = await chrome.runtime.sendMessage({
-      target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.UPDATE_GEMINI_KEY,
-      payload: { geminiApiKey }
-    });
-    if (!response?.ok) throw new Error(response?.error || "Gemini API 키를 교체하지 못했습니다.");
-    elements.geminiApiKey.value = "";
-    if (response.snapshot) render(response.snapshot);
+    setConnectionMessage(`보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`);
   }
 
   async function recoverSession() {
-    const geminiApiKey = elements.geminiApiKey.value.trim();
-    if (!geminiApiKey) {
-      elements.connectionMessage.textContent = "서버 세션 복구에 사용할 Gemini API 키를 입력해 주세요.";
-      elements.geminiApiKey.focus();
-      return;
-    }
     const tabId = Number(snapshot.sourceTabId);
     if (!Number.isInteger(tabId)) throw new Error("기존 캡처 탭을 찾을 수 없습니다.");
     elements.startButton.disabled = true;
-    elements.connectionMessage.textContent = "서버 세션과 보존 청크를 복구하고 있습니다.";
+    setConnectionMessage("서버 세션과 보존 청크를 복구하고 있습니다.");
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
       type: MESSAGE.RECOVER_SESSION,
-      payload: { tabId, geminiApiKey }
+      payload: { tabId }
     });
-    elements.geminiApiKey.value = "";
     if (response?.snapshot) render(response.snapshot);
     if (!response?.ok) throw new Error(response?.error || "서버 세션을 복구하지 못했습니다.");
   }
 
-  async function addBookmark() {
-    if (!Number.isInteger(Number(snapshot.sourceTabId))) {
-      throw new Error("활성 캡처 세션이 없습니다.");
+  async function processPreservedChunks() {
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      expandCredentials(!userId ? elements.userId : elements.accessToken);
+      throw new Error("사용자 ID와 접속 코드를 입력해 주세요.");
     }
+    setConnectionMessage("보존된 오디오 청크를 처리하고 있습니다.");
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.ADD_BOOKMARK,
+      type: MESSAGE.PROCESS_PRESERVED_CHUNKS,
       payload: {
-        tabId: snapshot.sourceTabId,
-        memo: elements.bookmarkMemo.value.trim()
+        serverBaseUrl: LectureConfig.SERVER_BASE_URL,
+        userId,
+        accessToken,
+        sourceUrl: snapshot.sourceUrl
       }
     });
-    if (!response?.ok) throw new Error(response?.error || "북마크를 저장하지 못했습니다.");
-    elements.bookmarkMemo.value = "";
-    if (response.snapshot) render(response.snapshot);
+    if (response?.snapshot) render(response.snapshot);
+    if (!response?.ok) throw new Error(response?.error || "보존 청크를 처리하지 못했습니다.");
   }
 
-  async function deleteBookmark(id) {
+  async function retrySession() {
+    elements.startButton.disabled = true;
+    setConnectionMessage("보존 청크 처리를 다시 시도합니다.");
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.DELETE_BOOKMARK,
-      payload: { id }
+      type: MESSAGE.RETRY_SESSION
     });
-    if (!response?.ok) throw new Error(response?.error || "북마크를 삭제하지 못했습니다.");
-    if (response.snapshot) render(response.snapshot);
+    if (response?.snapshot) render(response.snapshot);
+    if (!response?.ok) throw new Error(response?.error || "청크 처리를 다시 시작하지 못했습니다.");
   }
 
   function finalCaptions() {
@@ -400,10 +434,7 @@
       return [
         notes.summary || "",
         "",
-        ...captions.map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`),
-        "",
-        "북마크",
-        ...(snapshot.bookmarks || []).map((item) => `[${Core.formatClock(item.timestamp_ms)}] ${item.memo || ""}`)
+        ...captions.map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`)
       ].join("\n");
     }
     return [
@@ -429,16 +460,159 @@
       "",
       ...(notes.highlights || []).map((item) => `- ${item}`),
       "",
-      "## 북마크",
-      "",
-      ...(snapshot.bookmarks || []).map((item) => `- [${Core.formatClock(item.timestamp_ms)}] ${item.memo || ""}`),
-      "",
       "## 자막",
       "",
       ...captions.map((item) => `- [${Core.formatClock(item.start_ms)}] ${item.text}`),
       "",
       ...(snapshot.gaps?.length ? ["## 누락 구간", "", ...snapshot.gaps.map((gap) => `- ${Core.formatClock(gap.start_ms)}–${Core.formatClock(gap.end_ms || gap.start_ms)}: ${gap.reason}`)] : [])
     ].join("\n");
+  }
+
+  function documentStatusLabel(status) {
+    const labels = {
+      completed: "완료",
+      incomplete: "미완료 · 이어서 복구 가능",
+      finalize_pending: "최종 요약 처리 중"
+    };
+    return labels[status] || "저장됨";
+  }
+
+  function formatDocumentDate(value) {
+    if (!value) return "날짜 없음";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "날짜 없음" : date.toLocaleString("ko-KR");
+  }
+
+  async function authenticatedDocumentRequest(path, signal) {
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      expandCredentials(!userId ? elements.userId : elements.accessToken);
+      throw new Error("저장 문서를 조회하려면 사용자 ID와 접속 코드를 입력해 주세요.");
+    }
+    let response;
+    try {
+      response = await fetch(`${LectureConfig.SERVER_BASE_URL}${path}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "X-User-ID": userId
+        },
+        signal
+      });
+    } catch (error) {
+      if (!signal?.aborted || signal?.reason === "timeout") {
+        renderServerConnection("unavailable", error.message);
+        renderStorageReadiness("unknown", "서버 응답을 받지 못했습니다.");
+      }
+      throw error;
+    }
+    let payload = null;
+    try { payload = await response.json(); } catch { payload = null; }
+    renderServerConnection("connected");
+    if (response.ok) renderStorageReadiness("ready");
+    else if (payload?.error?.code === "storage_unavailable") {
+      renderStorageReadiness("unavailable", payload?.error?.message || "저장소 연결을 확인해 주세요.");
+    }
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        expandCredentials(elements.accessToken);
+      }
+      const detail = payload?.error?.message || payload?.detail || `문서 조회 실패 (${response.status})`;
+      throw new Error(detail);
+    }
+    return payload;
+  }
+
+  function beginDocumentsRequest(message) {
+    documentsRequestController?.abort();
+    documentsRequestController = new AbortController();
+    elements.documentsMessage.textContent = message;
+    return documentsRequestController;
+  }
+
+  async function loadDocuments() {
+    elements.documentDetail.hidden = true;
+    elements.documentsList.hidden = false;
+    elements.documentsMessage.hidden = false;
+    const controller = beginDocumentsRequest("저장 문서를 불러오는 중입니다.");
+    const timeout = setTimeout(() => controller.abort("timeout"), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    try {
+      const payload = await authenticatedDocumentRequest("/v1/documents?limit=50", controller.signal);
+      if (controller !== documentsRequestController) return;
+      const documents = Array.isArray(payload?.items) ? payload.items : [];
+      elements.documentsList.replaceChildren();
+      if (documents.length === 0) {
+        elements.documentsMessage.textContent = "저장된 문서가 없습니다.";
+        return;
+      }
+      elements.documentsMessage.hidden = true;
+      const fragment = document.createDocumentFragment();
+      for (const item of documents) {
+        const row = document.createElement("article");
+        row.className = "document-row";
+        const button = document.createElement("button");
+        button.className = "document-button";
+        button.type = "button";
+        const title = document.createElement("strong");
+        title.className = "document-title";
+        title.textContent = item?.source?.title || "제목 없는 강의";
+        const meta = document.createElement("span");
+        meta.className = "document-meta";
+        meta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
+        button.append(title, meta);
+        button.addEventListener("click", () => {
+          void loadDocumentDetail(item?.document_id).catch((error) => {
+            if (error.name !== "AbortError") setConnectionMessage(error.message);
+          });
+        });
+        row.append(button);
+        fragment.append(row);
+      }
+      elements.documentsList.append(fragment);
+    } catch (error) {
+      if (error.name !== "AbortError" && controller === documentsRequestController) {
+        elements.documentsList.replaceChildren();
+        elements.documentsMessage.textContent = error.message;
+      } else if (error.name === "AbortError" && controller === documentsRequestController) {
+        elements.documentsMessage.textContent = "문서 조회 시간이 초과되었습니다. 다시 시도해 주세요.";
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function loadDocumentDetail(documentId) {
+    if (!documentId) throw new Error("문서 ID를 찾을 수 없습니다.");
+    const controller = beginDocumentsRequest("문서 내용을 불러오는 중입니다.");
+    elements.documentsList.hidden = true;
+    elements.documentsMessage.hidden = false;
+    elements.documentDetail.hidden = true;
+    const timeout = setTimeout(() => controller.abort("timeout"), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    try {
+      const item = await authenticatedDocumentRequest(`/v1/documents/${encodeURIComponent(documentId)}`, controller.signal);
+      if (controller !== documentsRequestController) return;
+      const segments = Array.isArray(item?.transcript?.segments) ? item.transcript.segments : [];
+      const transcript = item?.transcript?.text || segments
+        .map((segment) => `[${Core.formatClock(segment.start_ms || 0)}] ${segment.text || ""}`)
+        .join("\n");
+      const summary = item?.summary?.summary || (typeof item?.summary === "string" ? item.summary : "");
+      elements.documentTitle.textContent = item?.source?.title || "제목 없는 강의";
+      elements.documentMeta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
+      elements.documentSummary.textContent = summary || "최종 요약이 생성되지 않은 문서입니다.";
+      elements.documentTranscript.textContent = transcript || "저장된 자막이 없습니다.";
+      elements.documentsMessage.hidden = true;
+      elements.documentDetail.hidden = false;
+    } catch (error) {
+      if (controller === documentsRequestController) {
+        elements.documentsMessage.textContent = error.name === "AbortError"
+          ? "문서 상세 조회 시간이 초과되었습니다. 다시 시도해 주세요."
+          : error.message;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   function download(format) {
@@ -460,44 +634,88 @@
     if (response?.snapshot) render(response.snapshot);
   }
 
+  async function warmServerOnPanelOpen() {
+    renderServerConnection("checking");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: TARGET.SERVICE_WORKER,
+        type: MESSAGE.CHECK_SERVER_LIVE,
+        payload: { serverBaseUrl: LectureConfig.SERVER_BASE_URL }
+      });
+      if (response?.state) renderServerConnection(response.state, response.error || "");
+      else if (!response?.ok) renderServerConnection("unavailable", response?.error || "Render에 연결할 수 없습니다.");
+    } catch (error) {
+      renderServerConnection("unavailable", error.message);
+    }
+  }
+
   elements.startButton.addEventListener("click", () => {
-    const action = snapshot.recoveryRequired
+    const processingPreserved = !snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state);
+    const action = processingPreserved
+      ? processPreservedChunks
+      : (snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION)
       ? recoverSession
-      : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? continueWithNewKey : startCapture);
-    action().catch((error) => {
-      elements.connectionMessage.textContent = error.message;
-      elements.startButton.disabled = false;
-    });
+      : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? retrySession : startCapture);
+    startActionPending = true;
+    renderStatus();
+    action()
+      .catch((error) => {
+        setConnectionMessage(error.message);
+      })
+      .finally(() => {
+        startActionPending = false;
+        renderStatus();
+      });
   });
   elements.stopButton.addEventListener("click", () => {
     stopCapture().catch((error) => {
-      elements.connectionMessage.textContent = error.message;
+      setConnectionMessage(error.message);
       elements.stopButton.disabled = false;
     });
   });
   elements.discardButton.addEventListener("click", () => {
-    discardSession().catch((error) => { elements.connectionMessage.textContent = error.message; });
+    discardSession().catch((error) => { setConnectionMessage(error.message); });
   });
   elements.exportPreservedButton.addEventListener("click", () => {
-    exportPreservedChunks().catch((error) => { elements.connectionMessage.textContent = error.message; });
+    exportPreservedChunks().catch((error) => { setConnectionMessage(error.message); });
+  });
+  elements.changeCredentialsButton.addEventListener("click", () => {
+    const active = isRunning();
+    if (active && snapshot.state !== SESSION_STATE.PAUSED_ACTION) return;
+    expandCredentials(elements.accessToken);
+  });
+  for (const input of [elements.userId, elements.accessToken]) {
+    input.addEventListener("input", renderCredentials);
+  }
+  elements.credentialArea.addEventListener("focusout", (event) => {
+    if (event.relatedTarget && elements.credentialArea.contains(event.relatedTarget)) return;
+    setTimeout(() => {
+      if (credentialsComplete() && !elements.credentialArea.contains(document.activeElement)) {
+        credentialsCollapsed = true;
+        renderCredentials();
+      }
+    }, 0);
+  });
+  elements.refreshDocumentsButton.addEventListener("click", () => {
+    void loadDocuments();
+  });
+  elements.backToDocumentsButton.addEventListener("click", () => {
+    void loadDocuments();
   });
   elements.searchInput.addEventListener("input", renderCaptions);
   elements.copyButton.addEventListener("click", () => {
     const text = finalCaptions().map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`).join("\n");
     navigator.clipboard.writeText(text).catch((error) => {
-      elements.connectionMessage.textContent = `복사 실패: ${error.message}`;
+      setConnectionMessage(`복사 실패: ${error.message}`);
     });
   });
-  elements.bookmarkButton.addEventListener("click", () => {
-    addBookmark().catch((error) => { elements.connectionMessage.textContent = error.message; });
-  });
-
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === button));
       document.querySelectorAll(".panel").forEach((panel) => {
         panel.classList.toggle("active", panel.id === `${button.dataset.tab}Panel`);
       });
+      if (button.dataset.tab === "documents") void loadDocuments();
     });
   });
 
@@ -508,6 +726,16 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SESSION_SNAPSHOT) {
       render(message.payload || {});
+      return;
+    }
+    if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SERVER_LIVE_STATUS) {
+      const payload = message.payload || {};
+      renderServerConnection(payload.state || "unavailable", payload.detail || "");
+      return;
+    }
+    if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SERVER_READY_STATUS) {
+      const payload = message.payload || {};
+      renderStorageReadiness(payload.state || "unknown", payload.detail || "");
     }
   });
 
@@ -518,4 +746,5 @@
   }, 1000);
 
   void loadSnapshot();
+  void warmServerOnPanelOpen();
 })();
