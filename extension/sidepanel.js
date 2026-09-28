@@ -1,11 +1,17 @@
 (function initializeSidePanel() {
   const { TARGET, MESSAGE, SESSION_STATE } = LectureProtocol;
   const Core = LectureCore;
+  const DOCUMENTS_REQUEST_TIMEOUT_MS = 75_000;
 
   const elements = {
     statusBadge: document.querySelector("#statusBadge"),
     userId: document.querySelector("#userId"),
     accessToken: document.querySelector("#accessToken"),
+    credentialArea: document.querySelector(".credential-area"),
+    credentialFields: document.querySelector("#credentialFields"),
+    credentialSummary: document.querySelector("#credentialSummary"),
+    credentialUserSummary: document.querySelector("#credentialUserSummary"),
+    changeCredentialsButton: document.querySelector("#changeCredentialsButton"),
     startButton: document.querySelector("#startButton"),
     stopButton: document.querySelector("#stopButton"),
     exportPreservedButton: document.querySelector("#exportPreservedButton"),
@@ -16,7 +22,6 @@
     elapsedValue: document.querySelector("#elapsedValue"),
     queueValue: document.querySelector("#queueValue"),
     sequenceValue: document.querySelector("#sequenceValue"),
-    latencyValue: document.querySelector("#latencyValue"),
     searchInput: document.querySelector("#searchInput"),
     copyButton: document.querySelector("#copyButton"),
     captionsList: document.querySelector("#captionsList"),
@@ -25,16 +30,24 @@
     termsList: document.querySelector("#termsList"),
     highlightsList: document.querySelector("#highlightsList"),
     checklistList: document.querySelector("#checklistList"),
-    bookmarkMemo: document.querySelector("#bookmarkMemo"),
-    bookmarkButton: document.querySelector("#bookmarkButton"),
-    bookmarksList: document.querySelector("#bookmarksList")
+    refreshDocumentsButton: document.querySelector("#refreshDocumentsButton"),
+    documentsMessage: document.querySelector("#documentsMessage"),
+    documentsList: document.querySelector("#documentsList"),
+    documentDetail: document.querySelector("#documentDetail"),
+    backToDocumentsButton: document.querySelector("#backToDocumentsButton"),
+    documentTitle: document.querySelector("#documentTitle"),
+    documentMeta: document.querySelector("#documentMeta"),
+    documentSummary: document.querySelector("#documentSummary"),
+    documentTranscript: document.querySelector("#documentTranscript")
   };
 
-  let snapshot = { state: SESSION_STATE.IDLE, captions: [], bookmarks: [], notes: {} };
+  let snapshot = { state: SESSION_STATE.IDLE, captions: [], notes: {} };
   let snapshotReceivedAt = Date.now();
   let serverReadinessState = "checking";
   let startActionPending = false;
   let localConnectionMessage = "";
+  let credentialsCollapsed = false;
+  let documentsRequestController = null;
 
   const statusPresentation = {
     IDLE: ["대기", "status-idle"],
@@ -82,7 +95,27 @@
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active && !needsAction;
     elements.accessToken.disabled = active && !needsAction;
+    elements.changeCredentialsButton.disabled = active && !needsAction;
+    renderCredentials();
     elements.connectionMessage.textContent = snapshot.error || snapshot.notice || localConnectionMessage;
+  }
+
+  function credentialsComplete() {
+    return Boolean(elements.userId.value.trim() && elements.accessToken.value.trim());
+  }
+
+  function renderCredentials() {
+    const collapsed = credentialsCollapsed && credentialsComplete();
+    elements.credentialFields.hidden = collapsed;
+    elements.credentialSummary.hidden = !collapsed;
+    elements.changeCredentialsButton.hidden = !collapsed;
+    elements.credentialUserSummary.textContent = elements.userId.value.trim();
+  }
+
+  function expandCredentials(focusTarget = null) {
+    credentialsCollapsed = false;
+    renderCredentials();
+    if (focusTarget) focusTarget.focus();
   }
 
   function setConnectionMessage(message) {
@@ -107,9 +140,6 @@
     elements.elapsedValue.textContent = Core.formatClock(snapshot.elapsedMs || 0);
     elements.queueValue.textContent = formatBytes(snapshot.estimatedQueueBytes || snapshot.queueBytes || 0);
     elements.sequenceValue.textContent = String((snapshot.stats?.lastSequence ?? -1) + 1);
-    elements.latencyValue.textContent = snapshot.stats?.lastLatencyMs == null
-      ? "-"
-      : `${(snapshot.stats.lastLatencyMs / 1000).toFixed(1)}초`;
   }
 
   function appendHighlightedText(container, text, query) {
@@ -212,39 +242,6 @@
     renderList(elements.checklistList, notes.checklist, "복습 항목이 아직 없습니다.");
   }
 
-  function renderBookmarks() {
-    elements.bookmarksList.replaceChildren();
-    const bookmarks = snapshot.bookmarks || [];
-    if (bookmarks.length === 0) {
-      const empty = document.createElement("p");
-      empty.className = "empty-state";
-      empty.textContent = "저장한 북마크가 없습니다.";
-      elements.bookmarksList.append(empty);
-      return;
-    }
-    const fragment = document.createDocumentFragment();
-    for (const bookmark of bookmarks) {
-      const row = document.createElement("article");
-      row.className = "bookmark-row";
-      const time = document.createElement("button");
-      time.className = "timestamp";
-      time.type = "button";
-      time.textContent = Core.formatClock(bookmark.timestamp_ms);
-      time.addEventListener("click", () => seekTo(bookmark.timestamp_ms));
-      const memo = document.createElement("div");
-      memo.className = "caption-text";
-      memo.textContent = bookmark.memo || "메모 없음";
-      const remove = document.createElement("button");
-      remove.className = "delete-button";
-      remove.type = "button";
-      remove.textContent = "삭제";
-      remove.addEventListener("click", () => deleteBookmark(bookmark.id));
-      row.append(time, memo, remove);
-      fragment.append(row);
-    }
-    elements.bookmarksList.append(fragment);
-  }
-
   function render(nextSnapshot) {
     if (nextSnapshot) localConnectionMessage = "";
     snapshot = { ...snapshot, ...(nextSnapshot || {}) };
@@ -253,20 +250,19 @@
     renderMetrics();
     renderCaptions();
     renderNotes();
-    renderBookmarks();
   }
 
   async function startCapture() {
     const userId = elements.userId.value.trim();
     if (!userId) {
       setConnectionMessage("관리자에게 받은 사용자 ID를 입력해 주세요.");
-      elements.userId.focus();
+      expandCredentials(elements.userId);
       return;
     }
     const accessToken = elements.accessToken.value.trim();
     if (!accessToken) {
       setConnectionMessage("관리자에게 받은 접속 코드를 입력해 주세요.");
-      elements.accessToken.focus();
+      expandCredentials(elements.accessToken);
       return;
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -284,7 +280,11 @@
         accessToken
       }
     });
-    if (!response?.ok) throw new Error(response?.error || "캡처를 시작하지 못했습니다.");
+    if (!response?.ok) {
+      const errorMessage = response?.error || "캡처를 시작하지 못했습니다.";
+      if (/401|인증|접속 코드|사용자 ID/i.test(errorMessage)) expandCredentials(elements.accessToken);
+      throw new Error(errorMessage);
+    }
     if (response.readinessOnly) {
       setConnectionMessage(response.message || "서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요.");
       return;
@@ -354,33 +354,6 @@
     if (!response?.ok) throw new Error(response?.error || "청크 처리를 다시 시작하지 못했습니다.");
   }
 
-  async function addBookmark() {
-    if (!Number.isInteger(Number(snapshot.sourceTabId))) {
-      throw new Error("활성 캡처 세션이 없습니다.");
-    }
-    const response = await chrome.runtime.sendMessage({
-      target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.ADD_BOOKMARK,
-      payload: {
-        tabId: snapshot.sourceTabId,
-        memo: elements.bookmarkMemo.value.trim()
-      }
-    });
-    if (!response?.ok) throw new Error(response?.error || "북마크를 저장하지 못했습니다.");
-    elements.bookmarkMemo.value = "";
-    if (response.snapshot) render(response.snapshot);
-  }
-
-  async function deleteBookmark(id) {
-    const response = await chrome.runtime.sendMessage({
-      target: TARGET.SERVICE_WORKER,
-      type: MESSAGE.DELETE_BOOKMARK,
-      payload: { id }
-    });
-    if (!response?.ok) throw new Error(response?.error || "북마크를 삭제하지 못했습니다.");
-    if (response.snapshot) render(response.snapshot);
-  }
-
   function finalCaptions() {
     return [...(snapshot.captions || [])].sort((left, right) => left.start_ms - right.start_ms);
   }
@@ -407,10 +380,7 @@
       return [
         notes.summary || "",
         "",
-        ...captions.map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`),
-        "",
-        "북마크",
-        ...(snapshot.bookmarks || []).map((item) => `[${Core.formatClock(item.timestamp_ms)}] ${item.memo || ""}`)
+        ...captions.map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`)
       ].join("\n");
     }
     return [
@@ -436,16 +406,145 @@
       "",
       ...(notes.highlights || []).map((item) => `- ${item}`),
       "",
-      "## 북마크",
-      "",
-      ...(snapshot.bookmarks || []).map((item) => `- [${Core.formatClock(item.timestamp_ms)}] ${item.memo || ""}`),
-      "",
       "## 자막",
       "",
       ...captions.map((item) => `- [${Core.formatClock(item.start_ms)}] ${item.text}`),
       "",
       ...(snapshot.gaps?.length ? ["## 누락 구간", "", ...snapshot.gaps.map((gap) => `- ${Core.formatClock(gap.start_ms)}–${Core.formatClock(gap.end_ms || gap.start_ms)}: ${gap.reason}`)] : [])
     ].join("\n");
+  }
+
+  function documentStatusLabel(status) {
+    const labels = {
+      completed: "완료",
+      incomplete: "미완료 · 이어서 복구 가능",
+      finalize_pending: "최종 요약 처리 중"
+    };
+    return labels[status] || "저장됨";
+  }
+
+  function formatDocumentDate(value) {
+    if (!value) return "날짜 없음";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "날짜 없음" : date.toLocaleString("ko-KR");
+  }
+
+  async function authenticatedDocumentRequest(path, signal) {
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      expandCredentials(!userId ? elements.userId : elements.accessToken);
+      throw new Error("저장 문서를 조회하려면 사용자 ID와 접속 코드를 입력해 주세요.");
+    }
+    const response = await fetch(`${LectureConfig.SERVER_BASE_URL}${path}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "X-User-ID": userId
+      },
+      signal
+    });
+    let payload = null;
+    try { payload = await response.json(); } catch { payload = null; }
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        expandCredentials(elements.accessToken);
+      }
+      const detail = payload?.error?.message || payload?.detail || `문서 조회 실패 (${response.status})`;
+      throw new Error(detail);
+    }
+    return payload;
+  }
+
+  function beginDocumentsRequest(message) {
+    documentsRequestController?.abort();
+    documentsRequestController = new AbortController();
+    elements.documentsMessage.textContent = message;
+    return documentsRequestController;
+  }
+
+  async function loadDocuments() {
+    elements.documentDetail.hidden = true;
+    elements.documentsList.hidden = false;
+    elements.documentsMessage.hidden = false;
+    const controller = beginDocumentsRequest("저장 문서를 불러오는 중입니다.");
+    const timeout = setTimeout(() => controller.abort(), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    try {
+      const payload = await authenticatedDocumentRequest("/v1/documents?limit=50", controller.signal);
+      if (controller !== documentsRequestController) return;
+      const documents = Array.isArray(payload?.items) ? payload.items : [];
+      elements.documentsList.replaceChildren();
+      if (documents.length === 0) {
+        elements.documentsMessage.textContent = "저장된 문서가 없습니다.";
+        return;
+      }
+      elements.documentsMessage.hidden = true;
+      const fragment = document.createDocumentFragment();
+      for (const item of documents) {
+        const row = document.createElement("article");
+        row.className = "document-row";
+        const button = document.createElement("button");
+        button.className = "document-button";
+        button.type = "button";
+        const title = document.createElement("strong");
+        title.className = "document-title";
+        title.textContent = item?.source?.title || "제목 없는 강의";
+        const meta = document.createElement("span");
+        meta.className = "document-meta";
+        meta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
+        button.append(title, meta);
+        button.addEventListener("click", () => {
+          void loadDocumentDetail(item?.document_id).catch((error) => {
+            if (error.name !== "AbortError") setConnectionMessage(error.message);
+          });
+        });
+        row.append(button);
+        fragment.append(row);
+      }
+      elements.documentsList.append(fragment);
+    } catch (error) {
+      if (error.name !== "AbortError" && controller === documentsRequestController) {
+        elements.documentsList.replaceChildren();
+        elements.documentsMessage.textContent = error.message;
+      } else if (error.name === "AbortError" && controller === documentsRequestController) {
+        elements.documentsMessage.textContent = "문서 조회 시간이 초과되었습니다. 다시 시도해 주세요.";
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  async function loadDocumentDetail(documentId) {
+    if (!documentId) throw new Error("문서 ID를 찾을 수 없습니다.");
+    const controller = beginDocumentsRequest("문서 내용을 불러오는 중입니다.");
+    elements.documentsList.hidden = true;
+    elements.documentsMessage.hidden = false;
+    elements.documentDetail.hidden = true;
+    const timeout = setTimeout(() => controller.abort(), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    try {
+      const item = await authenticatedDocumentRequest(`/v1/documents/${encodeURIComponent(documentId)}`, controller.signal);
+      if (controller !== documentsRequestController) return;
+      const segments = Array.isArray(item?.transcript?.segments) ? item.transcript.segments : [];
+      const transcript = item?.transcript?.text || segments
+        .map((segment) => `[${Core.formatClock(segment.start_ms || 0)}] ${segment.text || ""}`)
+        .join("\n");
+      const summary = item?.summary?.summary || (typeof item?.summary === "string" ? item.summary : "");
+      elements.documentTitle.textContent = item?.source?.title || "제목 없는 강의";
+      elements.documentMeta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
+      elements.documentSummary.textContent = summary || "최종 요약이 생성되지 않은 문서입니다.";
+      elements.documentTranscript.textContent = transcript || "저장된 자막이 없습니다.";
+      elements.documentsMessage.hidden = true;
+      elements.documentDetail.hidden = false;
+    } catch (error) {
+      if (controller === documentsRequestController) {
+        elements.documentsMessage.textContent = error.name === "AbortError"
+          ? "문서 상세 조회 시간이 초과되었습니다. 다시 시도해 주세요."
+          : error.message;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   function download(format) {
@@ -509,6 +608,29 @@
   elements.exportPreservedButton.addEventListener("click", () => {
     exportPreservedChunks().catch((error) => { setConnectionMessage(error.message); });
   });
+  elements.changeCredentialsButton.addEventListener("click", () => {
+    const active = isRunning();
+    if (active && snapshot.state !== SESSION_STATE.PAUSED_ACTION) return;
+    expandCredentials(elements.accessToken);
+  });
+  for (const input of [elements.userId, elements.accessToken]) {
+    input.addEventListener("input", renderCredentials);
+  }
+  elements.credentialArea.addEventListener("focusout", (event) => {
+    if (event.relatedTarget && elements.credentialArea.contains(event.relatedTarget)) return;
+    setTimeout(() => {
+      if (credentialsComplete() && !elements.credentialArea.contains(document.activeElement)) {
+        credentialsCollapsed = true;
+        renderCredentials();
+      }
+    }, 0);
+  });
+  elements.refreshDocumentsButton.addEventListener("click", () => {
+    void loadDocuments();
+  });
+  elements.backToDocumentsButton.addEventListener("click", () => {
+    void loadDocuments();
+  });
   elements.searchInput.addEventListener("input", renderCaptions);
   elements.copyButton.addEventListener("click", () => {
     const text = finalCaptions().map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`).join("\n");
@@ -516,16 +638,13 @@
       setConnectionMessage(`복사 실패: ${error.message}`);
     });
   });
-  elements.bookmarkButton.addEventListener("click", () => {
-    addBookmark().catch((error) => { setConnectionMessage(error.message); });
-  });
-
   document.querySelectorAll(".tab").forEach((button) => {
     button.addEventListener("click", () => {
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item === button));
       document.querySelectorAll(".panel").forEach((panel) => {
         panel.classList.toggle("active", panel.id === `${button.dataset.tab}Panel`);
       });
+      if (button.dataset.tab === "documents") void loadDocuments();
     });
   });
 

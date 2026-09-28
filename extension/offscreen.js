@@ -58,7 +58,6 @@
       processTimer: null,
       recoveryRequired: false,
       captions: [],
-      bookmarks: [],
       gaps: [],
       openGap: null,
       notes: emptyNotes(),
@@ -139,7 +138,6 @@
       recoveryRequired: Boolean(session.recoveryRequired),
       activeRecorderCount: session.activeRecorders.size,
       captions: sortedCaptions,
-      bookmarks: [...session.bookmarks],
       gaps: [...session.gaps, ...(session.openGap ? [{ ...session.openGap, open: true }] : [])],
       notes: { ...session.notes },
       stats: {
@@ -277,8 +275,7 @@
       expiresAtEpochMs: now + Config.OUTBOX_RETENTION_HOURS * 60 * 60 * 1000,
       startedAtEpochMs: session.startedAtEpochMs,
       stoppedAtEpochMs: session.stoppedAtEpochMs,
-      nextSequence: session.nextSequence,
-      bookmarks: session.bookmarks
+      nextSequence: session.nextSequence
     }, Config.OUTBOX_MAX_BYTES);
   }
 
@@ -320,7 +317,6 @@
       session.sourceTitle = marker.sourceTitle || session.sourceTitle;
       session.startedAtEpochMs = marker.startedAtEpochMs || session.startedAtEpochMs;
       session.stoppedAtEpochMs = marker.stoppedAtEpochMs || null;
-      session.bookmarks = Array.isArray(marker.bookmarks) ? marker.bookmarks : [];
       session.finalizePending = marker.state === "FINALIZE_PENDING";
     }
     const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED"].includes(record.state));
@@ -911,7 +907,6 @@
         headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           source_title: session.sourceTitle,
-          bookmarks: session.bookmarks,
           duration_ms: Math.max(0, (session.stoppedAtEpochMs || Date.now()) - (session.startedAtEpochMs || Date.now())),
           expected_chunk_count: session.nextSequence
         })
@@ -1133,25 +1128,6 @@
     return { ok: true };
   }
 
-  function addBookmark(payload) {
-    const bookmark = {
-      id: crypto.randomUUID(),
-      timestamp_ms: Math.max(0, Math.round(Number(payload.videoTimeMs) || 0)),
-      memo: String(payload.memo || "").trim(),
-      created_at: new Date().toISOString()
-    };
-    session.bookmarks.push(bookmark);
-    broadcastSnapshot();
-    return { ok: true, bookmark, snapshot: publicSnapshot() };
-  }
-
-  function deleteBookmark(payload) {
-    const id = String(payload.id || "");
-    session.bookmarks = session.bookmarks.filter((bookmark) => bookmark.id !== id);
-    broadcastSnapshot();
-    return { ok: true, snapshot: publicSnapshot() };
-  }
-
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message?.target !== TARGET.OFFSCREEN) return undefined;
 
@@ -1169,10 +1145,6 @@
           return { ok: true, snapshot: publicSnapshot() };
         case MESSAGE.TIMELINE_EVENT:
           return handleTimelineEvent(message.payload || {});
-        case MESSAGE.ADD_BOOKMARK:
-          return addBookmark(message.payload || {});
-        case MESSAGE.DELETE_BOOKMARK:
-          return deleteBookmark(message.payload || {});
         case MESSAGE.EXPORT_PRESERVED_CHUNKS:
           return exportPreservedChunks();
         case MESSAGE.DISCARD_SESSION:

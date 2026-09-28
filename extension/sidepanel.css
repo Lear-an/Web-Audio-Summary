@@ -16,6 +16,7 @@ body {
 }
 
 button, input { font: inherit; }
+[hidden] { display: none !important; }
 
 button {
   border: 1px solid #34405f;
@@ -100,13 +101,45 @@ h2 { margin: 0 0 10px; font-size: 14px; }
 label { display: block; margin-bottom: 9px; color: #aeb8ce; font-size: 11px; }
 label input { margin-top: 5px; }
 .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.secondary-actions:empty { display: none; }
 .primary { border-color: #5b78ff; background: #4968f2; }
 .danger { border-color: #8f3f51; background: #4a2430; }
 .message { min-height: 16px; margin: 9px 0 0; color: #ffbd66; font-size: 11px; line-height: 1.4; }
 
+.credential-area { margin-bottom: 10px; }
+.credential-heading, .credential-summary-row, .documents-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.credential-heading { margin-bottom: 7px; }
+.credential-heading h3 { margin: 0; font-size: 12px; }
+.credential-summary { padding: 9px 10px; border: 1px solid #303b59; border-radius: 9px; background: #0e1528; }
+.credential-summary-row { min-height: 20px; color: #8995ad; font-size: 11px; }
+.credential-summary-row strong { overflow: hidden; color: #e8ecf8; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.credential-fields[hidden] { display: none; }
+.text-button { padding: 3px 5px; border: 0; background: transparent; color: #9eafff; font-size: 11px; }
+.text-button:hover:not(:disabled) { background: transparent; color: #d6ddff; text-decoration: underline; }
+
+.video-context {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 11px;
+  padding: 9px 10px;
+  border: 1px solid #26314d;
+  border-radius: 10px;
+  background: rgba(14, 21, 40, 0.75);
+}
+.video-context-icon { display: grid; width: 28px; height: 28px; place-items: center; border-radius: 8px; background: #263660; color: #a9b8ff; font-size: 11px; }
+.video-context strong, .video-context small { display: block; }
+.video-context strong { font-size: 11px; }
+.video-context small { margin-top: 2px; color: #8995ad; font-size: 10px; }
+
 .metrics {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 7px;
   padding: 0 12px 12px;
 }
@@ -135,15 +168,15 @@ label input { margin-top: 5px; }
 .panel.active { display: block; }
 .toolbar { display: grid; grid-template-columns: 1fr auto; gap: 7px; margin-bottom: 8px; }
 
-.caption-list, .bookmark-list {
+.caption-list, .documents-list {
   min-height: 180px;
   max-height: calc(100vh - 410px);
   overflow: auto;
 }
 
-.caption-row, .bookmark-row {
+.caption-row {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr;
   gap: 9px;
   align-items: start;
   padding: 9px 4px;
@@ -161,9 +194,16 @@ mark { border-radius: 2px; background: #7f661c; color: #fff; }
 .preserve-lines { white-space: pre-line; line-height: 1.55; }
 .empty-state { color: #7f8aa1; font-size: 12px; }
 
-.bookmark-form { display: grid; gap: 7px; margin-bottom: 8px; }
-.bookmark-row { grid-template-columns: auto 1fr auto; }
-.delete-button { padding: 2px 6px; border: 0; background: transparent; color: #ff8290; }
+.documents-toolbar { margin-bottom: 8px; color: #aeb8ce; font-size: 11px; }
+.documents-list { min-height: 80px; max-height: calc(100vh - 260px); }
+.document-row { border-bottom: 1px solid #202a43; }
+.document-button { display: block; width: 100%; padding: 10px 5px; border: 0; border-radius: 0; background: transparent; text-align: left; }
+.document-button:hover:not(:disabled) { background: #151f37; }
+.document-title { margin: 0 0 5px; font-size: 13px; overflow-wrap: anywhere; }
+.document-meta { margin: 0; color: #8995ad; font-size: 10px; line-height: 1.5; }
+.document-detail { padding-top: 3px; }
+.document-detail h3 { margin: 16px 0 7px; font-size: 12px; }
+.document-summary, .document-transcript { max-height: 30vh; overflow: auto; padding: 10px; border: 1px solid #26314d; border-radius: 9px; background: #11192d; font-size: 12px; overflow-wrap: anywhere; }
 
 footer {
   position: sticky;

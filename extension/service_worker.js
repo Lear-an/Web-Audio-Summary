@@ -285,15 +285,6 @@ async function recoverSession(payload) {
   });
 }
 
-async function addBookmark(payload) {
-  const tabId = Number(payload?.tabId);
-  const videoState = await getVideoState(tabId);
-  return sendToOffscreen(MESSAGE.ADD_BOOKMARK, {
-    memo: String(payload?.memo || "").slice(0, 200),
-    videoTimeMs: videoState.currentTimeMs || 0
-  });
-}
-
 function sendSnapshotToViews(snapshot) {
   chrome.runtime.sendMessage({
     target: TARGET.SIDEPANEL,
@@ -366,10 +357,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           payload: { timestampMs: Number(message.payload?.timestampMs) || 0 }
         });
         return { ok: true };
-      case MESSAGE.ADD_BOOKMARK:
-        return addBookmark(message.payload || {});
-      case MESSAGE.DELETE_BOOKMARK:
-        return sendToOffscreen(MESSAGE.DELETE_BOOKMARK, message.payload || {});
       case MESSAGE.EXPORT_PRESERVED_CHUNKS:
         return sendToOffscreen(MESSAGE.EXPORT_PRESERVED_CHUNKS);
       case MESSAGE.DISCARD_SESSION:

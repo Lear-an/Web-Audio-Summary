@@ -110,6 +110,35 @@ def test_health_chunk_ack_and_archive_flow() -> None:
         assert repeated.json()["document_id"] == archived.json()["document_id"]
 
 
+def test_legacy_bookmarks_are_ignored_but_existing_document_field_is_preserved() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        archived = client.post(
+            f"/v1/sessions/{session_id}/archive",
+            headers=HEADERS,
+            json={
+                "source_title": "호환성 강의",
+                "bookmarks": [{"timestamp_ms": 1234, "memo": "legacy-only"}],
+                "duration_ms": 60_000,
+                "expected_chunk_count": 1,
+            },
+        )
+        assert archived.status_code == 200
+        document_id = archived.json()["document_id"]
+        saved = asyncio.run(store.get_document_for_session("local", session_id))
+        assert "bookmarks" not in saved
+        assert saved["summary_provider"]["prompt_version"] == "summary-v2"
+
+        legacy_field = [{"timestamp_ms": 1234, "memo": "keep-this-existing-atlas-value"}]
+        asyncio.run(store.upsert_document({**saved, "bookmarks": legacy_field}))
+        detail = client.get(f"/v1/documents/{document_id}", headers=HEADERS)
+        assert detail.status_code == 200
+        assert "bookmarks" not in detail.json()
+        preserved = asyncio.run(store.get_document_for_session("local", session_id))
+        assert preserved["bookmarks"] == legacy_field
+
+
 def test_source_url_is_canonicalized_without_sensitive_query() -> None:
     payload = {**SESSION_PAYLOAD, "source_url": "https://viewer:password@www.youtube.com/watch?v=abc&utm_source=x&token=secret&session=private&fbclid=tracker#frag"}
     with TestClient(app) as client:

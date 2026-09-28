@@ -21,17 +21,35 @@
         <span class="readiness-indicator" aria-hidden="true"></span>
         <span id="serverReadinessText">서버 준비 중</span>
       </p>
-      <label>
-        사용자 ID
-        <input id="userId" type="text" value="user-001" maxlength="64" autocomplete="username">
-      </label>
-      <label>
-        접속 코드
-        <input id="accessToken" type="password" placeholder="관리자에게 받은 접속 코드" autocomplete="current-password">
-      </label>
+      <section class="credential-area" aria-labelledby="credentialTitle">
+        <div class="credential-heading">
+          <h3 id="credentialTitle">사용자 정보</h3>
+          <button id="changeCredentialsButton" class="text-button" type="button" hidden>변경</button>
+        </div>
+        <div id="credentialSummary" class="credential-summary" hidden>
+          <div class="credential-summary-row"><span>사용자 ID</span><strong id="credentialUserSummary"></strong></div>
+          <div class="credential-summary-row"><span>접속 코드</span><strong id="credentialCodeSummary">입력됨</strong></div>
+        </div>
+        <div id="credentialFields" class="credential-fields">
+          <label>
+            사용자 ID
+            <input id="userId" type="text" value="user-001" maxlength="64" autocomplete="username">
+          </label>
+          <label>
+            접속 코드
+            <input id="accessToken" type="password" placeholder="관리자에게 받은 접속 코드" autocomplete="current-password">
+          </label>
+        </div>
+      </section>
+      <div class="video-context" aria-label="캡처 대상">
+        <span class="video-context-icon" aria-hidden="true">▶</span>
+        <span><strong>현재 탭의 강의 영상</strong><small>캡처를 시작하면 자막이 생성됩니다</small></span>
+      </div>
       <div class="button-row">
         <button id="startButton" class="primary" type="button">캡처 시작</button>
         <button id="stopButton" class="danger" type="button" disabled>캡처 종료</button>
+      </div>
+      <div class="button-row secondary-actions">
         <button id="exportPreservedButton" type="button" hidden>보존 오디오 내보내기</button>
         <button id="discardButton" type="button" hidden>보존 청크 폐기</button>
       </div>
@@ -40,15 +58,14 @@
 
     <section class="metrics" aria-label="세션 상태">
       <article><span>경과</span><strong id="elapsedValue">00:00</strong></article>
-      <article><span>큐</span><strong id="queueValue">0 KB</strong></article>
       <article><span>청크</span><strong id="sequenceValue">0</strong></article>
-      <article><span>최근 처리</span><strong id="latencyValue">-</strong></article>
+      <article><span>보존 큐</span><strong id="queueValue">0 KB</strong></article>
     </section>
 
     <nav class="tabs" aria-label="화면 선택">
       <button class="tab active" type="button" data-tab="captions">자막</button>
       <button class="tab" type="button" data-tab="notes">노트</button>
-      <button class="tab" type="button" data-tab="bookmarks">북마크</button>
+      <button class="tab" type="button" data-tab="documents">저장 문서</button>
     </nav>
 
     <main>
@@ -83,12 +100,22 @@
         </article>
       </section>
 
-      <section id="bookmarksPanel" class="panel">
-        <div class="bookmark-form">
-          <input id="bookmarkMemo" type="text" maxlength="200" placeholder="현재 시점에 남길 메모">
-          <button id="bookmarkButton" type="button">현재 위치 저장</button>
+      <section id="documentsPanel" class="panel" aria-label="저장 문서">
+        <div class="documents-toolbar">
+          <span>부분·완료 문서</span>
+          <button id="refreshDocumentsButton" class="text-button" type="button">새로고침</button>
         </div>
-        <div id="bookmarksList" class="bookmark-list"></div>
+        <p id="documentsMessage" class="empty-state" aria-live="polite">문서를 불러오려면 사용자 정보가 필요합니다.</p>
+        <div id="documentsList" class="documents-list"></div>
+        <section id="documentDetail" class="document-detail" hidden aria-label="문서 상세">
+          <button id="backToDocumentsButton" class="text-button" type="button">‹ 문서 목록</button>
+          <h2 id="documentTitle" class="document-title"></h2>
+          <p id="documentMeta" class="document-meta"></p>
+          <h3>요약</h3>
+          <div id="documentSummary" class="document-summary preserve-lines"></div>
+          <h3>자막</h3>
+          <div id="documentTranscript" class="document-transcript preserve-lines"></div>
+        </section>
       </section>
     </main>
 

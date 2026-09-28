@@ -78,12 +78,12 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": "\n".join(v["text"] for v in segments), "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "summary_status": "completed" if status == "completed" else ("processing" if status == "finalize_pending" else "not_run"),
-        "summary": summary.model_dump() if summary else (existing or {}).get("summary"), "bookmarks": archive.bookmarks if archive else (existing or {}).get("bookmarks", []),
+        "summary": summary.model_dump() if summary else (existing or {}).get("summary"),
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
         "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": None if status == "completed" else draft.get("expire_at"),
     }
     if summary_meta is not None:
-        value["summary_provider"] = {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v1", "schema_version": 1}
+        value["summary_provider"] = {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v2", "schema_version": 1}
     encoded = json.dumps(value, default=str, ensure_ascii=False).encode("utf-8")
     if len(encoded) > settings.max_document_bytes: raise ApiError(413, "document_too_large", "문서 크기가 Atlas 저장 한도를 초과합니다.")
     return await store.upsert_document(value)
@@ -361,7 +361,7 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
     try:
         interim = await _write_partial(user.user_id, session_id, status="finalize_pending", expected=expected, archive=payload); transcript = interim["transcript"]["text"]
         await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
-        try: summary, summary_meta = await gateway.summarize(transcript=transcript, bookmarks=payload.bookmarks, safety_identifier=_safety_id(user.user_id))
+        try: summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
         finally: openai_slots.release()
         doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload, summary=summary, summary_meta=summary_meta)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"summary_requests": 1}); await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
@@ -385,7 +385,7 @@ async def get_document(document_id: str, user: AuthenticatedUser = Depends(autho
     await _reconcile_state()
     row = await store.get_document(user.user_id, document_id)
     if not row: raise ApiError(404, "document_not_found", "문서를 찾을 수 없습니다.")
-    return row
+    return {key: value for key, value in row.items() if key != "bookmarks"}
 
 
 @app.delete("/v1/documents/{document_id}")

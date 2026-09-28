@@ -80,7 +80,8 @@ class SummaryResponse(BaseModel):
 
 class ArchiveRequest(BaseModel):
     source_title: str = Field(default="", max_length=1000)
-    bookmarks: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
+    # 구버전 확장 프로그램 요청만 호환합니다. 신규 저장·요약에는 사용하지 않습니다.
+    bookmarks: list[dict[str, Any]] = Field(default_factory=list, max_length=1000, deprecated=True)
     duration_ms: int = Field(default=0, ge=0)
     expected_chunk_count: int = Field(default=0, ge=0)
 
