@@ -65,3 +65,47 @@ test("offscreen discard keeps outbox after network failure and succeeds on retry
   assert.equal(retried.snapshot.state, "STOPPED");
   assert.deepEqual(removed, ["audio", "session"]);
 });
+
+test("preserved session finalizes without requesting a new tab capture stream", async () => {
+  let listener;
+  const calls = [];
+  const marker = {
+    id: "saved-session:session", kind: "session", sessionId: "saved-session",
+    sourceUrl: "https://example.test/lecture", sourceTitle: "강의", state: "FINALIZE_PENDING",
+    startedAtEpochMs: Date.now() - 60_000, stoppedAtEpochMs: Date.now(), sequence: -1
+  };
+  const context = vm.createContext({
+    AbortController, clearTimeout, setTimeout, performance, URL,
+    LectureCore: { queueDrainTimeoutMs: () => 100 },
+    LectureDiscard: {},
+    LectureConfig: { SERVER_BASE_URL: "https://example.test", OUTBOX_MAX_BYTES: 128 * 1024 * 1024 },
+    LectureOutbox: {
+      markExpired: async () => {}, latestRecoverable: async () => marker,
+      listSession: async () => [marker], remove: async () => {}, put: async () => {}
+    },
+    chrome: {
+      runtime: {
+        onMessage: { addListener: (callback) => { listener = callback; } },
+        sendMessage: async () => ({ ok: true })
+      }
+    },
+    fetch: async (url) => {
+      calls.push(url);
+      const body = url.endsWith("/resume")
+        ? { session_id: "saved-session", next_sequence: 0, segments: [] }
+        : { saved: true, status: "completed", document_id: "saved-document" };
+      return { ok: true, status: 200, json: async () => body, headers: { get: () => null } };
+    }
+  });
+  const extension = path.resolve(__dirname, "../../extension");
+  vm.runInContext(fs.readFileSync(path.join(extension, "protocol.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(extension, "offscreen.js"), "utf8"), context);
+  const response = await new Promise((resolve) => listener({
+    target: context.LectureProtocol.TARGET.OFFSCREEN,
+    type: context.LectureProtocol.MESSAGE.PROCESS_PRESERVED_CHUNKS,
+    payload: { serverBaseUrl: "https://example.test", userId: "user", accessToken: "token", sourceUrl: marker.sourceUrl }
+  }, {}, resolve));
+  assert.equal(response.ok, true, JSON.stringify(response));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls.map((url) => url.slice(url.lastIndexOf("/"))), ["/resume", "/archive"]);
+});

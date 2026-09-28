@@ -222,6 +222,40 @@ def test_session_can_resume_from_persisted_draft() -> None:
         assert resumed.json()["segments"][0]["text"] == "[모의 자막] 청크 0"
 
 
+def test_next_chunk_automatically_restores_session_after_process_restart() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, 0).status_code == 200
+        sessions.clear()
+        second = upload_chunk(client, session_id, 1)
+        assert second.status_code == 200
+        assert second.json()["sequence"] == 1
+        assert upload_chunk(client, session_id, 1).status_code == 200
+        assert asyncio.run(store.get_session("local", session_id))["next_sequence"] == 2
+
+
+def test_capture_gap_keeps_document_incomplete_without_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, 0).status_code == 200
+        response = client.post(
+            f"/v1/sessions/{session_id}/archive",
+            headers=HEADERS,
+            json={"expected_chunk_count": 1, "capture_gaps": [{"start_ms": 60_000, "end_ms": 90_000, "reason": "server_recovery"}]},
+        )
+        assert response.status_code == 200
+        assert response.json()["saved"] is False
+        assert response.json()["missing_sequences"] == []
+        assert response.json()["missing_time_ranges"][0]["end_ms"] == 90_000
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["status"] == "incomplete"
+        assert document["summary_status"] == "not_run"
+        repeated = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert repeated.status_code == 200
+        assert repeated.json()["saved"] is False
+        assert repeated.json()["missing_time_ranges"][0]["start_ms"] == 60_000
+
+
 def test_resume_clears_incomplete_ttl_from_session_and_chunks() -> None:
     with TestClient(app) as client:
         session_id = create_session(client)

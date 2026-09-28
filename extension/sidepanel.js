@@ -88,18 +88,19 @@
     elements.statusBadge.className = `status ${className}`;
     const active = isRunning();
     const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
-    const recoveringSession = Boolean(snapshot.recoveryRequired);
-    elements.startButton.textContent = recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작");
-    elements.startButton.disabled = startActionPending || (active && !recoveringSession && !retryingQuota);
+    const recoveringSession = Boolean(snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION);
+    const processingPreserved = Boolean(!snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state));
+    elements.startButton.textContent = processingPreserved ? "보존 청크 처리" : (recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작"));
+    elements.startButton.disabled = startActionPending || (active && !recoveringSession && !retryingQuota && !processingPreserved);
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
-    elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
+    elements.exportPreservedButton.hidden = !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active && !needsAction;
     elements.accessToken.disabled = active && !needsAction;
     elements.changeCredentialsButton.disabled = active && !needsAction;
     renderCredentials();
-    elements.connectionMessage.textContent = snapshot.error || snapshot.notice || localConnectionMessage;
+    elements.connectionMessage.textContent = localConnectionMessage || snapshot.error || snapshot.notice;
   }
 
   function credentialsComplete() {
@@ -374,6 +375,28 @@
     if (!response?.ok) throw new Error(response?.error || "서버 세션을 복구하지 못했습니다.");
   }
 
+  async function processPreservedChunks() {
+    const userId = elements.userId.value.trim();
+    const accessToken = elements.accessToken.value.trim();
+    if (!userId || !accessToken) {
+      expandCredentials(!userId ? elements.userId : elements.accessToken);
+      throw new Error("사용자 ID와 접속 코드를 입력해 주세요.");
+    }
+    setConnectionMessage("보존된 오디오 청크를 처리하고 있습니다.");
+    const response = await chrome.runtime.sendMessage({
+      target: TARGET.SERVICE_WORKER,
+      type: MESSAGE.PROCESS_PRESERVED_CHUNKS,
+      payload: {
+        serverBaseUrl: LectureConfig.SERVER_BASE_URL,
+        userId,
+        accessToken,
+        sourceUrl: snapshot.sourceUrl
+      }
+    });
+    if (response?.snapshot) render(response.snapshot);
+    if (!response?.ok) throw new Error(response?.error || "보존 청크를 처리하지 못했습니다.");
+  }
+
   async function retrySession() {
     elements.startButton.disabled = true;
     setConnectionMessage("보존 청크 처리를 다시 시도합니다.");
@@ -627,7 +650,10 @@
   }
 
   elements.startButton.addEventListener("click", () => {
-    const action = snapshot.recoveryRequired
+    const processingPreserved = !snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state);
+    const action = processingPreserved
+      ? processPreservedChunks
+      : (snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION)
       ? recoverSession
       : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? retrySession : startCapture);
     startActionPending = true;

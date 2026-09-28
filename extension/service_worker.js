@@ -401,6 +401,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return startSession(message.payload || {});
       case MESSAGE.RECOVER_SESSION:
         return recoverSession(message.payload || {});
+      case MESSAGE.PROCESS_PRESERVED_CHUNKS:
+        await ensureOffscreenDocument();
+        return sendToOffscreen(MESSAGE.PROCESS_PRESERVED_CHUNKS, message.payload || {});
       case MESSAGE.RETRY_SESSION:
         return sendToOffscreen(MESSAGE.RETRY_SESSION);
       case MESSAGE.STOP_SESSION:

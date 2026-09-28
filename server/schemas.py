@@ -84,6 +84,7 @@ class ArchiveRequest(BaseModel):
     bookmarks: list[dict[str, Any]] = Field(default_factory=list, max_length=1000, deprecated=True)
     duration_ms: int = Field(default=0, ge=0)
     expected_chunk_count: int = Field(default=0, ge=0)
+    capture_gaps: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
 
 
 class ArchiveResponse(BaseModel):
@@ -92,6 +93,7 @@ class ArchiveResponse(BaseModel):
     document_id: str | None = None
     chunk_count: int
     missing_sequences: list[int] = Field(default_factory=list)
+    missing_time_ranges: list[dict[str, Any]] = Field(default_factory=list)
     summary: SummaryResponse | None = None
 
 
