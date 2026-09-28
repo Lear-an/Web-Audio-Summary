@@ -229,23 +229,7 @@
     return payload;
   }
 
-  async function verifyServer() {
-    let payload = null;
-    let lastError = null;
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
-      try {
-        const response = await fetchWithTimeout(`${session.serverBaseUrl}/health/ready`, {}, 15_000);
-        payload = await assertResponse(response);
-        break;
-      } catch (error) {
-        lastError = error;
-        if (attempt >= 3) break;
-        session.notice = `서버를 깨우는 중입니다. 연결 재시도 ${attempt}/2`;
-        broadcastSnapshot();
-        await delay(attempt * 2_000);
-      }
-    }
-    if (!payload) throw lastError || new Error("서버에 연결하지 못했습니다.");
+  function applyServerHealth(payload) {
     if (payload?.status !== "ok") throw new Error("서버 상태가 정상적이지 않습니다.");
     const chunkSeconds = Core.clampNumber(payload.chunk_seconds, 15, 180);
     const overlapSeconds = Core.clampNumber(payload.chunk_overlap_seconds, 0, 30);
@@ -772,7 +756,7 @@
     broadcastSnapshot();
 
     try {
-      await verifyServer();
+      applyServerHealth(payload.serverHealth);
       await navigator.storage?.persist?.().catch(() => false);
       const resumed = await restoreRecoverableOutbox();
       if (!resumed) await createServerSession();

@@ -17,6 +17,10 @@
 
     <section class="connection-card" aria-labelledby="connectionTitle">
       <h2 id="connectionTitle">Lecture Memo 서버</h2>
+      <p id="serverReadiness" class="server-readiness" data-state="checking" role="status" aria-live="polite">
+        <span class="readiness-indicator" aria-hidden="true"></span>
+        <span id="serverReadinessText">서버 준비 중</span>
+      </p>
       <label>
         사용자 ID
         <input id="userId" type="text" value="user-001" maxlength="64" autocomplete="username">

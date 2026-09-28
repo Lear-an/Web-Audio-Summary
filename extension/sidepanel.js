@@ -11,6 +11,8 @@
     exportPreservedButton: document.querySelector("#exportPreservedButton"),
     discardButton: document.querySelector("#discardButton"),
     connectionMessage: document.querySelector("#connectionMessage"),
+    serverReadiness: document.querySelector("#serverReadiness"),
+    serverReadinessText: document.querySelector("#serverReadinessText"),
     elapsedValue: document.querySelector("#elapsedValue"),
     queueValue: document.querySelector("#queueValue"),
     sequenceValue: document.querySelector("#sequenceValue"),
@@ -30,6 +32,9 @@
 
   let snapshot = { state: SESSION_STATE.IDLE, captions: [], bookmarks: [], notes: {} };
   let snapshotReceivedAt = Date.now();
+  let serverReadinessState = "checking";
+  let startActionPending = false;
+  let localConnectionMessage = "";
 
   const statusPresentation = {
     IDLE: ["대기", "status-idle"],
@@ -69,14 +74,33 @@
     const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
     const recoveringSession = Boolean(snapshot.recoveryRequired);
     elements.startButton.textContent = recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작");
-    elements.startButton.disabled = active && !recoveringSession && !retryingQuota;
+    const readinessPending = serverReadinessState === "checking" && !recoveringSession && !retryingQuota;
+    elements.startButton.disabled = startActionPending || readinessPending || (active && !recoveringSession && !retryingQuota);
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
     elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active && !needsAction;
     elements.accessToken.disabled = active && !needsAction;
-    elements.connectionMessage.textContent = snapshot.error || snapshot.notice || "";
+    elements.connectionMessage.textContent = snapshot.error || snapshot.notice || localConnectionMessage;
+  }
+
+  function setConnectionMessage(message) {
+    localConnectionMessage = String(message || "");
+    elements.connectionMessage.textContent = localConnectionMessage;
+  }
+
+  function renderServerReadiness(state, detail = "") {
+    serverReadinessState = state;
+    const labels = {
+      checking: "서버 준비 중",
+      ready: "서버 연결 완료",
+      unavailable: "서버 확인 필요"
+    };
+    elements.serverReadiness.dataset.state = state;
+    elements.serverReadinessText.textContent = labels[state] || labels.unavailable;
+    elements.serverReadiness.title = detail || "";
+    renderStatus();
   }
 
   function renderMetrics() {
@@ -118,7 +142,7 @@
       type: MESSAGE.SEEK_TO,
       payload: { tabId: snapshot.sourceTabId, timestampMs }
     }).catch((error) => {
-      elements.connectionMessage.textContent = error.message;
+      setConnectionMessage(error.message);
     });
   }
 
@@ -222,6 +246,7 @@
   }
 
   function render(nextSnapshot) {
+    if (nextSnapshot) localConnectionMessage = "";
     snapshot = { ...snapshot, ...(nextSnapshot || {}) };
     snapshotReceivedAt = Date.now();
     renderStatus();
@@ -234,19 +259,20 @@
   async function startCapture() {
     const userId = elements.userId.value.trim();
     if (!userId) {
-      elements.connectionMessage.textContent = "관리자에게 받은 사용자 ID를 입력해 주세요.";
+      setConnectionMessage("관리자에게 받은 사용자 ID를 입력해 주세요.");
       elements.userId.focus();
       return;
     }
     const accessToken = elements.accessToken.value.trim();
     if (!accessToken) {
-      elements.connectionMessage.textContent = "관리자에게 받은 접속 코드를 입력해 주세요.";
+      setConnectionMessage("관리자에게 받은 접속 코드를 입력해 주세요.");
       elements.accessToken.focus();
       return;
     }
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("현재 탭을 찾을 수 없습니다.");
-    elements.connectionMessage.textContent = "캡처를 준비하고 있습니다.";
+    setConnectionMessage("캡처를 준비하고 있습니다.");
+    renderServerReadiness("checking");
     elements.startButton.disabled = true;
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
@@ -259,6 +285,10 @@
       }
     });
     if (!response?.ok) throw new Error(response?.error || "캡처를 시작하지 못했습니다.");
+    if (response.readinessOnly) {
+      setConnectionMessage(response.message || "서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요.");
+      return;
+    }
     if (response.snapshot) render(response.snapshot);
   }
 
@@ -278,7 +308,7 @@
     const userId = elements.userId.value.trim();
     const accessToken = elements.accessToken.value.trim();
     if (!userId || !accessToken) {
-      elements.connectionMessage.textContent = "서버 초안을 삭제하려면 사용자 ID와 접속 코드를 다시 입력해 주세요.";
+      setConnectionMessage("서버 초안을 삭제하려면 사용자 ID와 접속 코드를 다시 입력해 주세요.");
       return;
     }
     const response = await chrome.runtime.sendMessage({
@@ -296,14 +326,14 @@
       type: MESSAGE.EXPORT_PRESERVED_CHUNKS
     });
     if (!response?.ok) throw new Error(response?.error || "보존 오디오를 내보내지 못했습니다.");
-    elements.connectionMessage.textContent = `보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`;
+    setConnectionMessage(`보존 오디오 ${response.count || 0}개 다운로드를 요청했습니다.`);
   }
 
   async function recoverSession() {
     const tabId = Number(snapshot.sourceTabId);
     if (!Number.isInteger(tabId)) throw new Error("기존 캡처 탭을 찾을 수 없습니다.");
     elements.startButton.disabled = true;
-    elements.connectionMessage.textContent = "서버 세션과 보존 청크를 복구하고 있습니다.";
+    setConnectionMessage("서버 세션과 보존 청크를 복구하고 있습니다.");
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
       type: MESSAGE.RECOVER_SESSION,
@@ -315,7 +345,7 @@
 
   async function retrySession() {
     elements.startButton.disabled = true;
-    elements.connectionMessage.textContent = "보존 청크 처리를 다시 시도합니다.";
+    setConnectionMessage("보존 청크 처리를 다시 시도합니다.");
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
       type: MESSAGE.RETRY_SESSION
@@ -437,36 +467,57 @@
     if (response?.snapshot) render(response.snapshot);
   }
 
+  async function warmServerOnPanelOpen() {
+    renderServerReadiness("checking");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        target: TARGET.SERVICE_WORKER,
+        type: MESSAGE.CHECK_SERVER_READY,
+        payload: { serverBaseUrl: LectureConfig.SERVER_BASE_URL }
+      });
+      if (response?.state) renderServerReadiness(response.state, response.error || "");
+      else if (!response?.ok) renderServerReadiness("unavailable", response?.error || "서버에 연결할 수 없습니다.");
+    } catch (error) {
+      renderServerReadiness("unavailable", error.message);
+    }
+  }
+
   elements.startButton.addEventListener("click", () => {
     const action = snapshot.recoveryRequired
       ? recoverSession
       : (snapshot.state === SESSION_STATE.PAUSED_QUOTA ? retrySession : startCapture);
-    action().catch((error) => {
-      elements.connectionMessage.textContent = error.message;
-      elements.startButton.disabled = false;
-    });
+    startActionPending = true;
+    renderStatus();
+    action()
+      .catch((error) => {
+        setConnectionMessage(error.message);
+      })
+      .finally(() => {
+        startActionPending = false;
+        renderStatus();
+      });
   });
   elements.stopButton.addEventListener("click", () => {
     stopCapture().catch((error) => {
-      elements.connectionMessage.textContent = error.message;
+      setConnectionMessage(error.message);
       elements.stopButton.disabled = false;
     });
   });
   elements.discardButton.addEventListener("click", () => {
-    discardSession().catch((error) => { elements.connectionMessage.textContent = error.message; });
+    discardSession().catch((error) => { setConnectionMessage(error.message); });
   });
   elements.exportPreservedButton.addEventListener("click", () => {
-    exportPreservedChunks().catch((error) => { elements.connectionMessage.textContent = error.message; });
+    exportPreservedChunks().catch((error) => { setConnectionMessage(error.message); });
   });
   elements.searchInput.addEventListener("input", renderCaptions);
   elements.copyButton.addEventListener("click", () => {
     const text = finalCaptions().map((item) => `[${Core.formatClock(item.start_ms)}] ${item.text}`).join("\n");
     navigator.clipboard.writeText(text).catch((error) => {
-      elements.connectionMessage.textContent = `복사 실패: ${error.message}`;
+      setConnectionMessage(`복사 실패: ${error.message}`);
     });
   });
   elements.bookmarkButton.addEventListener("click", () => {
-    addBookmark().catch((error) => { elements.connectionMessage.textContent = error.message; });
+    addBookmark().catch((error) => { setConnectionMessage(error.message); });
   });
 
   document.querySelectorAll(".tab").forEach((button) => {
@@ -485,6 +536,11 @@
   chrome.runtime.onMessage.addListener((message) => {
     if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SESSION_SNAPSHOT) {
       render(message.payload || {});
+      return;
+    }
+    if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SERVER_READY_STATUS) {
+      const payload = message.payload || {};
+      renderServerReadiness(payload.state || "unavailable", payload.detail || "");
     }
   });
 
@@ -495,4 +551,5 @@
   }, 1000);
 
   void loadSnapshot();
+  void warmServerOnPanelOpen();
 })();

@@ -73,6 +73,30 @@ h2 { margin: 0 0 10px; font-size: 14px; }
   background: rgba(17, 25, 45, 0.88);
 }
 
+.server-readiness {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: -2px 0 11px;
+  color: #ffd166;
+  font-size: 11px;
+}
+.server-readiness[data-state="ready"] { color: #5ee0a0; }
+.server-readiness[data-state="unavailable"] { color: #ff8996; }
+.readiness-indicator {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.server-readiness[data-state="checking"] .readiness-indicator {
+  animation: readiness-pulse 1.2s ease-in-out infinite;
+}
+@keyframes readiness-pulse {
+  50% { opacity: 0.3; }
+}
+
 label { display: block; margin-bottom: 9px; color: #aeb8ce; font-size: 11px; }
 label input { margin-top: 5px; }
 .button-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }

@@ -89,7 +89,7 @@ SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 .\setup-and-run-server.cmd --install-only
 .\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest -q
-node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js
+node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js tests\extension\server_readiness.test.js
 Get-ChildItem extension\*.js | ForEach-Object { node --check $_.FullName }
 ```
 

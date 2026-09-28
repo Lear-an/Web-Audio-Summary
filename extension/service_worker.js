@@ -1,10 +1,133 @@
-importScripts("protocol.js");
+importScripts("protocol.js", "config.js");
 
 const { TARGET, MESSAGE } = LectureProtocol;
+const SERVER_READY_TIMEOUT_MS = 65_000;
+const SERVER_READY_GESTURE_BUDGET_MS = 2_500;
+const SERVER_READY_CACHE_KEYS = ["serverReadyLastAttemptAt", "serverReadyLastSuccessAt", "serverReadyLastState"];
 let creatingOffscreen = null;
+let serverReadyRequest = null;
 
 function serializeError(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function normalizeServerBaseUrl(rawValue) {
+  const url = new URL(String(rawValue || LectureConfig.SERVER_BASE_URL));
+  const isLocal = url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname) && (url.port || "80") === "8050";
+  const configured = new URL(LectureConfig.SERVER_BASE_URL);
+  const isConfiguredProduction = url.protocol === "https:" && url.origin === configured.origin;
+  if (!isLocal && !isConfiguredProduction) throw new Error("확장 프로그램에 등록되지 않은 서버 주소입니다.");
+  return url.origin;
+}
+
+function serverReadyCacheMs() {
+  const configured = Number(LectureConfig.SERVER_READY_CACHE_SECONDS) || 180;
+  return Math.min(300, Math.max(120, configured)) * 1000;
+}
+
+function publishServerReadyStatus(state, detail = "") {
+  chrome.runtime.sendMessage({
+    target: TARGET.SIDEPANEL,
+    type: MESSAGE.SERVER_READY_STATUS,
+    payload: { state, detail }
+  }).catch(() => {});
+}
+
+async function fetchServerReadiness(serverBaseUrl, onRequestStarted) {
+  const attemptedAt = Date.now();
+  await chrome.storage.session.set({
+    serverReadyLastAttemptAt: attemptedAt,
+    serverReadyLastState: "checking"
+  });
+  publishServerReadyStatus("checking");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SERVER_READY_TIMEOUT_MS);
+  try {
+    onRequestStarted?.();
+    const response = await fetch(`${serverBaseUrl}/health/ready`, { signal: controller.signal });
+    let payload = null;
+    try { payload = await response.json(); } catch { payload = null; }
+    if (!response.ok) {
+      throw new Error(payload?.error?.message || payload?.detail || `서버 상태 확인 실패 (${response.status})`);
+    }
+    if (payload?.status !== "ok") throw new Error("서버 상태가 정상적이지 않습니다.");
+
+    const checkedAt = Date.now();
+    await chrome.storage.session.set({
+      serverReadyLastSuccessAt: checkedAt,
+      serverReadyLastState: "ready"
+    });
+    publishServerReadyStatus("ready");
+    return { ok: true, state: "ready", payload, checkedAt };
+  } catch (error) {
+    const detail = error?.name === "AbortError"
+      ? `서버 준비 확인이 ${Math.round(SERVER_READY_TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다.`
+      : serializeError(error);
+    await chrome.storage.session.set({ serverReadyLastState: "unavailable" });
+    publishServerReadyStatus("unavailable", detail);
+    return { ok: false, state: "unavailable", error: detail, checkedAt: Date.now() };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function performServerReadinessCheck(serverBaseUrl, force, onRequestStarted) {
+  const now = Date.now();
+  if (!force) {
+    const saved = await chrome.storage.session.get(SERVER_READY_CACHE_KEYS);
+    const lastAttemptAt = Number(saved.serverReadyLastAttemptAt) || 0;
+    const lastSuccessAt = Number(saved.serverReadyLastSuccessAt) || 0;
+    const cacheMs = serverReadyCacheMs();
+    const successAge = now - lastSuccessAt;
+    if (saved.serverReadyLastState === "ready" && lastSuccessAt && successAge >= 0 && successAge < cacheMs) {
+      return { ok: true, state: "ready", cached: true, checkedAt: lastSuccessAt };
+    }
+    const attemptAge = now - lastAttemptAt;
+    if (lastAttemptAt && attemptAge >= 0 && attemptAge < cacheMs) {
+      return {
+        ok: false,
+        state: "unavailable",
+        cached: true,
+        error: "최근 서버 확인이 완료되지 않았습니다. 캡처 시작 시 다시 확인합니다."
+      };
+    }
+  }
+  return fetchServerReadiness(serverBaseUrl, onRequestStarted);
+}
+
+function checkServerReady(payload = {}) {
+  let serverBaseUrl;
+  try {
+    serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl);
+  } catch (error) {
+    return Promise.resolve({ ok: false, state: "unavailable", error: serializeError(error) });
+  }
+
+  if (serverReadyRequest?.serverBaseUrl === serverBaseUrl) {
+    const current = serverReadyRequest;
+    if (!payload.force || current.networkStarted) return current.promise;
+    if (current.forcePromise) return current.forcePromise;
+    current.forcePromise = current.promise.then((result) => {
+      if (current.networkStarted) return result;
+      if (serverReadyRequest === current) serverReadyRequest = null;
+      return checkServerReady({ ...payload, serverBaseUrl, force: true });
+    }, () => {
+      if (serverReadyRequest === current) serverReadyRequest = null;
+      return checkServerReady({ ...payload, serverBaseUrl, force: true });
+    });
+    return current.forcePromise;
+  }
+
+  const request = { serverBaseUrl, networkStarted: false, force: Boolean(payload.force), promise: null, forcePromise: null };
+  request.promise = performServerReadinessCheck(serverBaseUrl, request.force, () => {
+    request.networkStarted = true;
+  });
+  serverReadyRequest = request;
+  request.promise.finally(() => {
+    if (serverReadyRequest === request) serverReadyRequest = null;
+  }).catch(() => {});
+  return request.promise;
 }
 
 function assertCapturableTab(tab) {
@@ -85,11 +208,30 @@ async function getVideoState(tabId) {
 }
 
 async function startSession(payload) {
+  const startRequestedAt = performance.now();
   const tabId = Number(payload?.tabId);
   const tab = await chrome.tabs.get(tabId);
   assertCapturableTab(tab);
+
+  const readiness = await checkServerReady({ serverBaseUrl: payload.serverBaseUrl, force: true });
+  if (!readiness.ok) throw new Error(`서버 연결을 확인하지 못했습니다: ${readiness.error || "다시 시도해 주세요."}`);
+  if (performance.now() - startRequestedAt > SERVER_READY_GESTURE_BUDGET_MS) {
+    return {
+      ok: true,
+      readinessOnly: true,
+      message: "서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요."
+    };
+  }
+
   await prepareTab(tab);
   await ensureOffscreenDocument();
+  if (performance.now() - startRequestedAt > SERVER_READY_GESTURE_BUDGET_MS) {
+    return {
+      ok: true,
+      readinessOnly: true,
+      message: "서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요."
+    };
+  }
 
   const videoState = await getVideoState(tabId);
   let streamId;
@@ -109,7 +251,8 @@ async function startSession(payload) {
     serverBaseUrl: payload.serverBaseUrl,
     userId: payload.userId,
     accessToken: payload.accessToken,
-    videoState
+    videoState,
+    serverHealth: readiness.payload
   });
 
   if (!response?.ok) throw new Error(response?.error || "캡처를 시작하지 못했습니다.");
@@ -199,6 +342,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   void (async () => {
     switch (message.type) {
+      case MESSAGE.CHECK_SERVER_READY:
+        return checkServerReady(message.payload || {});
       case MESSAGE.START_SESSION:
         return startSession(message.payload || {});
       case MESSAGE.RECOVER_SESSION:
