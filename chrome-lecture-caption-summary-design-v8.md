@@ -6,7 +6,7 @@ V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계�
 
 - 등록 가능 계정은 기본 **10명**, 실제 동시 활성 사용자는 **5명**입니다. 두 제한은 별도 설정입니다.
 - OpenAI API 키는 운영자가 Render Secret으로 한 번만 설정합니다.
-- `gpt-transcribe`가 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다.
+- `whisper-1`이 구간 타임스탬프를 포함해 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다.
 - 사용자는 사용자 ID와 접속 코드만 입력합니다.
 - 북마크 기능은 제품 UI와 신규 전사·요약 데이터 범위에서 제외합니다.
 - 청크는 60초, 겹침은 2초입니다.
@@ -55,7 +55,7 @@ Render FastAPI Web Service
   ├─ 사용자 인증·소유권 격리
   ├─ 최대 동시 사용자 5명
   ├─ 청크 검증·영속 lease·재시도 분류
-  ├─ OpenAI gpt-transcribe 전사
+  ├─ OpenAI Whisper-1 전사 (구간 타임스탬프)
   ├─ OpenAI GPT-6 Luna 한국어 변환·최종 요약
   └─ MongoDB Atlas
        ├─ lecture_sessions
@@ -69,7 +69,7 @@ Render FastAPI Web Service
 |---|---|
 | 확장 프로그램 | 오디오 캡처, outbox 보존, 순차 업로드, 사용자 UI |
 | FastAPI | 인증, 검증, 큐 제어, OpenAI 호출, 상태 전이, 저장 |
-| gpt-transcribe | 원언어 전사와 세그먼트 타임스탬프 |
+| Whisper-1 (`whisper-1`) | 원언어 전사와 세그먼트 타임스탬프 |
 | GPT-6 Luna (`gpt-6-luna`) | 비한국어 전사의 한국어 변환, 종료 시 최종 요약 |
 | Atlas | 처리 상태, 전사, 부분·완료 문서, 공급자 상태, 사용량 |
 
@@ -118,18 +118,19 @@ SAFETY_IDENTIFIER_SECRET=<랜덤 비밀값>
 
 ### 5.2 전사 요청
 
-`gpt-transcribe` 요청 계약:
+`whisper-1` 요청 계약:
 
 - 확장자가 있는 파일명(예: `chunk-000012.webm`)과 `audio/webm` MIME을 전달합니다.
 - `response_format=verbose_json`을 사용합니다.
 - `timestamp_granularities=["segment"]`를 요청합니다.
-- 가능한 경우 강의 도메인의 keyword·prompt 정보를 사용합니다.
+- `timestamp_granularities=["segment"]`는 `whisper-1`에서만 지원됩니다. `gpt-transcribe`와 이 요청을 조합하면 OpenAI가 422로 거부하므로, 모델과 요청 파라미터를 함께 변경해야 합니다.
+- 현재 구현은 구간 타임스탬프에 의존하므로 운영 설정에서 `OPENAI_TRANSCRIBE_MODEL=whisper-1`을 사용합니다.
 - 세그먼트 타임스탬프가 없으면 청크 전체를 coarse segment 하나로 저장하고 `timestamp_uncertain=true`로 표시합니다.
 - 브라우저 청크 시각을 서버 기준 절대 자막 시각으로 변환합니다.
 
 ### 5.3 한국어 변환과 최종 요약
 
-GPT-6 Luna는 오디오 입력을 지원하지 않으므로 오디오 전사는 `gpt-transcribe`가 계속 담당하고, 번역·요약은 Responses API로 호출합니다.
+GPT-6 Luna는 이 구조에서 오디오 입력을 처리하지 않으므로 오디오 전사는 타임스탬프를 제공하는 `whisper-1`이 담당하고, 번역·요약은 Responses API로 호출합니다.
 
 - `model=gpt-6-luna`
 - `store=false`
@@ -262,7 +263,7 @@ OPENAI_QUEUE_WAIT_SECONDS=30
   "lease_until": "datetime",
   "attempt_count": 1,
   "provider_request_id": "...",
-  "requested_model": "gpt-transcribe",
+  "requested_model": "whisper-1",
   "resolved_model": "...",
   "prompt_version": "transcribe-v1",
   "schema_version": 1,
@@ -545,7 +546,7 @@ reconciliation은 만료된 processing lease를 해제하고, 오래된 processi
 MONGODB_URI=<Render Secret>
 MONGODB_DATABASE=lecture_memo
 OPENAI_API_KEY=<Render Secret>
-OPENAI_TRANSCRIBE_MODEL=gpt-transcribe
+OPENAI_TRANSCRIBE_MODEL=whisper-1
 OPENAI_TEXT_MODEL=gpt-6-luna
 OPENAI_TRANSCRIBE_TIMEOUT_SECONDS=90
 OPENAI_TEXT_TIMEOUT_SECONDS=60
@@ -619,7 +620,7 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 4. 세션 생성 시 `document_id` 선발급과 URL 정규화
 5. 0 기반 sequence와 `expected_chunk_count`
 6. Atlas 기반 chunk processing lease
-7. gpt-transcribe verbose JSON·segment timestamp 계약
+7. whisper-1 verbose JSON·segment timestamp 계약
 8. GPT-6 Luna Responses API의 `store:false`, structured output, prompt 방어
 9. 부분 문서 upsert와 7일 후 `resume_status=expired`
 10. archive 순서, finalize lease, 크기 검사
@@ -694,7 +695,7 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 
 2026-09-28 OpenAI 공개 표준 가격(입력 272K 토큰 이하) 기준 GPT-6 Luna는 입력 100만 토큰당 $0.10, 캐시 입력 $0.01, 캐시 쓰기 $0.125, 출력 $0.50입니다. 이전 GPT-5.6 Luna 가격($0.20 입력·$1.20 출력)과 비교하면 입력 단가는 50%, 출력 단가는 약 58% 낮습니다. 예시로 입력·출력 각 100만 토큰이면 $0.60이며, 이전 모델의 $1.40보다 $0.80 저렴합니다. 한 요청의 입력이 272K 토큰을 넘으면 입력·캐시 요금은 2배, 출력은 1.5배가 적용됩니다.
 
-오디오 전사는 `gpt-transcribe` 과금이고 GPT-6 Luna 단가가 적용되지 않습니다. 이전 월 총액 추정은 GPT-5.6 Luna 가격을 전제로 했으므로 더 이상 기준으로 사용하지 않습니다. 실제 월 비용은 전사 분량과 번역·요약 입력/출력 토큰 사용량을 `daily_usage`에 기록한 뒤 다시 산정하며, Render와 Atlas 비용은 별도입니다.
+오디오 전사는 Whisper-1의 별도 음성 전사 단가가 적용되고 GPT-6 Luna 단가가 적용되지 않습니다. 이전 월 총액 추정은 GPT-5.6 Luna 가격을 전제로 했으므로 더 이상 기준으로 사용하지 않습니다. 실제 월 비용은 전사 분량과 번역·요약 입력/출력 토큰 사용량을 `daily_usage`에 기록한 뒤 다시 산정하며, Render와 Atlas 비용은 별도입니다.
 
 ## 19. 공식 참고 문서
 

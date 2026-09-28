@@ -17,12 +17,14 @@ os.environ["AUDIO_CHUNK_SECONDS"] = "60"
 os.environ["AUDIO_CHUNK_OVERLAP_SECONDS"] = "2"
 os.environ["MAX_CHUNK_BYTES"] = "2000000"
 os.environ["MAX_REQUEST_BYTES"] = "2500000"
+os.environ["OPENAI_TRANSCRIBE_MODEL"] = "whisper-1"
 os.environ["OPENAI_TEXT_MODEL"] = "gpt-6-luna"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from server.app import _absolute_segments, _source_metadata, app, gateway, sessions, settings, store  # noqa: E402
 from server.openai_client import OpenAIQuotaExhaustedError, OpenAIUnavailableError  # noqa: E402
+from server.settings import Settings  # noqa: E402
 from server.storage import utcnow  # noqa: E402
 
 
@@ -43,6 +45,11 @@ def reset_memory_store():
     yield
     sessions.clear()
     asyncio.run(store.clear())
+
+
+def test_transcription_model_must_support_segment_timestamps() -> None:
+    with pytest.raises(ValueError, match="OPENAI_TRANSCRIBE_MODEL은 whisper-1이어야 합니다"):
+        Settings(openai_transcribe_model="gpt-transcribe")
 
 
 def create_session(client: TestClient) -> str:
@@ -74,7 +81,7 @@ def test_health_chunk_ack_and_archive_flow() -> None:
         assert health.status_code == 200
         assert health.json()["storage"] == "memory"
         assert health.json()["model"] == "gpt-6-luna"
-        assert health.json()["transcription_model"] == "gpt-transcribe"
+        assert health.json()["transcription_model"] == "whisper-1"
         assert health.json()["max_chunk_bytes"] >= 1_000_000
 
         session_id = create_session(client)

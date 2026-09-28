@@ -72,7 +72,7 @@ _configured_local_token = os.getenv("LOCAL_ACCESS_TOKEN", "").strip()
 @dataclass(frozen=True, slots=True)
 class Settings:
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "").strip()
-    openai_transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe").strip()
+    openai_transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip()
     openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-6-luna").strip()
     openai_text_fallback_model: str = os.getenv("OPENAI_TEXT_FALLBACK_MODEL", "gpt-5.6-terra").strip()
     text_fallback_enabled: bool = _as_bool(os.getenv("TEXT_FALLBACK_ENABLED"), False)
@@ -117,6 +117,11 @@ class Settings:
     daily_audio_minutes_limit_total: int = _bounded_int("DAILY_AUDIO_MINUTES_LIMIT_TOTAL", 0, 0, 1_000_000)
 
     def __post_init__(self) -> None:
+        if self.openai_transcribe_model != "whisper-1":
+            raise ValueError(
+                "OPENAI_TRANSCRIBE_MODEL은 whisper-1이어야 합니다. "
+                "현재 전사 요청의 구간 타임스탬프는 whisper-1에서만 지원됩니다."
+            )
         if self.app_auth_mode not in {"local", "multi_user"}:
             raise ValueError("APP_AUTH_MODE는 local 또는 multi_user여야 합니다.")
         if self.app_auth_mode == "multi_user" and not self.app_users:
