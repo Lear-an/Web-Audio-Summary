@@ -34,6 +34,8 @@
       serverBaseUrl: "",
       userId: "",
       accessToken: "",
+      mockMode: false,
+      providerStatus: { state: "not_checked", detail: "", updatedAtEpochMs: null },
       serverSessionId: null,
       stream: null,
       audioContext: null,
@@ -136,6 +138,8 @@
       estimatedQueueBytes: Math.round(audioBytes() * 1.5),
       queueCount: session.queue.length + (session.processing ? 1 : 0),
       recoveryRequired: Boolean(session.recoveryRequired),
+      mockMode: Boolean(session.mockMode),
+      providerStatus: { ...session.providerStatus },
       activeRecorderCount: session.activeRecorders.size,
       captions: sortedCaptions,
       gaps: [...session.gaps, ...(session.openGap ? [{ ...session.openGap, open: true }] : [])],
@@ -218,7 +222,7 @@
       const error = new HttpResponseError(
         payload?.error?.message || payload?.detail || payload?.error || `서버 요청 실패 (${response.status})`,
         response.status,
-        response.headers.get("Retry-After")
+        response.headers.get("Retry-After") || payload?.error?.retry_after_seconds
       );
       error.code = payload?.error?.code || "http_error";
       error.action = payload?.error?.action || null;
@@ -238,6 +242,37 @@
     session.overlapMs = Math.round(overlapSeconds * 1000);
     session.windowIntervalMs = session.windowMs - session.overlapMs;
     session.maxChunkBytes = Math.max(100_000, Number(payload.max_chunk_bytes) || 6_000_000);
+    session.mockMode = Boolean(payload.mock_mode);
+    session.providerStatus = {
+      state: session.mockMode ? "mock_mode" : "not_checked",
+      detail: session.mockMode ? "서버가 모의 모드로 실행 중입니다." : "실제 GPT 요청 전입니다.",
+      updatedAtEpochMs: Date.now()
+    };
+  }
+
+  function recordProviderSuccess() {
+    session.providerStatus = {
+      state: session.mockMode ? "mock_mode" : "success",
+      detail: session.mockMode ? "모의 응답이 반환되었습니다." : "최근 AI 처리 결과가 정상 반환되었습니다.",
+      updatedAtEpochMs: Date.now()
+    };
+  }
+
+  function recordProviderFailure(error) {
+    const providerStates = {
+      openai_quota_exhausted: "quota_exhausted",
+      openai_rate_limited: "rate_limited",
+      openai_overloaded: "overloaded",
+      openai_invalid_request: "invalid_request",
+      openai_request_failed: "request_failed"
+    };
+    const state = providerStates[error?.code];
+    if (!state) return;
+    session.providerStatus = {
+      state,
+      detail: serializeError(error),
+      updatedAtEpochMs: Date.now()
+    };
   }
 
   async function createServerSession() {
@@ -615,19 +650,28 @@
       session.stats.recentLatenciesMs.push(latencyMs);
       if (session.stats.recentLatenciesMs.length > 100) session.stats.recentLatenciesMs.shift();
       applyTranscriptResponse(chunk, response);
+      recordProviderSuccess();
       await Outbox.remove(chunk.id);
     } catch (error) {
-      const retryable = !error?.status || error?.status === 503 || Core.isRetryableStatus(error?.status);
-      if (error?.status === 429 || retryable) {
+      recordProviderFailure(error);
+      const quotaExhausted = error?.code === "openai_quota_exhausted" || (error?.status === 429 && (!error?.code || error.code === "http_error"));
+      const rateLimited = error?.code === "openai_rate_limited";
+      const retryable = !error?.status || error?.status === 503 || Core.isRetryableStatus(error?.status) || rateLimited;
+      if (quotaExhausted || retryable) {
         session.queue.unshift(chunk);
         session.queuedBytes += chunk.blob.size;
         chunk.unavailableAttempts = (chunk.unavailableAttempts || 0) + 1;
-        nextProcessingDelayMs = Core.transientRetryDelayMs(chunk.unavailableAttempts);
+        const retryAfterSeconds = Number(error?.retryAfter);
+        nextProcessingDelayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(3_600_000, Math.max(1_000, retryAfterSeconds * 1000))
+          : Core.transientRetryDelayMs(chunk.unavailableAttempts);
         session.stats.retries += 1;
-        await Outbox.updateState(chunk.id, error?.status === 429 ? "PAUSED_QUOTA" : "RETRY_WAIT", serializeError(error));
-        session.notice = error?.status === 429
+        await Outbox.updateState(chunk.id, quotaExhausted ? "PAUSED_QUOTA" : "RETRY_WAIT", serializeError(error));
+        session.notice = quotaExhausted
           ? "OpenAI 운영 한도에 도달하여 원본 청크를 보존했습니다. 관리자에게 문의해 주세요."
-          : `청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
+          : rateLimited
+            ? `GPT 요청 속도 제한으로 청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`
+            : `청크 ${chunk.sequence}을 보존했습니다. ${Math.ceil(nextProcessingDelayMs / 1000)}초 후 재시도합니다.`;
       } else {
         const requiresSessionResume = error?.code === "session_resume_required";
         session.stats.failedChunks += 1;
@@ -646,7 +690,7 @@
         openGap(error?.code || "chunk_needs_action");
         await stopAllRecorders();
       }
-      if (error?.status === 429) {
+      if (quotaExhausted) {
         await pauseForQuota();
       }
     } finally {
@@ -922,6 +966,7 @@
         highlights: Array.isArray(payload.summary.highlights) ? payload.summary.highlights : [],
         checklist: Array.isArray(payload.summary.checklist) ? payload.summary.checklist : []
       };
+      recordProviderSuccess();
     }
     session.documentId = payload?.document_id || null;
     if (payload?.saved) {
@@ -939,6 +984,7 @@
         return await archiveServerSession();
       } catch (error) {
         lastError = error;
+        recordProviderFailure(error);
         if (error?.status === 429 || (error?.status && error.status !== 503) || attempt >= 3) break;
         const waitMs = Core.transientRetryDelayMs(attempt + 1);
         session.notice = `최종 저장이 지연되어 ${Math.ceil(waitMs / 1000)}초 후 다시 시도합니다.`;

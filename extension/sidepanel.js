@@ -17,8 +17,12 @@
     exportPreservedButton: document.querySelector("#exportPreservedButton"),
     discardButton: document.querySelector("#discardButton"),
     connectionMessage: document.querySelector("#connectionMessage"),
-    serverReadiness: document.querySelector("#serverReadiness"),
-    serverReadinessText: document.querySelector("#serverReadinessText"),
+    serverConnection: document.querySelector("#serverConnection"),
+    serverConnectionText: document.querySelector("#serverConnectionText"),
+    storageReadiness: document.querySelector("#storageReadiness"),
+    storageReadinessText: document.querySelector("#storageReadinessText"),
+    providerStatus: document.querySelector("#providerStatus"),
+    providerStatusText: document.querySelector("#providerStatusText"),
     elapsedValue: document.querySelector("#elapsedValue"),
     queueValue: document.querySelector("#queueValue"),
     sequenceValue: document.querySelector("#sequenceValue"),
@@ -41,9 +45,8 @@
     documentTranscript: document.querySelector("#documentTranscript")
   };
 
-  let snapshot = { state: SESSION_STATE.IDLE, captions: [], notes: {} };
+  let snapshot = { state: SESSION_STATE.IDLE, captions: [], notes: {}, providerStatus: { state: "not_checked" } };
   let snapshotReceivedAt = Date.now();
-  let serverReadinessState = "checking";
   let startActionPending = false;
   let localConnectionMessage = "";
   let credentialsCollapsed = false;
@@ -87,8 +90,7 @@
     const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
     const recoveringSession = Boolean(snapshot.recoveryRequired);
     elements.startButton.textContent = recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작");
-    const readinessPending = serverReadinessState === "checking" && !recoveringSession && !retryingQuota;
-    elements.startButton.disabled = startActionPending || readinessPending || (active && !recoveringSession && !retryingQuota);
+    elements.startButton.disabled = startActionPending || (active && !recoveringSession && !retryingQuota);
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
     elements.exportPreservedButton.hidden = !needsAction || !(snapshot.queueCount > 0);
@@ -123,17 +125,45 @@
     elements.connectionMessage.textContent = localConnectionMessage;
   }
 
-  function renderServerReadiness(state, detail = "") {
-    serverReadinessState = state;
+  function renderServerConnection(state, detail = "") {
     const labels = {
-      checking: "서버 준비 중",
-      ready: "서버 연결 완료",
-      unavailable: "서버 확인 필요"
+      checking: "연결 확인 중",
+      connected: "연결 완료",
+      degraded: "응답 상태 비정상",
+      unavailable: "연결 확인 필요"
     };
-    elements.serverReadiness.dataset.state = state;
-    elements.serverReadinessText.textContent = labels[state] || labels.unavailable;
-    elements.serverReadiness.title = detail || "";
-    renderStatus();
+    elements.serverConnection.dataset.state = state;
+    elements.serverConnectionText.textContent = labels[state] || labels.unavailable;
+    elements.serverConnection.title = detail || "";
+  }
+
+  function renderStorageReadiness(state, detail = "") {
+    const labels = {
+      checking: "확인 중",
+      ready: "준비 완료",
+      unavailable: "확인 필요",
+      unknown: "캡처 시작 시 확인"
+    };
+    elements.storageReadiness.dataset.state = state;
+    elements.storageReadinessText.textContent = labels[state] || labels.unknown;
+    elements.storageReadiness.title = detail || "";
+  }
+
+  function renderProviderStatus(providerStatus = {}) {
+    const state = providerStatus?.state || "not_checked";
+    const labels = {
+      not_checked: "실제 요청 전",
+      mock_mode: "모의 모드",
+      success: "최근 GPT 처리 성공",
+      quota_exhausted: "할당량 소진",
+      rate_limited: "요청 속도 제한",
+      overloaded: "GPT 일시 과부하",
+      invalid_request: "요청 형식 오류",
+      request_failed: "GPT 요청 실패"
+    };
+    elements.providerStatus.dataset.state = state;
+    elements.providerStatusText.textContent = labels[state] || labels.request_failed;
+    elements.providerStatus.title = providerStatus?.detail || "상태 시험을 위한 GPT 요청은 보내지 않습니다.";
   }
 
   function renderMetrics() {
@@ -246,6 +276,7 @@
     if (nextSnapshot) localConnectionMessage = "";
     snapshot = { ...snapshot, ...(nextSnapshot || {}) };
     snapshotReceivedAt = Date.now();
+    renderProviderStatus(snapshot.providerStatus);
     renderStatus();
     renderMetrics();
     renderCaptions();
@@ -268,7 +299,7 @@
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab?.id) throw new Error("현재 탭을 찾을 수 없습니다.");
     setConnectionMessage("캡처를 준비하고 있습니다.");
-    renderServerReadiness("checking");
+    renderStorageReadiness("checking");
     elements.startButton.disabled = true;
     const response = await chrome.runtime.sendMessage({
       target: TARGET.SERVICE_WORKER,
@@ -436,16 +467,30 @@
       expandCredentials(!userId ? elements.userId : elements.accessToken);
       throw new Error("저장 문서를 조회하려면 사용자 ID와 접속 코드를 입력해 주세요.");
     }
-    const response = await fetch(`${LectureConfig.SERVER_BASE_URL}${path}`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "X-User-ID": userId
-      },
-      signal
-    });
+    let response;
+    try {
+      response = await fetch(`${LectureConfig.SERVER_BASE_URL}${path}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "X-User-ID": userId
+        },
+        signal
+      });
+    } catch (error) {
+      if (!signal?.aborted || signal?.reason === "timeout") {
+        renderServerConnection("unavailable", error.message);
+        renderStorageReadiness("unknown", "서버 응답을 받지 못했습니다.");
+      }
+      throw error;
+    }
     let payload = null;
     try { payload = await response.json(); } catch { payload = null; }
+    renderServerConnection("connected");
+    if (response.ok) renderStorageReadiness("ready");
+    else if (payload?.error?.code === "storage_unavailable") {
+      renderStorageReadiness("unavailable", payload?.error?.message || "저장소 연결을 확인해 주세요.");
+    }
     if (!response.ok) {
       if (response.status === 401 || response.status === 403) {
         expandCredentials(elements.accessToken);
@@ -468,7 +513,7 @@
     elements.documentsList.hidden = false;
     elements.documentsMessage.hidden = false;
     const controller = beginDocumentsRequest("저장 문서를 불러오는 중입니다.");
-    const timeout = setTimeout(() => controller.abort(), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort("timeout"), DOCUMENTS_REQUEST_TIMEOUT_MS);
     try {
       const payload = await authenticatedDocumentRequest("/v1/documents?limit=50", controller.signal);
       if (controller !== documentsRequestController) return;
@@ -520,7 +565,7 @@
     elements.documentsList.hidden = true;
     elements.documentsMessage.hidden = false;
     elements.documentDetail.hidden = true;
-    const timeout = setTimeout(() => controller.abort(), DOCUMENTS_REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort("timeout"), DOCUMENTS_REQUEST_TIMEOUT_MS);
     try {
       const item = await authenticatedDocumentRequest(`/v1/documents/${encodeURIComponent(documentId)}`, controller.signal);
       if (controller !== documentsRequestController) return;
@@ -567,17 +612,17 @@
   }
 
   async function warmServerOnPanelOpen() {
-    renderServerReadiness("checking");
+    renderServerConnection("checking");
     try {
       const response = await chrome.runtime.sendMessage({
         target: TARGET.SERVICE_WORKER,
-        type: MESSAGE.CHECK_SERVER_READY,
+        type: MESSAGE.CHECK_SERVER_LIVE,
         payload: { serverBaseUrl: LectureConfig.SERVER_BASE_URL }
       });
-      if (response?.state) renderServerReadiness(response.state, response.error || "");
-      else if (!response?.ok) renderServerReadiness("unavailable", response?.error || "서버에 연결할 수 없습니다.");
+      if (response?.state) renderServerConnection(response.state, response.error || "");
+      else if (!response?.ok) renderServerConnection("unavailable", response?.error || "Render에 연결할 수 없습니다.");
     } catch (error) {
-      renderServerReadiness("unavailable", error.message);
+      renderServerConnection("unavailable", error.message);
     }
   }
 
@@ -657,9 +702,14 @@
       render(message.payload || {});
       return;
     }
+    if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SERVER_LIVE_STATUS) {
+      const payload = message.payload || {};
+      renderServerConnection(payload.state || "unavailable", payload.detail || "");
+      return;
+    }
     if (message?.target === TARGET.SIDEPANEL && message.type === MESSAGE.SERVER_READY_STATUS) {
       const payload = message.payload || {};
-      renderServerReadiness(payload.state || "unavailable", payload.detail || "");
+      renderStorageReadiness(payload.state || "unknown", payload.detail || "");
     }
   });
 

@@ -65,6 +65,8 @@ function readyResponse() {
     status: 200,
     json: async () => ({
       status: "ok",
+      mock_mode: false,
+      storage: "mongodb",
       chunk_seconds: 60,
       chunk_overlap_seconds: 2,
       max_chunk_bytes: 6_000_000
@@ -72,67 +74,78 @@ function readyResponse() {
   };
 }
 
-test("server readiness caches panel checks and forced checks bypass the cache", async () => {
+function liveResponse() {
+  return { ok: true, status: 200, json: async () => ({ status: "ok" }) };
+}
+
+test("panel liveness checks /health/live and caches duplicate opens", async () => {
   let requests = 0;
-  const worker = createWorker(async () => {
+  const paths = [];
+  const worker = createWorker(async (url) => {
     requests += 1;
-    return readyResponse();
+    paths.push(new URL(url).pathname);
+    return liveResponse();
   });
   const payload = { serverBaseUrl: "https://web-audio-summary.onrender.com" };
 
-  const opened = await worker.send("CHECK_SERVER_READY", payload);
-  const reopened = await worker.send("CHECK_SERVER_READY", payload);
-  const captureStart = await worker.send("CHECK_SERVER_READY", { ...payload, force: true });
+  const opened = await worker.send("CHECK_SERVER_LIVE", payload);
+  const reopened = await worker.send("CHECK_SERVER_LIVE", payload);
 
   assert.equal(opened.ok, true);
-  assert.equal(opened.state, "ready");
+  assert.equal(opened.state, "connected");
   assert.equal(reopened.cached, true);
-  assert.equal(captureStart.cached, undefined);
-  assert.equal(requests, 2);
-  assert.equal(worker.sessionStorage.serverReadyLastState, "ready");
+  assert.equal(requests, 1);
+  assert.deepEqual(paths, ["/health/live"]);
+  assert.equal(worker.sessionStorage.serverLiveLastState, "connected");
 });
 
-test("panel warm-up and capture-start check share the same in-flight request", async () => {
-  let requests = 0;
-  let signalRequestStarted;
-  let releaseResponse;
-  const requestStarted = new Promise((resolve) => { signalRequestStarted = resolve; });
-  const responsePromise = new Promise((resolve) => { releaseResponse = resolve; });
-  const worker = createWorker(async () => {
-    requests += 1;
-    signalRequestStarted();
-    return responsePromise;
+test("Render liveness and storage readiness use separate endpoints", async () => {
+  const paths = [];
+  const worker = createWorker(async (url) => {
+    const pathName = new URL(url).pathname;
+    paths.push(pathName);
+    return pathName === "/health/live" ? liveResponse() : readyResponse();
   });
   const payload = { serverBaseUrl: "https://web-audio-summary.onrender.com" };
 
-  const panelCheck = worker.send("CHECK_SERVER_READY", payload);
-  await requestStarted;
-  const captureCheck = worker.send("CHECK_SERVER_READY", { ...payload, force: true });
-  await Promise.resolve();
-  assert.equal(requests, 1);
+  const live = await worker.send("CHECK_SERVER_LIVE", payload);
+  const ready = await worker.send("CHECK_SERVER_READY", payload);
 
-  releaseResponse(readyResponse());
-  const [panelResult, captureResult] = await Promise.all([panelCheck, captureCheck]);
-  assert.equal(panelResult.ok, true);
-  assert.equal(captureResult.ok, true);
-  assert.equal(requests, 1);
+  assert.equal(live.state, "connected");
+  assert.equal(ready.state, "ready");
+  assert.deepEqual(paths, ["/health/live", "/health/ready"]);
 });
 
-test("failed panel warm-up can be retried with a forced capture-start check", async () => {
-  let requests = 0;
-  const worker = createWorker(async () => {
-    requests += 1;
-    if (requests === 1) return { ok: false, status: 503, json: async () => ({ detail: "storage unavailable" }) };
-    return readyResponse();
+test("storage failure keeps Render connected and marks storage unavailable", async () => {
+  const worker = createWorker(async (url) => {
+    assert.equal(new URL(url).pathname, "/health/ready");
+    return {
+      ok: false,
+      status: 503,
+      json: async () => ({ error: { code: "storage_unavailable", message: "Atlas ping failed" } })
+    };
   });
   const payload = { serverBaseUrl: "https://web-audio-summary.onrender.com" };
 
-  const warmup = await worker.send("CHECK_SERVER_READY", payload);
-  const retry = await worker.send("CHECK_SERVER_READY", { ...payload, force: true });
+  const result = await worker.send("CHECK_SERVER_READY", payload);
+  const statuses = worker.publishedStatuses.map((message) => [message.type, message.payload.state]);
 
-  assert.equal(warmup.ok, false);
-  assert.equal(warmup.state, "unavailable");
-  assert.equal(retry.ok, true);
-  assert.equal(worker.sessionStorage.serverReadyLastState, "ready");
-  assert.equal(requests, 2);
+  assert.equal(result.ok, false);
+  assert.equal(result.state, "unavailable");
+  assert.equal(worker.sessionStorage.serverLiveLastState, "connected");
+  assert.equal(worker.sessionStorage.serverStorageLastState, "unavailable");
+  assert.ok(statuses.some(([type, state]) => type === "SERVER_LIVE_STATUS" && state === "connected"));
+  assert.ok(statuses.some(([type, state]) => type === "SERVER_READY_STATUS" && state === "unavailable"));
+});
+
+test("a readiness network failure leaves storage unknown and Render unverified", async () => {
+  const worker = createWorker(async () => { throw new Error("network unavailable"); });
+  const result = await worker.send("CHECK_SERVER_READY", {
+    serverBaseUrl: "https://web-audio-summary.onrender.com"
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.state, "unknown");
+  assert.equal(worker.sessionStorage.serverLiveLastState, "unavailable");
+  assert.equal(worker.sessionStorage.serverStorageLastState, "unknown");
 });

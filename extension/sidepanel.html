@@ -17,10 +17,23 @@
 
     <section class="connection-card" aria-labelledby="connectionTitle">
       <h2 id="connectionTitle">Lecture Memo 서버</h2>
-      <p id="serverReadiness" class="server-readiness" data-state="checking" role="status" aria-live="polite">
-        <span class="readiness-indicator" aria-hidden="true"></span>
-        <span id="serverReadinessText">서버 준비 중</span>
-      </p>
+      <div class="server-status-list" role="status" aria-live="polite" aria-label="서비스 상태">
+        <p id="serverConnection" class="server-status" data-state="checking">
+          <span class="readiness-indicator" aria-hidden="true"></span>
+          <span class="server-status-label">Render</span>
+          <span id="serverConnectionText">연결 확인 중</span>
+        </p>
+        <p id="storageReadiness" class="server-status" data-state="unknown">
+          <span class="readiness-indicator" aria-hidden="true"></span>
+          <span class="server-status-label">저장소</span>
+          <span id="storageReadinessText">캡처 시작 시 확인</span>
+        </p>
+        <p id="providerStatus" class="server-status" data-state="not_checked">
+          <span class="readiness-indicator" aria-hidden="true"></span>
+          <span class="server-status-label">GPT</span>
+          <span id="providerStatusText">실제 요청 전</span>
+        </p>
+      </div>
       <section class="credential-area" aria-labelledby="credentialTitle">
         <div class="credential-heading">
           <h3 id="credentialTitle">사용자 정보</h3>

@@ -1,10 +1,11 @@
 importScripts("protocol.js", "config.js");
 
 const { TARGET, MESSAGE } = LectureProtocol;
-const SERVER_READY_TIMEOUT_MS = 65_000;
+const SERVER_CHECK_TIMEOUT_MS = 65_000;
 const SERVER_READY_GESTURE_BUDGET_MS = 2_500;
-const SERVER_READY_CACHE_KEYS = ["serverReadyLastAttemptAt", "serverReadyLastSuccessAt", "serverReadyLastState"];
+const SERVER_LIVE_CACHE_KEYS = ["serverLiveLastAttemptAt", "serverLiveLastSuccessAt", "serverLiveLastState"];
 let creatingOffscreen = null;
+let serverLiveRequest = null;
 let serverReadyRequest = null;
 
 function serializeError(error) {
@@ -20,9 +21,17 @@ function normalizeServerBaseUrl(rawValue) {
   return url.origin;
 }
 
-function serverReadyCacheMs() {
-  const configured = Number(LectureConfig.SERVER_READY_CACHE_SECONDS) || 180;
+function serverLiveCacheMs() {
+  const configured = Number(LectureConfig.SERVER_LIVE_CACHE_SECONDS) || 180;
   return Math.min(300, Math.max(120, configured)) * 1000;
+}
+
+function publishServerLiveStatus(state, detail = "") {
+  chrome.runtime.sendMessage({
+    target: TARGET.SIDEPANEL,
+    type: MESSAGE.SERVER_LIVE_STATUS,
+    payload: { state, detail }
+  }).catch(() => {});
 }
 
 function publishServerReadyStatus(state, detail = "") {
@@ -33,70 +42,73 @@ function publishServerReadyStatus(state, detail = "") {
   }).catch(() => {});
 }
 
-async function fetchServerReadiness(serverBaseUrl, onRequestStarted) {
+async function fetchServerLive(serverBaseUrl) {
   const attemptedAt = Date.now();
   await chrome.storage.session.set({
-    serverReadyLastAttemptAt: attemptedAt,
-    serverReadyLastState: "checking"
+    serverLiveLastAttemptAt: attemptedAt,
+    serverLiveLastState: "checking"
   });
-  publishServerReadyStatus("checking");
+  publishServerLiveStatus("checking");
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), SERVER_READY_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), SERVER_CHECK_TIMEOUT_MS);
   try {
-    onRequestStarted?.();
-    const response = await fetch(`${serverBaseUrl}/health/ready`, { signal: controller.signal });
+    const response = await fetch(`${serverBaseUrl}/health/live`, { signal: controller.signal });
     let payload = null;
     try { payload = await response.json(); } catch { payload = null; }
-    if (!response.ok) {
-      throw new Error(payload?.error?.message || payload?.detail || `서버 상태 확인 실패 (${response.status})`);
+    if (!response.ok || payload?.status !== "ok") {
+      const detail = payload?.error?.message || payload?.detail || `Render 서버 응답 상태가 비정상입니다 (${response.status})`;
+      await chrome.storage.session.set({ serverLiveLastSuccessAt: Date.now(), serverLiveLastState: "degraded" });
+      publishServerLiveStatus("degraded", detail);
+      return { ok: false, state: "degraded", error: detail, checkedAt: Date.now() };
     }
-    if (payload?.status !== "ok") throw new Error("서버 상태가 정상적이지 않습니다.");
 
     const checkedAt = Date.now();
     await chrome.storage.session.set({
-      serverReadyLastSuccessAt: checkedAt,
-      serverReadyLastState: "ready"
+      serverLiveLastSuccessAt: checkedAt,
+      serverLiveLastState: "connected"
     });
-    publishServerReadyStatus("ready");
-    return { ok: true, state: "ready", payload, checkedAt };
+    publishServerLiveStatus("connected");
+    return { ok: true, state: "connected", payload, checkedAt };
   } catch (error) {
     const detail = error?.name === "AbortError"
-      ? `서버 준비 확인이 ${Math.round(SERVER_READY_TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다.`
+      ? `Render 서버 응답이 ${Math.round(SERVER_CHECK_TIMEOUT_MS / 1000)}초 안에 오지 않았습니다.`
       : serializeError(error);
-    await chrome.storage.session.set({ serverReadyLastState: "unavailable" });
-    publishServerReadyStatus("unavailable", detail);
+    await chrome.storage.session.set({ serverLiveLastState: "unavailable" });
+    publishServerLiveStatus("unavailable", detail);
     return { ok: false, state: "unavailable", error: detail, checkedAt: Date.now() };
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function performServerReadinessCheck(serverBaseUrl, force, onRequestStarted) {
+async function performServerLiveCheck(serverBaseUrl, force) {
   const now = Date.now();
   if (!force) {
-    const saved = await chrome.storage.session.get(SERVER_READY_CACHE_KEYS);
-    const lastAttemptAt = Number(saved.serverReadyLastAttemptAt) || 0;
-    const lastSuccessAt = Number(saved.serverReadyLastSuccessAt) || 0;
-    const cacheMs = serverReadyCacheMs();
+    const saved = await chrome.storage.session.get(SERVER_LIVE_CACHE_KEYS);
+    const lastAttemptAt = Number(saved.serverLiveLastAttemptAt) || 0;
+    const lastSuccessAt = Number(saved.serverLiveLastSuccessAt) || 0;
+    const cacheMs = serverLiveCacheMs();
     const successAge = now - lastSuccessAt;
-    if (saved.serverReadyLastState === "ready" && lastSuccessAt && successAge >= 0 && successAge < cacheMs) {
-      return { ok: true, state: "ready", cached: true, checkedAt: lastSuccessAt };
+    if (saved.serverLiveLastState === "connected" && lastSuccessAt && successAge >= 0 && successAge < cacheMs) {
+      return { ok: true, state: "connected", cached: true, checkedAt: lastSuccessAt };
     }
     const attemptAge = now - lastAttemptAt;
-    if (lastAttemptAt && attemptAge >= 0 && attemptAge < cacheMs) {
+    if (["degraded", "unavailable"].includes(saved.serverLiveLastState) && lastAttemptAt && attemptAge >= 0 && attemptAge < cacheMs) {
       return {
         ok: false,
-        state: "unavailable",
+        state: saved.serverLiveLastState,
         cached: true,
-        error: "최근 서버 확인이 완료되지 않았습니다. 캡처 시작 시 다시 확인합니다."
+        error: saved.serverLiveLastState === "degraded"
+          ? "Render는 응답했지만 상태 확인이 정상적이지 않았습니다."
+          : "최근 Render 연결 확인에 실패했습니다. 캡처 시작 시 저장소 준비를 다시 확인합니다."
       };
     }
   }
-  return fetchServerReadiness(serverBaseUrl, onRequestStarted);
+  return fetchServerLive(serverBaseUrl);
 }
 
-function checkServerReady(payload = {}) {
+function checkServerLive(payload = {}) {
   let serverBaseUrl;
   try {
     serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl);
@@ -104,25 +116,73 @@ function checkServerReady(payload = {}) {
     return Promise.resolve({ ok: false, state: "unavailable", error: serializeError(error) });
   }
 
-  if (serverReadyRequest?.serverBaseUrl === serverBaseUrl) {
-    const current = serverReadyRequest;
-    if (!payload.force || current.networkStarted) return current.promise;
-    if (current.forcePromise) return current.forcePromise;
-    current.forcePromise = current.promise.then((result) => {
-      if (current.networkStarted) return result;
-      if (serverReadyRequest === current) serverReadyRequest = null;
-      return checkServerReady({ ...payload, serverBaseUrl, force: true });
-    }, () => {
-      if (serverReadyRequest === current) serverReadyRequest = null;
-      return checkServerReady({ ...payload, serverBaseUrl, force: true });
-    });
-    return current.forcePromise;
+  if (serverLiveRequest?.serverBaseUrl === serverBaseUrl) {
+    return serverLiveRequest.promise;
   }
 
-  const request = { serverBaseUrl, networkStarted: false, force: Boolean(payload.force), promise: null, forcePromise: null };
-  request.promise = performServerReadinessCheck(serverBaseUrl, request.force, () => {
-    request.networkStarted = true;
-  });
+  const request = { serverBaseUrl, promise: null };
+  request.promise = performServerLiveCheck(serverBaseUrl, Boolean(payload.force));
+  serverLiveRequest = request;
+  request.promise.finally(() => {
+    if (serverLiveRequest === request) serverLiveRequest = null;
+  }).catch(() => {});
+  return request.promise;
+}
+
+async function fetchServerReadiness(serverBaseUrl) {
+  await chrome.storage.session.set({ serverStorageLastState: "checking" });
+  publishServerReadyStatus("checking");
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SERVER_CHECK_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${serverBaseUrl}/health/ready`, { signal: controller.signal });
+    let payload = null;
+    try { payload = await response.json(); } catch { payload = null; }
+
+    // Receiving any HTTP response proves that the Render app answered, even if Atlas is unavailable.
+    await chrome.storage.session.set({ serverLiveLastSuccessAt: Date.now(), serverLiveLastState: "connected" });
+    publishServerLiveStatus("connected");
+
+    if (!response.ok || payload?.status !== "ok") {
+      const storageUnavailable = payload?.error?.code === "storage_unavailable";
+      const state = storageUnavailable ? "unavailable" : "unknown";
+      const detail = payload?.error?.message || payload?.detail || `저장소 준비 확인 실패 (${response.status})`;
+      await chrome.storage.session.set({ serverStorageLastState: state });
+      publishServerReadyStatus(state, detail);
+      return { ok: false, state, error: detail, payload, checkedAt: Date.now() };
+    }
+
+    const checkedAt = Date.now();
+    await chrome.storage.session.set({ serverStorageLastState: "ready", serverStorageLastSuccessAt: checkedAt });
+    publishServerReadyStatus("ready");
+    return { ok: true, state: "ready", payload, checkedAt };
+  } catch (error) {
+    const detail = error?.name === "AbortError"
+      ? `저장소 준비 확인이 ${Math.round(SERVER_CHECK_TIMEOUT_MS / 1000)}초 안에 끝나지 않았습니다.`
+      : serializeError(error);
+    await chrome.storage.session.set({ serverStorageLastState: "unknown", serverLiveLastState: "unavailable" });
+    publishServerLiveStatus("unavailable", detail);
+    publishServerReadyStatus("unknown", detail);
+    return { ok: false, state: "unknown", error: detail, checkedAt: Date.now() };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function checkServerReady(payload = {}) {
+  let serverBaseUrl;
+  try {
+    serverBaseUrl = normalizeServerBaseUrl(payload.serverBaseUrl);
+  } catch (error) {
+    const detail = serializeError(error);
+    publishServerReadyStatus("unknown", detail);
+    return Promise.resolve({ ok: false, state: "unknown", error: detail });
+  }
+
+  if (serverReadyRequest?.serverBaseUrl === serverBaseUrl) return serverReadyRequest.promise;
+  const request = { serverBaseUrl, promise: null };
+  request.promise = fetchServerReadiness(serverBaseUrl);
   serverReadyRequest = request;
   request.promise.finally(() => {
     if (serverReadyRequest === request) serverReadyRequest = null;
@@ -213,8 +273,8 @@ async function startSession(payload) {
   const tab = await chrome.tabs.get(tabId);
   assertCapturableTab(tab);
 
-  const readiness = await checkServerReady({ serverBaseUrl: payload.serverBaseUrl, force: true });
-  if (!readiness.ok) throw new Error(`서버 연결을 확인하지 못했습니다: ${readiness.error || "다시 시도해 주세요."}`);
+  const readiness = await checkServerReady({ serverBaseUrl: payload.serverBaseUrl });
+  if (!readiness.ok) throw new Error(`저장소 준비 확인에 실패했습니다: ${readiness.error || "다시 시도해 주세요."}`);
   if (performance.now() - startRequestedAt > SERVER_READY_GESTURE_BUDGET_MS) {
     return {
       ok: true,
@@ -335,6 +395,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     switch (message.type) {
       case MESSAGE.CHECK_SERVER_READY:
         return checkServerReady(message.payload || {});
+      case MESSAGE.CHECK_SERVER_LIVE:
+        return checkServerLive(message.payload || {});
       case MESSAGE.START_SESSION:
         return startSession(message.payload || {});
       case MESSAGE.RECOVER_SESSION:
