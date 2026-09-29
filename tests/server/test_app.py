@@ -22,8 +22,9 @@ os.environ["OPENAI_TEXT_MODEL"] = "gpt-6-luna"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server.app import _absolute_segments, _source_metadata, app, gateway, sessions, settings, store  # noqa: E402
-from server.openai_client import OpenAIQuotaExhaustedError, OpenAIUnavailableError  # noqa: E402
+from server.app import _absolute_segments, _provider_error, _source_metadata, app, auth_failures, gateway, sessions, settings, store  # noqa: E402
+from server.openai_client import OpenAIInvalidResponseError, OpenAIQuotaExhaustedError, OpenAIUnavailableError  # noqa: E402
+from server.schemas import SummaryResponse  # noqa: E402
 from server.settings import Settings  # noqa: E402
 from server.storage import utcnow  # noqa: E402
 
@@ -42,8 +43,10 @@ SESSION_PAYLOAD = {
 def reset_memory_store():
     asyncio.run(store.clear())
     sessions.clear()
+    auth_failures.clear()
     yield
     sessions.clear()
+    auth_failures.clear()
     asyncio.run(store.clear())
 
 
@@ -234,7 +237,7 @@ def test_next_chunk_automatically_restores_session_after_process_restart() -> No
         assert asyncio.run(store.get_session("local", session_id))["next_sequence"] == 2
 
 
-def test_capture_gap_keeps_document_incomplete_without_summary() -> None:
+def test_capture_gap_keeps_document_incomplete_with_partial_summary() -> None:
     with TestClient(app) as client:
         session_id = create_session(client)
         assert upload_chunk(client, session_id, 0).status_code == 200
@@ -249,11 +252,64 @@ def test_capture_gap_keeps_document_incomplete_without_summary() -> None:
         assert response.json()["missing_time_ranges"][0]["end_ms"] == 90_000
         document = asyncio.run(store.get_document_for_session("local", session_id))
         assert document["status"] == "incomplete"
-        assert document["summary_status"] == "not_run"
+        assert document["summary_status"] == "completed"
+        assert document["summary_scope"] == "partial"
+        assert document["summary"]["summary"]
+        assert response.json()["summary"]["summary"]
         repeated = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
         assert repeated.status_code == 200
         assert repeated.json()["saved"] is False
         assert repeated.json()["missing_time_ranges"][0]["start_ms"] == 60_000
+        assert repeated.json()["summary"]["summary"] == document["summary"]["summary"]
+
+
+def test_incomplete_document_can_generate_partial_summary_on_retry(monkeypatch) -> None:
+    original = gateway.summarize
+
+    async def unavailable(**_kwargs):
+        raise OpenAIUnavailableError()
+
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        monkeypatch.setattr(gateway, "summarize", unavailable)
+        first = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert first.status_code == 200
+        assert first.json()["saved"] is False
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "failed"
+        assert document["summary_error_code"] == "openai_overloaded"
+
+        monkeypatch.setattr(gateway, "summarize", original)
+        second = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert second.status_code == 200
+        assert second.json()["saved"] is False
+        assert second.json()["summary"]["summary"]
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "completed"
+        assert document["summary_scope"] == "partial"
+
+
+def test_incomplete_document_without_transcript_has_no_partial_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        response = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert response.status_code == 200
+        assert response.json()["summary"] is None
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "not_run"
+
+
+def test_new_transcript_clears_stale_partial_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, 0).status_code == 200
+        first = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert first.json()["summary"]
+        assert upload_chunk(client, session_id, 1).status_code == 200
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary"] is None
+        assert document["summary_scope"] is None
 
 
 def test_resume_clears_incomplete_ttl_from_session_and_chunks() -> None:
@@ -392,6 +448,76 @@ def test_multi_user_authentication_and_session_ownership() -> None:
         object.__setattr__(settings, "app_users", previous_users)
 
 
+def test_atlas_accounts_work_from_any_extension_and_can_be_revoked() -> None:
+    previous_mode = settings.app_auth_mode
+    previous_admin = settings.admin_access_token
+    previous_users = settings.app_users
+    object.__setattr__(settings, "app_auth_mode", "atlas_users")
+    object.__setattr__(settings, "admin_access_token", "a" * 40)
+    object.__setattr__(settings, "app_users", {})
+    admin = {"X-Admin-Token": "a" * 40}
+    try:
+        with TestClient(app) as client:
+            assert client.post("/v1/admin/users", json={"user_id": "user-001"}).status_code == 401
+            created = client.post("/v1/admin/users", headers=admin, json={"user_id": "user-001"})
+            assert created.status_code == 200
+            code = created.json()["access_code"]
+            assert len(code) >= 40
+            assert client.post("/v1/admin/users", headers=admin, json={"user_id": "user-001"}).status_code == 409
+            listed = client.get("/v1/admin/users", headers=admin).json()["users"]
+            assert listed[0]["user_id"] == "user-001"
+            assert "token_hash" not in listed[0] and "access_code" not in listed[0]
+            import hashlib
+            imported = client.post("/v1/admin/users/import", headers=admin, json={"user_id": "existing", "token_sha256": hashlib.sha256(b"existing-code").hexdigest()})
+            assert imported.status_code == 200
+            assert client.get("/v1/documents", headers={"X-User-ID": "existing", "Authorization": "Bearer existing-code"}).status_code == 200
+
+            first = {"Origin": "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "X-User-ID": "user-001", "Authorization": f"Bearer {code}"}
+            second = {**first, "Origin": "chrome-extension://bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+            assert client.post("/v1/sessions", headers=first, json=SESSION_PAYLOAD).status_code == 200
+            assert client.get("/v1/documents", headers=second).status_code == 200
+            assert client.get("/v1/documents", headers={**second, "Origin": "https://example.com"}).status_code == 403
+
+            assert client.post("/v1/admin/users/user-001/disable", headers=admin).status_code == 200
+            assert client.get("/v1/documents", headers=first).status_code == 401
+            assert client.post("/v1/admin/users/user-001/enable", headers=admin).status_code == 200
+            assert client.get("/v1/documents", headers=second).status_code == 200
+            rotated = client.post("/v1/admin/users/user-001/rotate", headers=admin)
+            assert rotated.status_code == 200
+            assert client.get("/v1/documents", headers=first).status_code == 401
+            assert client.get("/v1/documents", headers={**second, "Authorization": f"Bearer {rotated.json()['access_code']}"}).status_code == 200
+    finally:
+        object.__setattr__(settings, "app_auth_mode", previous_mode)
+        object.__setattr__(settings, "admin_access_token", previous_admin)
+        object.__setattr__(settings, "app_users", previous_users)
+
+
+def test_atlas_mode_imports_existing_hashes_and_limits_failed_logins() -> None:
+    import hashlib
+
+    previous_mode = settings.app_auth_mode
+    previous_admin = settings.admin_access_token
+    previous_users = settings.app_users
+    object.__setattr__(settings, "app_auth_mode", "atlas_users")
+    object.__setattr__(settings, "admin_access_token", "a" * 40)
+    object.__setattr__(settings, "app_users", {"existing": hashlib.sha256(b"old-code").hexdigest()})
+    try:
+        with TestClient(app) as client:
+            headers = {"Origin": ORIGIN, "X-User-ID": "existing", "Authorization": "Bearer old-code"}
+            assert client.get("/v1/documents", headers=headers).status_code == 200
+            bad = {**headers, "Authorization": "Bearer invalid"}
+            for _ in range(5):
+                assert client.get("/v1/documents", headers=bad).status_code == 401
+            limited = client.get("/v1/documents", headers=headers)
+            assert limited.status_code == 429
+            assert limited.json()["error"]["code"] == "authentication_rate_limited"
+            assert limited.headers["retry-after"] == "60"
+    finally:
+        object.__setattr__(settings, "app_auth_mode", previous_mode)
+        object.__setattr__(settings, "admin_access_token", previous_admin)
+        object.__setattr__(settings, "app_users", previous_users)
+
+
 def test_ready_chunk_retry_repairs_partial_document_before_ack(monkeypatch) -> None:
     original = store.upsert_document
     failed = False
@@ -455,6 +581,48 @@ def test_completed_document_is_written_with_summary_in_same_update(monkeypatch) 
         response = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
         assert response.status_code == 200
         assert len(completed_writes) == 1
+
+
+def test_blank_summary_is_rejected() -> None:
+    for value in ("", "  \n  "):
+        with pytest.raises(ValueError):
+            SummaryResponse(summary=value, concepts=[], terms=[], highlights=[], checklist=[])
+
+
+def test_provider_timeout_is_retryable() -> None:
+    assert isinstance(gateway._map_error(TimeoutError()), OpenAIUnavailableError)
+
+
+def test_invalid_provider_response_is_retryable() -> None:
+    error = _provider_error(OpenAIInvalidResponseError("빈 요약"))
+    assert error.status_code == 502
+    assert error.retryable is True
+
+
+def test_summary_failure_is_recorded_and_archive_can_retry(monkeypatch) -> None:
+    original = gateway.summarize
+
+    async def unavailable(**_kwargs):
+        raise OpenAIUnavailableError()
+
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        monkeypatch.setattr(gateway, "summarize", unavailable)
+        failed = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert failed.status_code == 503
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["status"] == "finalize_pending"
+        assert document["summary_status"] == "failed"
+        assert document["summary_error_code"] == "openai_overloaded"
+
+        monkeypatch.setattr(gateway, "summarize", original)
+        recovered = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert recovered.status_code == 200
+        assert recovered.json()["saved"] is True
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "completed"
+        assert document["summary_error_code"] is None
 
 
 def test_reconcile_expires_stale_session_after_restart() -> None:

@@ -29,7 +29,7 @@ Chrome 확장 프로그램
 
 ## V8 설계 대비 남은 구현
 
-V8 설계서는 목표 동작까지 포함합니다. 현재 코드는 인증 실패 횟수 제한, 동시 사용자 5명 제한의 경합 방지, 12 MB 초과 시 `input_too_large` 상태 보존을 아직 구현하지 않았습니다. `daily_usage`의 텍스트 토큰·예상 비용 집계와 선택적 텍스트 모델 fallback도 미구현입니다. 문서 목록·상세 API는 있지만 확장 프로그램의 복구 세션 목록 및 저장 문서 목록·상세 화면은 아직 없습니다.
+V8 설계서는 목표 동작까지 포함합니다. 현재 코드는 동시 사용자 5명 제한의 경합 방지, 12 MB 초과 시 `input_too_large` 상태 보존을 아직 구현하지 않았습니다. `daily_usage`의 텍스트 토큰·예상 비용 집계와 선택적 텍스트 모델 fallback도 미구현입니다. 문서 목록·상세 API는 있지만 확장 프로그램의 복구 세션 목록 및 저장 문서 목록·상세 화면은 아직 없습니다.
 
 ## 저장소 구성
 
@@ -49,26 +49,25 @@ render.yaml     Render 무료 Web Service 설정
 
 1. MongoDB Atlas에서 데이터베이스 사용자와 연결 문자열을 준비합니다.
 2. Render에서 이 GitHub 저장소의 Web Service를 만들고 `render.yaml`을 사용합니다.
-3. Render 환경변수에 `OPENAI_API_KEY`, `OPENAI_TEXT_MODEL=gpt-6-luna`, `MONGODB_URI`, 사용자별 `APP_USER_n_ID/TOKEN_SHA256`, `ALLOWED_EXTENSION_ORIGINS`를 입력합니다.
+3. Render 환경변수에 `OPENAI_API_KEY`, `MONGODB_URI`, `ADMIN_ACCESS_TOKEN`을 입력합니다. 관리자 비밀값은 32자 이상의 무작위 값으로 만듭니다.
 4. `extension/config.js`의 `SERVER_BASE_URL`에는 실제 Render HTTPS URL이 반영되어 있습니다.
 5. `extension/manifest.json`의 Render host permission에도 같은 URL이 반영되어 있습니다.
-6. Chrome Developer Dashboard의 공개 키를 manifest의 `key`로 넣어 확장 ID를 고정합니다.
-7. 고정된 확장 ID를 `chrome-extension://<확장-id>` 형식으로 Render의 `ALLOWED_EXTENSION_ORIGINS`에 등록합니다.
+6. 배포 후 `python manage-users.py create user-001`로 계정을 발급해 사용자에게 ID와 접속 코드를 전달합니다. 관리자 비밀값은 명령 실행 시 입력합니다.
 
-Render URL은 현재 `https://web-audio-summary.onrender.com`으로 반영되어 있습니다. Chrome Developer Dashboard의 manifest 공개 키와 확장 ID만 아직 운영자 입력값으로 남아 있습니다. Render Auto-Deploy는 꺼져 있으며, CI 통과 뒤 관리자가 수동 배포하는 정책입니다.
+Render URL은 현재 `https://web-audio-summary.onrender.com`으로 반영되어 있습니다. PC별 확장 ID 등록은 필요하지 않습니다. Render Auto-Deploy는 꺼져 있으며, CI 통과 뒤 관리자가 수동 배포하는 정책입니다.
 
 필수 Render 비밀 환경변수 예시는 다음과 같습니다.
 
 ```dotenv
-APP_AUTH_MODE=multi_user
-APP_USER_1_ID=user-001
-APP_USER_1_TOKEN_SHA256=<접속 코드의 SHA-256>
-ALLOWED_EXTENSION_ORIGINS=chrome-extension://<고정 확장 ID>
+APP_AUTH_MODE=atlas_users
+ADMIN_ACCESS_TOKEN=<32자 이상의 무작위 관리자 비밀값>
 MONGODB_URI=mongodb+srv://...
 MONGODB_REQUIRED=true
 OPENAI_API_KEY=<Render Secret>
 SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 ```
+
+계정 관리 명령은 `python manage-users.py create <사용자 ID>`, `list`, `disable <사용자 ID>`, `enable <사용자 ID>`, `rotate <사용자 ID>`입니다. 발급·재발급된 접속 코드는 한 번만 표시됩니다. 기존 `APP_USER_n_ID/TOKEN_SHA256` 변수가 남아 있으면 전환 배포 첫 시작에 Atlas로 복사됩니다. 배포 과정에서 변수가 제거되었다면 기존 해시를 확인해 `python manage-users.py import-hash <사용자 ID>`로 이관할 수 있습니다. 이관과 로그인을 확인한 뒤 기존 Render 변수를 제거합니다. 동일 계정은 어느 PC에서든 사용할 수 있습니다.
 
 ## 장애·복구 동작
 
@@ -77,7 +76,7 @@ SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 - Render/네트워크/Atlas 장애: ACK하지 않으며 IndexedDB 원본을 유지합니다.
 - Render 재시작으로 메모리의 처리 상태가 초기화된 경우: Atlas의 세션 초안은 유지됩니다. `서버 세션 복구`를 누르면 `/resume` 후 보존 청크를 순서대로 재전송합니다.
 - 처리 lease가 만료돼 다른 시도가 시작된 경우: 늦게 끝난 이전 시도는 새 청크 결과를 덮어쓰지 않으며 보존 원본으로 재시도합니다.
-- 종료 시 누락 청크 존재: 최종 요약 없이 Atlas에 `incomplete`로 자동 보관합니다.
+- 종료 시 누락 청크 또는 녹음 중단 구간 존재: Atlas에 `incomplete`로 보관하고, 확보된 자막이 있으면 부분 요약을 생성합니다.
 - 브라우저 재시작: 동일한 강의 URL에서 캡처를 시작하면 보존 세션을 찾아 `/resume`으로 이어갑니다.
 - 72시간 경과: 청크를 `EXPIRED`로 표시하며 사용자가 직접 내보내거나 폐기할 때까지 삭제하지 않습니다.
 - 보존 세션 폐기: 사용자 ID와 접속 코드를 입력한 뒤 서버 삭제를 확인합니다. 네트워크·인증 오류가 나면 로컬 청크가 남아 재시도할 수 있습니다.

@@ -139,6 +139,7 @@
       estimatedQueueBytes: Math.round(audioBytes() * 1.5),
       queueCount: session.queue.length + (session.processing ? 1 : 0),
       recoveryRequired: Boolean(session.recoveryRequired),
+      archivedIncomplete: Boolean(session.archivedIncomplete),
       finalizePending: Boolean(session.finalizePending),
       hasStream: Boolean(session.stream),
       mockMode: Boolean(session.mockMode),
@@ -229,6 +230,7 @@
       );
       error.code = payload?.error?.code || "http_error";
       error.action = payload?.error?.action || null;
+      error.retryable = payload?.error?.retryable === true;
       throw error;
     }
     return payload;
@@ -267,6 +269,7 @@
       openai_rate_limited: "rate_limited",
       openai_overloaded: "overloaded",
       openai_invalid_request: "invalid_request",
+      openai_invalid_response: "request_failed",
       openai_request_failed: "request_failed"
     };
     const state = providerStates[error?.code];
@@ -849,7 +852,7 @@
         session.state = SESSION_STATE.STOPPED;
         session.notice = archive?.saved
           ? `최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
-          : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
+          : archive?.summary ? "누락 구간이 있어 확보된 자막의 부분 요약을 저장했습니다." : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
         session.accessToken = "";
         session.userId = "";
         broadcastSnapshot();
@@ -975,7 +978,7 @@
           session.state = SESSION_STATE.STOPPED;
           session.notice = archive?.saved
             ? "보존 청크 처리와 최종 문서 저장을 완료했습니다."
-            : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
+            : archive?.summary ? "미완료 문서에 확보된 자막의 부분 요약을 저장했습니다. 누락 구간을 확인해 주세요." : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
         } catch (error) {
           session.state = SESSION_STATE.PAUSED_ACTION;
           session.finalizePending = true;
@@ -1056,7 +1059,7 @@
           capture_gaps: session.gaps
         })
       },
-      60_000
+      REQUEST_TIMEOUT_MS
     );
     const payload = await assertResponse(response);
     if (payload?.summary) {
@@ -1088,8 +1091,12 @@
       } catch (error) {
         lastError = error;
         recordProviderFailure(error);
-        if (error?.status === 429 || (error?.status && error.status !== 503) || attempt >= 3) break;
-        const waitMs = Core.transientRetryDelayMs(attempt + 1);
+        const retryable = !error?.status || error?.retryable === true || (error?.status === 409 && error?.code === "finalize_in_progress");
+        if (!retryable || error?.code === "openai_quota_exhausted" || attempt >= 3) break;
+        const retryAfterSeconds = Number(error?.retryAfter);
+        const waitMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(300_000, Math.max(1_000, retryAfterSeconds * 1_000))
+          : Core.transientRetryDelayMs(attempt + 1);
         session.notice = `최종 저장이 지연되어 ${Math.ceil(waitMs / 1000)}초 후 다시 시도합니다.`;
         broadcastSnapshot();
         await delay(waitMs);
@@ -1118,10 +1125,14 @@
     closeGap();
     session.stoppedAtEpochMs = Date.now();
     try {
+      session.finalizePending = true;
+      await preserveSessionMarker("FINALIZE_PENDING");
+      session.notice = "최종 요약과 문서를 저장하고 있습니다.";
+      broadcastSnapshot();
       const archive = await archiveServerSessionWithRetry();
       session.notice = archive?.saved
         ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
-        : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
+        : archive?.summary ? `${reason} 미완료 문서와 확보된 자막의 부분 요약을 저장했습니다.` : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
     } catch (error) {
       session.finalizePending = true;
       await preserveSessionMarker("FINALIZE_PENDING", serializeError(error));

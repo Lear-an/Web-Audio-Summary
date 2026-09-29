@@ -84,6 +84,7 @@ class Settings:
     safety_identifier_secret: str = os.getenv("SAFETY_IDENTIFIER_SECRET", "").strip()
 
     app_auth_mode: str = os.getenv("APP_AUTH_MODE", "local").strip().lower()
+    admin_access_token: str = os.getenv("ADMIN_ACCESS_TOKEN", "").strip()
     local_access_token: str = _configured_local_token or secrets.token_urlsafe(24)
     generated_access_token: bool = not bool(_configured_local_token)
     app_users: dict[str, str] = field(default_factory=_users)
@@ -103,7 +104,7 @@ class Settings:
     session_idle_ttl_seconds: int = _bounded_int("SESSION_IDLE_TTL_SECONDS", 1800, 60, 86_400)
     incomplete_draft_retention_days: int = _bounded_int("DRAFT_RETENTION_DAYS", 7, 1, 90)
     processing_lease_seconds: int = _bounded_int("PROCESSING_LEASE_SECONDS", 180, 30, 900)
-    finalize_lease_seconds: int = _bounded_int("FINALIZE_LEASE_SECONDS", 180, 30, 900)
+    finalize_lease_seconds: int = _bounded_int("FINALIZE_LEASE_SECONDS", 600, 30, 900)
 
     mongodb_uri: str = os.getenv("MONGODB_URI", "").strip()
     mongodb_database: str = os.getenv("MONGODB_DATABASE", "lecture_memo").strip()
@@ -122,10 +123,14 @@ class Settings:
                 "OPENAI_TRANSCRIBE_MODEL은 whisper-1이어야 합니다. "
                 "현재 전사 요청의 구간 타임스탬프는 whisper-1에서만 지원됩니다."
             )
-        if self.app_auth_mode not in {"local", "multi_user"}:
-            raise ValueError("APP_AUTH_MODE는 local 또는 multi_user여야 합니다.")
+        if self.app_auth_mode not in {"local", "multi_user", "atlas_users"}:
+            raise ValueError("APP_AUTH_MODE는 local, multi_user 또는 atlas_users여야 합니다.")
         if self.app_auth_mode == "multi_user" and not self.app_users:
             raise ValueError("multi_user 모드에는 APP_USER_n_ID/TOKEN_SHA256이 하나 이상 필요합니다.")
+        if self.app_auth_mode == "atlas_users" and not self.mongodb_uri:
+            raise ValueError("atlas_users 모드에는 MONGODB_URI가 필요합니다.")
+        if self.app_auth_mode == "atlas_users" and len(self.admin_access_token) < 32:
+            raise ValueError("atlas_users 모드에는 32자 이상의 ADMIN_ACCESS_TOKEN이 필요합니다.")
         if len(self.app_users) > self.max_registered_users:
             raise ValueError("등록된 사용자가 MAX_REGISTERED_USERS를 초과했습니다.")
         if self.mongodb_required and not self.mongodb_uri:

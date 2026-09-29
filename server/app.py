@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -18,8 +19,9 @@ from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
-from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIQuotaExhaustedError, OpenAIRateLimitError, OpenAIUnavailableError
+from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIInvalidResponseError, OpenAIQuotaExhaustedError, OpenAIRateLimitError, OpenAIUnavailableError
 from .schemas import ArchiveRequest, ArchiveResponse, ChunkResponse, DocumentListResponse, HealthResponse, SessionCreateRequest, SessionCreateResponse, SessionResumeRequest, SummaryResponse, TranscriptSegment
 from .settings import settings
 from .storage import create_store, utcnow
@@ -55,6 +57,19 @@ class SessionRecord:
 
 sessions: dict[str, SessionRecord] = {}
 session_restore_lock = asyncio.Lock()
+admin_user_lock = asyncio.Lock()
+auth_failures: dict[tuple[str, str], list[float]] = {}
+auth_failure_lock = asyncio.Lock()
+AUTH_FAILURE_WINDOW_SECONDS = 60
+AUTH_FAILURE_LIMIT = 5
+
+
+class AdminUserRequest(BaseModel):
+    user_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+
+
+class AdminImportRequest(AdminUserRequest):
+    token_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
 
 
 def _lease_until(seconds: int): return utcnow() + timedelta(seconds=seconds)
@@ -73,15 +88,20 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         or (existing.get("status") == "finalize_pending" and status == "incomplete" and archive is None)
     ):
         return existing
+    transcript_text = "\n".join(v["text"] for v in segments)
+    keep_partial_summary = status == "incomplete" and (existing or {}).get("summary_scope") == "partial" and (existing or {}).get("transcript", {}).get("text") == transcript_text
     value = {
         "schema_version": 8, "document_id": draft["document_id"], "session_id": session_id, "owner_id": owner_id,
         "status": status, "source": {"url": _canonical_url(draft.get("source_url", "")), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
         "requested_at": draft.get("created_at", now), "updated_at": now, "completed_at": now if status == "completed" else None,
-        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": "\n".join(v["text"] for v in segments), "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
+        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "missing_time_ranges": gaps},
         "missing_time_ranges": gaps,
-        "summary_status": "completed" if status == "completed" else ("processing" if status == "finalize_pending" else "not_run"),
-        "summary": summary.model_dump() if summary else (existing or {}).get("summary"),
+        "summary_status": "completed" if status == "completed" or (keep_partial_summary and (existing or {}).get("summary")) else ("processing" if status == "finalize_pending" else "not_run"),
+        "summary_error_code": None,
+        "summary_scope": "complete" if status == "completed" else ("partial" if keep_partial_summary else None),
+        "summary": summary.model_dump() if summary else ((existing or {}).get("summary") if keep_partial_summary else None),
+        "summary_provider": (existing or {}).get("summary_provider") if keep_partial_summary else None,
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
         "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": None if status == "completed" else draft.get("expire_at"),
     }
@@ -137,7 +157,12 @@ async def expire_idle_sessions() -> None:
 async def lifespan(_: FastAPI):
     if settings.app_auth_mode == "local" and settings.generated_access_token: logger.warning("Lecture Memo local access token: %s", settings.local_access_token)
     if settings.mock_openai: logger.warning("MOCK_OPENAI=true: 실제 OpenAI API를 호출하지 않습니다.")
-    await store.initialize(); await store.scrub_source_urls(_source_metadata); await _reconcile_state()
+    await store.initialize()
+    if settings.app_auth_mode == "atlas_users":
+        for user_id, token_hash in settings.app_users.items():
+            outcome = await store.create_user({"user_id": user_id, "token_hash": token_hash, "status": "active", "created_at": utcnow(), "updated_at": utcnow()}, settings.max_registered_users)
+            if outcome == "limit": raise RuntimeError("기존 사용자 계정을 Atlas로 이관할 공간이 없습니다.")
+    await store.scrub_source_urls(_source_metadata); await _reconcile_state()
     task = asyncio.create_task(expire_idle_sessions())
     try: yield
     finally:
@@ -147,10 +172,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Lecture Memo Relay", version="0.8.0", docs_url=None, redoc_url=None, lifespan=lifespan)
-if settings.allowed_extension_origins: allowed_origins, allowed_origin_regex = list(settings.allowed_extension_origins), None
+if settings.app_auth_mode == "atlas_users": allowed_origins, allowed_origin_regex = [], r"^chrome-extension://[a-p]{32}$"
+elif settings.allowed_extension_origins: allowed_origins, allowed_origin_regex = list(settings.allowed_extension_origins), None
 elif settings.app_auth_mode == "local": allowed_origins, allowed_origin_regex = [], r"^chrome-extension://[a-p]{32}$"
 else: allowed_origins, allowed_origin_regex = [], None
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=allowed_origin_regex, allow_credentials=False, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-User-ID"])
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=allowed_origin_regex, allow_credentials=False, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-User-ID", "X-Admin-Token"])
 
 
 @app.exception_handler(ApiError)
@@ -180,20 +206,116 @@ async def limit_request_size(request: Request, call_next):
 
 def _valid_origin(origin: str | None) -> bool:
     if not origin: return True
+    if settings.app_auth_mode == "atlas_users": return bool(re.fullmatch(r"chrome-extension://[a-p]{32}", origin))
     if settings.allowed_extension_origins: return origin in settings.allowed_extension_origins
     return settings.app_auth_mode == "local" and bool(re.fullmatch(r"chrome-extension://[a-p]{32}", origin))
 
 
-async def authorize(authorization: Annotated[str | None, Header()] = None, x_user_id: Annotated[str | None, Header()] = None, origin: Annotated[str | None, Header()] = None) -> AuthenticatedUser:
+def _failure_key(request: Request, identity: str) -> tuple[str, str]:
+    address = request.client.host if request.client else "unknown"
+    return address, hashlib.sha256(identity.encode()).hexdigest()
+
+
+async def _check_auth_limit(key: tuple[str, str]) -> None:
+    async with auth_failure_lock:
+        now = time.monotonic()
+        attempts = [stamp for stamp in auth_failures.get(key, []) if stamp > now - AUTH_FAILURE_WINDOW_SECONDS]
+        if attempts: auth_failures[key] = attempts
+        else: auth_failures.pop(key, None)
+        if len(attempts) >= AUTH_FAILURE_LIMIT:
+            raise ApiError(429, "authentication_rate_limited", "인증 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.", retry_after_seconds=60)
+
+
+async def _auth_failed(key: tuple[str, str]) -> None:
+    async with auth_failure_lock:
+        if len(auth_failures) > 2048:
+            cutoff = time.monotonic() - AUTH_FAILURE_WINDOW_SECONDS
+            for old_key, stamps in list(auth_failures.items()):
+                if not stamps or stamps[-1] <= cutoff: auth_failures.pop(old_key, None)
+        auth_failures.setdefault(key, []).append(time.monotonic())
+
+
+async def authorize(request: Request, authorization: Annotated[str | None, Header()] = None, x_user_id: Annotated[str | None, Header()] = None, origin: Annotated[str | None, Header()] = None) -> AuthenticatedUser:
     if not _valid_origin(origin): raise ApiError(403, "origin_not_allowed", "허용되지 않은 확장 프로그램 origin입니다.")
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
     if settings.app_auth_mode == "local":
         if not hmac.compare_digest(token, settings.local_access_token): raise ApiError(401, "authentication_failed", "접속 토큰이 올바르지 않습니다.")
         return AuthenticatedUser("local")
-    user_id = (x_user_id or "").strip(); expected = settings.app_users.get(user_id, "")
+    user_id = (x_user_id or "").strip()
+    key = _failure_key(request, user_id)
+    await _check_auth_limit(key)
+    if settings.app_auth_mode == "atlas_users":
+        row = await store.get_user(user_id) if user_id else None
+        expected = row.get("token_hash", "") if row and row.get("status") == "active" else ""
+    else:
+        expected = settings.app_users.get(user_id, "")
     actual_hash = hashlib.sha256(token.encode()).hexdigest()
-    if not expected or not hmac.compare_digest(actual_hash, expected): raise ApiError(401, "authentication_failed", "사용자 ID 또는 접속 코드가 올바르지 않습니다.")
+    if not expected or not hmac.compare_digest(actual_hash, expected):
+        await _auth_failed(key)
+        raise ApiError(401, "authentication_failed", "사용자 ID 또는 접속 코드가 올바르지 않습니다.")
+    async with auth_failure_lock: auth_failures.pop(key, None)
     return AuthenticatedUser(user_id)
+
+
+async def authorize_admin(request: Request, x_admin_token: Annotated[str | None, Header()] = None) -> None:
+    key = _failure_key(request, "admin")
+    await _check_auth_limit(key)
+    if settings.app_auth_mode != "atlas_users" or not x_admin_token or not hmac.compare_digest(x_admin_token, settings.admin_access_token):
+        await _auth_failed(key)
+        raise ApiError(401, "authentication_failed", "관리자 인증에 실패했습니다.")
+    async with auth_failure_lock: auth_failures.pop(key, None)
+
+
+def _public_user(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: row[key] for key in ("user_id", "status", "created_at", "updated_at") if key in row}
+
+
+@app.get("/v1/admin/users", dependencies=[Depends(authorize_admin)])
+async def admin_list_users() -> dict[str, Any]:
+    return {"users": [_public_user(row) for row in await store.list_users()]}
+
+
+@app.post("/v1/admin/users", dependencies=[Depends(authorize_admin)])
+async def admin_create_user(payload: AdminUserRequest) -> dict[str, str]:
+    code = secrets.token_urlsafe(32)
+    now = utcnow()
+    async with admin_user_lock:
+        outcome = await store.create_user({"user_id": payload.user_id, "token_hash": hashlib.sha256(code.encode()).hexdigest(), "status": "active", "created_at": now, "updated_at": now}, settings.max_registered_users)
+    if outcome == "exists": raise ApiError(409, "user_exists", "이미 존재하는 사용자 ID입니다.")
+    if outcome == "limit": raise ApiError(409, "registered_user_limit", "등록 가능한 계정 수를 초과했습니다.")
+    return {"user_id": payload.user_id, "access_code": code}
+
+
+@app.post("/v1/admin/users/import", dependencies=[Depends(authorize_admin)])
+async def admin_import_user(payload: AdminImportRequest) -> dict[str, str]:
+    now = utcnow()
+    async with admin_user_lock:
+        outcome = await store.create_user({"user_id": payload.user_id, "token_hash": payload.token_sha256.lower(), "status": "active", "created_at": now, "updated_at": now}, settings.max_registered_users)
+    if outcome == "exists": raise ApiError(409, "user_exists", "이미 존재하는 사용자 ID입니다.")
+    if outcome == "limit": raise ApiError(409, "registered_user_limit", "등록 가능한 계정 수를 초과했습니다.")
+    return {"user_id": payload.user_id, "status": "active"}
+
+
+@app.post("/v1/admin/users/{user_id}/rotate", dependencies=[Depends(authorize_admin)])
+async def admin_rotate_user(user_id: str) -> dict[str, str]:
+    code = secrets.token_urlsafe(32)
+    if not await store.update_user(user_id, {"token_hash": hashlib.sha256(code.encode()).hexdigest(), "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "access_code": code}
+
+
+@app.post("/v1/admin/users/{user_id}/disable", dependencies=[Depends(authorize_admin)])
+async def admin_disable_user(user_id: str) -> dict[str, str]:
+    if not await store.update_user(user_id, {"status": "disabled", "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "status": "disabled"}
+
+
+@app.post("/v1/admin/users/{user_id}/enable", dependencies=[Depends(authorize_admin)])
+async def admin_enable_user(user_id: str) -> dict[str, str]:
+    if not await store.update_user(user_id, {"status": "active", "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "status": "active"}
 
 
 def _canonical_url(raw: str) -> str:
@@ -273,6 +395,7 @@ def _provider_error(exc: Exception, chunk_id: str | None = None) -> ApiError:
     if isinstance(exc, OpenAIRateLimitError): return ApiError(429, "openai_rate_limited", str(exc), retryable=True, action="retry_later", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
     if isinstance(exc, OpenAIUnavailableError): return ApiError(503, "openai_overloaded", str(exc), retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
     if isinstance(exc, OpenAIInvalidRequestError): return ApiError(422, "openai_invalid_request", str(exc), retryable=False, action="keep_chunk", chunk_id=chunk_id)
+    if isinstance(exc, OpenAIInvalidResponseError): return ApiError(502, "openai_invalid_response", str(exc), retryable=True, action="retry_later", chunk_id=chunk_id)
     return ApiError(502, "openai_request_failed", "OpenAI 요청에 실패했습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id)
 
 
@@ -363,6 +486,42 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
         return ChunkResponse(session_id=session_id, sequence=sequence, segments=result.transcript.segments)
 
 
+async def _summarize_incomplete(owner_id: str, session_id: str, document: dict[str, Any]) -> dict[str, Any]:
+    transcript = document.get("transcript", {}).get("text", "")
+    if not transcript.strip() or (document.get("summary_scope") == "partial" and document.get("summary")):
+        return document
+    attempt_id = str(uuid.uuid4())
+    if not await store.claim_finalize(owner_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()):
+        return document
+    try:
+        try:
+            await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
+        except TimeoutError:
+            error = ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="retry_later")
+        else:
+            try:
+                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(owner_id), partial=True)
+                error = None
+            except Exception as exc:
+                error = _provider_error(exc)
+            finally:
+                openai_slots.release()
+        if error:
+            await store.update_document_for_session(owner_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+            if error.code != "ai_backpressure":
+                await store.record_provider_state(error.code, error.retry_after_seconds)
+            return await store.get_document_for_session(owner_id, session_id) or document
+        await store.update_document_for_session(owner_id, session_id, {
+            "summary": summary.model_dump(), "summary_scope": "partial", "summary_status": "completed", "summary_error_code": None,
+            "summary_provider": {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v2-partial", "schema_version": 1},
+            "updated_at": utcnow(),
+        })
+        await store.record_usage(owner_id, utcnow().date().isoformat(), {"summary_requests": 1})
+        return await store.get_document_for_session(owner_id, session_id) or document
+    finally:
+        await store.release_finalize(owner_id, session_id)
+
+
 @app.post("/v1/sessions/{session_id}/archive", response_model=ArchiveResponse)
 async def archive_session(session_id: str, payload: ArchiveRequest, user: AuthenticatedUser = Depends(authorize)) -> ArchiveResponse:
     await _reconcile_state()
@@ -377,21 +536,35 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
     gaps = _capture_gaps(payload.capture_gaps) or (existing or {}).get("missing_time_ranges", []) or draft.get("missing_time_ranges", [])
     if missing or gaps:
         expire_at = utcnow() + timedelta(days=settings.incomplete_draft_retention_days); await store.update_session(user.user_id, session_id, {"status": "incomplete", "expected_chunk_count": expected, "missing_sequences": missing, "missing_time_ranges": gaps, "expire_at": expire_at}); await store.expire_drafts(user.user_id, session_id, expire_at)
-        doc = await _write_partial(user.user_id, session_id, status="incomplete", missing=missing, expected=expected, archive=payload); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
-        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, missing_time_ranges=gaps)
+        doc = await _write_partial(user.user_id, session_id, status="incomplete", missing=missing, expected=expected, archive=payload)
+        try:
+            doc = await _summarize_incomplete(user.user_id, session_id, doc)
+        finally:
+            sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
+        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, missing_time_ranges=gaps, summary=doc.get("summary"))
     attempt_id = str(uuid.uuid4())
     if not await store.claim_finalize(user.user_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()): raise ApiError(409, "finalize_in_progress", "최종 요약이 이미 처리 중입니다.", retryable=True, action="retry_later")
     try:
         interim = await _write_partial(user.user_id, session_id, status="finalize_pending", expected=expected, archive=payload); transcript = interim["transcript"]["text"]
-        await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
-        try: summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
+        try:
+            await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
+        except TimeoutError:
+            error = ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="retry_later", retry_after_seconds=15)
+            await store.update_document_for_session(user.user_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+            raise error
+        try:
+            try:
+                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
+            except Exception as exc:
+                error = _provider_error(exc)
+                await store.record_provider_state(error.code, error.retry_after_seconds)
+                await store.update_document_for_session(user.user_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+                raise error from exc
         finally: openai_slots.release()
         doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload, summary=summary, summary_meta=summary_meta)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"summary_requests": 1}); await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
         return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), summary=summary)
     except ApiError: raise
-    except Exception as exc:
-        error = _provider_error(exc); await store.record_provider_state(error.code, error.retry_after_seconds); raise error from exc
     finally: await store.release_finalize(user.user_id, session_id)
 
 
