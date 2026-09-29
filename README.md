@@ -1,6 +1,6 @@
 # Lecture Memo
 
-Chrome에서 재생 중인 강의 탭의 오디오를 60초 창·2초 겹침으로 캡처해 `whisper-1`로 구간 타임스탬프가 포함된 전사를 만들고, GPT-6 Luna(`gpt-6-luna`)로 비한국어 자막을 한국어로 변환하고 종료 시 최종 요약을 생성하는 Manifest V3 확장 프로그램입니다. V8은 Render의 FastAPI 서버와 MongoDB Atlas를 이용해 등록 10명·동시 활성 5명을 기본 지원합니다.
+Chrome에서 재생 중인 강의 탭의 오디오를 60초 창·2초 겹침으로 캡처해 OpenAI Audio Transcriptions API로 구간 타임스탬프가 포함된 전사를 만들고, OpenAI Responses API로 비한국어 자막을 한국어로 변환하고 종료 시 최종 요약을 생성하는 Manifest V3 확장 프로그램입니다. V8은 Render의 FastAPI 서버와 MongoDB Atlas를 이용해 등록 10명·동시 활성 5명을 기본 지원합니다.
 
 설계 기준은 [V8 설계서](chrome-lecture-caption-summary-design-v8.md), 설치·사용 순서는 [사용 설명서](사용설명서.md)를 참고하세요.
 
@@ -16,9 +16,9 @@ Chrome 확장 프로그램
 
 - 사용자는 관리자에게 받은 사용자 ID와 접속 코드만 입력합니다.
 - OpenAI 키는 운영자가 Render Secret으로 관리하며 확장 프로그램·Atlas·GitHub에 저장하지 않습니다.
-- `whisper-1`은 구간별 타임스탬프가 필요한 오디오 전사를 담당하고, GPT-6 Luna는 번역·최종 요약을 담당합니다.
+- [OpenAI Audio Transcriptions API](https://developers.openai.com/api/docs/guides/speech-to-text)는 오디오 전사와 구간 타임스탬프를, [OpenAI Responses API](https://developers.openai.com/api/docs/guides/text)는 비한국어 자막의 한국어 변환과 최종 요약을 담당합니다.
 - 성공한 전사와 부분 문서가 Atlas에 저장된 뒤에만 ACK됩니다. 중간에 저장이 실패하면 동일 청크 재전송으로 세션 순번과 부분 문서를 복구하며, ACK 전 원본 오디오는 IndexedDB에 남습니다.
-- 중간 요약은 만들지 않고 캡처 종료 시 최종 요약 결과를 문서에 한 번 확정합니다. 장애 후 재시도에서는 OpenAI 호출이 다시 발생할 수 있습니다.
+- 녹음 중에는 요약을 만들지 않습니다. 캡처 종료 시 최종 요약을 생성하고, 누락된 청크나 녹음 중단 구간이 있으면 확보된 자막으로 부분 요약을 생성합니다. 장애 후 재시도에서는 OpenAI 호출이 다시 발생할 수 있습니다.
 - 최종 요약과 `completed` 상태는 한 번의 문서 쓰기로 확정합니다. 배속 재생의 자막 시각은 영상 시간축으로 환산해 저장합니다.
 - 미처리 오디오는 최대 128 MiB, 72시간 보존하며 사용자 확인 없이 자동 삭제하지 않습니다.
 - 완료 문서 저장 직후 Atlas 초안을 삭제하고, 미완료 초안은 7일간 보존합니다. Render 재시작 뒤 오래된 세션도 시작·조회·재개·종료 시 정리하며 부분 문서는 유지합니다.
@@ -29,7 +29,7 @@ Chrome 확장 프로그램
 
 ## V8 설계 대비 남은 구현
 
-V8 설계서는 목표 동작까지 포함합니다. 현재 코드는 동시 사용자 5명 제한의 경합 방지, 12 MB 초과 시 `input_too_large` 상태 보존을 아직 구현하지 않았습니다. `daily_usage`의 텍스트 토큰·예상 비용 집계와 선택적 텍스트 모델 fallback도 미구현입니다. 문서 목록·상세 API는 있지만 확장 프로그램의 복구 세션 목록 및 저장 문서 목록·상세 화면은 아직 없습니다.
+V8 설계서는 목표 동작까지 포함합니다. 현재 코드는 동시 사용자 5명 제한의 경합 방지, 12 MB 초과 시 `input_too_large` 상태 보존을 아직 구현하지 않았습니다. `daily_usage`의 텍스트 토큰·예상 비용 집계와 선택적 텍스트 모델 fallback도 미구현입니다. 저장 문서 목록·상세 화면은 있지만 복구 가능한 세션을 별도로 보여주는 목록은 아직 없습니다.
 
 ## 저장소 구성
 
@@ -43,31 +43,24 @@ render.yaml     Render 무료 Web Service 설정
 
 ## 사용자 이용
 
-운영 서버는 Render에서 실행됩니다. 사용자는 Python이나 로컬 서버를 설치할 필요 없이 Chrome에 `extension` 폴더를 로드하고, 관리자에게 받은 사용자 ID와 접속 코드를 입력하면 됩니다. 확장 프로그램 설치와 캡처 방법은 [사용 설명서](사용설명서.md)를 참고하세요.
+운영 서버는 Render에서 실행되므로 사용자는 Python이나 로컬 서버를 설치할 필요가 없습니다. 관리자에게 **사용자 ID와 접속 코드**를 받은 뒤 다음 순서로 이용합니다.
 
-## Render·Atlas 운영 준비
+1. [GitHub 저장소](https://github.com/Lear-an/Web-Audio-Summary)에서 `Code` → `Download ZIP`을 누르고 내려받은 ZIP의 압축을 풉니다.
+2. Chrome 주소창에 `chrome://extensions`를 입력하고 오른쪽 위의 `개발자 모드`를 켭니다.
+3. `압축해제된 확장 프로그램을 로드합니다`를 눌러 **압축을 푼 폴더 안의 `extension` 폴더**를 선택합니다. ZIP 파일 자체나 저장소의 최상위 폴더를 선택하지 않습니다.
+4. 캡처할 강의 영상을 Chrome 탭에서 연 뒤 그 탭을 선택한 상태로 툴바의 `Lecture Memo` 아이콘을 눌러 사이드패널을 엽니다.
+5. 관리자에게 받은 사용자 ID와 접속 코드를 입력하고 `캡처 시작`을 누릅니다. 첫 연결에서 서버가 준비되는 동안 `연결 확인 중` 또는 `확인 중`이 표시될 수 있습니다. `서버가 준비됐습니다. 캡처 시작을 다시 눌러 주세요.`가 나오면 같은 강의 탭에서 버튼을 한 번 더 누릅니다.
+6. 캡처가 시작되면 영상을 재생합니다. 자막은 즉시 나오지 않고 첫 오디오 청크(기본 약 60초)가 녹음되고 서버에서 처리된 뒤 표시됩니다. 이후 자막은 처리된 청크마다 추가됩니다.
+7. 강의가 끝나면 `캡처 종료`를 누르고 남은 청크 처리와 최종 요약·문서 저장이 끝날 때까지 기다립니다. `최종 자막과 요약을 저장했습니다`라는 안내가 나오면 `노트`와 `저장 문서`에서 결과를 확인하고 필요하면 MD, TXT, SRT, VTT로 내보냅니다. `최종 저장은 보류됐습니다`가 나오면 아래 재시도 절차를 따릅니다.
 
-1. MongoDB Atlas에서 데이터베이스 사용자와 연결 문자열을 준비합니다.
-2. Render에서 이 GitHub 저장소의 Web Service를 만들고 `render.yaml`을 사용합니다.
-3. Render 환경변수에 `OPENAI_API_KEY`, `MONGODB_URI`, `ADMIN_ACCESS_TOKEN`을 입력합니다. 관리자 비밀값은 32자 이상의 무작위 값으로 만듭니다.
-4. `extension/config.js`의 `SERVER_BASE_URL`에는 실제 Render HTTPS URL이 반영되어 있습니다.
-5. `extension/manifest.json`의 Render host permission에도 같은 URL이 반영되어 있습니다.
-6. 배포 후 `python manage-users.py create user-001`로 계정을 발급해 사용자에게 ID와 접속 코드를 전달합니다. 관리자 비밀값은 명령 실행 시 입력합니다.
+설치 화면이나 캡처가 막히면 [사용 설명서](사용설명서.md)의 오류·복구 절차를 참고하세요.
 
-Render URL은 현재 `https://web-audio-summary.onrender.com`으로 반영되어 있습니다. PC별 확장 ID 등록은 필요하지 않습니다. Render Auto-Deploy는 꺼져 있으며, CI 통과 뒤 관리자가 수동 배포하는 정책입니다.
+### 요약 생성·재시도
 
-필수 Render 비밀 환경변수 예시는 다음과 같습니다.
-
-```dotenv
-APP_AUTH_MODE=atlas_users
-ADMIN_ACCESS_TOKEN=<32자 이상의 무작위 관리자 비밀값>
-MONGODB_URI=mongodb+srv://...
-MONGODB_REQUIRED=true
-OPENAI_API_KEY=<Render Secret>
-SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
-```
-
-계정 관리 명령은 `python manage-users.py create <사용자 ID>`, `list`, `disable <사용자 ID>`, `enable <사용자 ID>`, `rotate <사용자 ID>`입니다. 발급·재발급된 접속 코드는 한 번만 표시됩니다. 기존 `APP_USER_n_ID/TOKEN_SHA256` 변수가 남아 있으면 전환 배포 첫 시작에 Atlas로 복사됩니다. 배포 과정에서 변수가 제거되었다면 기존 해시를 확인해 `python manage-users.py import-hash <사용자 ID>`로 이관할 수 있습니다. 이관과 로그인을 확인한 뒤 기존 Render 변수를 제거합니다. 동일 계정은 어느 PC에서든 사용할 수 있습니다.
+- 캡처 종료 시 최종 요약과 문서 저장을 요청합니다. 일시적인 오류가 나면 확장 프로그램이 최대 4회 시도합니다.
+- 자동 시도 후에도 최종 저장이 보류되고 보존 세션이 남아 있으면 사용자 ID와 접속 코드를 입력한 뒤 `보존 청크 처리`를 눌러 다시 시도할 수 있습니다. 이 버튼은 보존 청크 또는 보류된 최종 저장이 있을 때 표시됩니다.
+- 누락된 청크나 녹음 중단 구간이 있는 미완료 문서에서 자막은 있지만 요약이 없으면, `저장 문서`의 해당 문서 상세에서 `확보된 자막으로 부분 요약 생성`을 누를 수 있습니다. 서버 세션의 재개가 가능한 경우에만 버튼이 표시됩니다.
+- 요약이 없는 문서에 대해 언제든 요약만 다시 요청하는 범용 버튼은 아직 없습니다.
 
 ## 장애·복구 동작
 
@@ -81,23 +74,25 @@ SAFETY_IDENTIFIER_SECRET=<충분히 긴 무작위 비밀값>
 - 72시간 경과: 청크를 `EXPIRED`로 표시하며 사용자가 직접 내보내거나 폐기할 때까지 삭제하지 않습니다.
 - 보존 세션 폐기: 사용자 ID와 접속 코드를 입력한 뒤 서버 삭제를 확인합니다. 네트워크·인증 오류가 나면 로컬 청크가 남아 재시도할 수 있습니다.
 
-## 개발·테스트 (선택)
+## Atlas 연동 서버 테스트 (선택)
 
-코드를 수정하거나 로컬 서버를 시험할 때만 Python 개발 환경을 준비합니다. Windows에서는 프로젝트 루트에서 `setup-and-run-server.cmd --install-only`로 가상환경과 서버 의존성을 설치할 수 있습니다. 테스트용 패키지는 아래 명령으로 추가합니다.
+이 테스트는 **별도의 Atlas 테스트 클러스터**에 연결해 서버의 세션 재개·초안 삭제 트랜잭션을 검증합니다. 배포된 Render 서버에 HTTP 요청을 보내는 테스트는 아닙니다. 운영 Atlas 클러스터의 URI는 사용하지 마세요.
 
-```powershell
-.\setup-and-run-server.cmd --install-only
-.\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
-.\.venv\Scripts\python.exe -m pytest -q
-node --test tests\extension\core.test.js tests\extension\outbox.test.js tests\extension\discard.test.js tests\extension\offscreen_discard.test.js tests\extension\server_readiness.test.js
-Get-ChildItem extension\*.js | ForEach-Object { node --check $_.FullName }
-```
+1. Atlas 테스트 클러스터의 연결 URI를 준비하고, 프로젝트 루트의 `tests/server/.env.test.local` 파일에 다음처럼 저장합니다. 이 파일은 Git에서 제외됩니다.
 
-로컬 서버 실행이 필요하면 `server/.env`를 설정한 뒤 `.\setup-and-run-server.cmd`를 실행합니다. 자동 설치 스크립트는 최초 설정에 `MOCK_OPENAI=true`와 로컬 접속 토큰을 사용합니다. 실제 OpenAI 호출은 `OPENAI_API_KEY`, `SAFETY_IDENTIFIER_SECRET`을 설정하고 `MOCK_OPENAI=false`로 변경해야 합니다.
+   ```dotenv
+   MONGODB_TEST_URI=<테스트 클러스터의 전체 MongoDB 연결 URI>
+   ```
 
-GitHub Actions는 `main`·`ver_gpt` 푸시와 PR에서 Python 3.12·Node.js 22로 같은 검사를 실행합니다. Atlas 통합 테스트는 `MONGODB_TEST_URI`가 없는 CI에서는 건너뜁니다.
+2. Windows PowerShell에서 프로젝트 루트로 이동한 뒤 의존성을 설치하고 통합 테스트를 실행합니다.
 
-실제 MongoDB 트랜잭션 검증에는 비운영 테스트 클러스터가 필요합니다. 로컬 환경의 `MONGODB_TEST_URI` 또는 Git에서 제외되는 `tests/server/.env.test.local`에 새 URI를 설정하면 `python -m pytest tests/server/test_mongo_integration.py -q`로 고유한 임시 DB에서 재개·삭제를 확인한 뒤 해당 DB를 정리합니다. 변수가 없으면 이 테스트는 건너뜁니다. 운영 클러스터의 URI는 사용하지 마세요.
+   ```powershell
+   .\setup-and-run-server.cmd --install-only
+   .\.venv\Scripts\python.exe -m pip install -r server\requirements-dev.txt
+   .\.venv\Scripts\python.exe -m pytest tests\server\test_mongo_integration.py -q
+   ```
+
+테스트는 `cv_`로 시작하는 고유한 임시 데이터베이스를 만들고, 세션 재개·삭제를 확인한 뒤 데이터베이스를 삭제합니다. 결과가 `1 skipped`라면 `MONGODB_TEST_URI`를 읽지 못한 것이므로 설정을 확인하세요. GitHub Actions에서는 이 URI를 설정하지 않으므로 해당 통합 테스트를 건너뜁니다.
 
 ## 보안 주의사항
 
