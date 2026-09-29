@@ -88,16 +88,20 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         or (existing.get("status") == "finalize_pending" and status == "incomplete" and archive is None)
     ):
         return existing
+    transcript_text = "\n".join(v["text"] for v in segments)
+    keep_partial_summary = status == "incomplete" and (existing or {}).get("summary_scope") == "partial" and (existing or {}).get("transcript", {}).get("text") == transcript_text
     value = {
         "schema_version": 8, "document_id": draft["document_id"], "session_id": session_id, "owner_id": owner_id,
         "status": status, "source": {"url": _canonical_url(draft.get("source_url", "")), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
         "requested_at": draft.get("created_at", now), "updated_at": now, "completed_at": now if status == "completed" else None,
-        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": "\n".join(v["text"] for v in segments), "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
+        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "missing_time_ranges": gaps},
         "missing_time_ranges": gaps,
-        "summary_status": "completed" if status == "completed" else ("processing" if status == "finalize_pending" else "not_run"),
+        "summary_status": "completed" if status == "completed" or (keep_partial_summary and (existing or {}).get("summary")) else ("processing" if status == "finalize_pending" else "not_run"),
         "summary_error_code": None,
-        "summary": summary.model_dump() if summary else (existing or {}).get("summary"),
+        "summary_scope": "complete" if status == "completed" else ("partial" if keep_partial_summary else None),
+        "summary": summary.model_dump() if summary else ((existing or {}).get("summary") if keep_partial_summary else None),
+        "summary_provider": (existing or {}).get("summary_provider") if keep_partial_summary else None,
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
         "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": None if status == "completed" else draft.get("expire_at"),
     }
@@ -482,6 +486,42 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
         return ChunkResponse(session_id=session_id, sequence=sequence, segments=result.transcript.segments)
 
 
+async def _summarize_incomplete(owner_id: str, session_id: str, document: dict[str, Any]) -> dict[str, Any]:
+    transcript = document.get("transcript", {}).get("text", "")
+    if not transcript.strip() or (document.get("summary_scope") == "partial" and document.get("summary")):
+        return document
+    attempt_id = str(uuid.uuid4())
+    if not await store.claim_finalize(owner_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()):
+        return document
+    try:
+        try:
+            await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
+        except TimeoutError:
+            error = ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="retry_later")
+        else:
+            try:
+                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(owner_id), partial=True)
+                error = None
+            except Exception as exc:
+                error = _provider_error(exc)
+            finally:
+                openai_slots.release()
+        if error:
+            await store.update_document_for_session(owner_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+            if error.code != "ai_backpressure":
+                await store.record_provider_state(error.code, error.retry_after_seconds)
+            return await store.get_document_for_session(owner_id, session_id) or document
+        await store.update_document_for_session(owner_id, session_id, {
+            "summary": summary.model_dump(), "summary_scope": "partial", "summary_status": "completed", "summary_error_code": None,
+            "summary_provider": {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v2-partial", "schema_version": 1},
+            "updated_at": utcnow(),
+        })
+        await store.record_usage(owner_id, utcnow().date().isoformat(), {"summary_requests": 1})
+        return await store.get_document_for_session(owner_id, session_id) or document
+    finally:
+        await store.release_finalize(owner_id, session_id)
+
+
 @app.post("/v1/sessions/{session_id}/archive", response_model=ArchiveResponse)
 async def archive_session(session_id: str, payload: ArchiveRequest, user: AuthenticatedUser = Depends(authorize)) -> ArchiveResponse:
     await _reconcile_state()
@@ -496,8 +536,12 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
     gaps = _capture_gaps(payload.capture_gaps) or (existing or {}).get("missing_time_ranges", []) or draft.get("missing_time_ranges", [])
     if missing or gaps:
         expire_at = utcnow() + timedelta(days=settings.incomplete_draft_retention_days); await store.update_session(user.user_id, session_id, {"status": "incomplete", "expected_chunk_count": expected, "missing_sequences": missing, "missing_time_ranges": gaps, "expire_at": expire_at}); await store.expire_drafts(user.user_id, session_id, expire_at)
-        doc = await _write_partial(user.user_id, session_id, status="incomplete", missing=missing, expected=expected, archive=payload); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
-        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, missing_time_ranges=gaps)
+        doc = await _write_partial(user.user_id, session_id, status="incomplete", missing=missing, expected=expected, archive=payload)
+        try:
+            doc = await _summarize_incomplete(user.user_id, session_id, doc)
+        finally:
+            sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
+        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, missing_time_ranges=gaps, summary=doc.get("summary"))
     attempt_id = str(uuid.uuid4())
     if not await store.claim_finalize(user.user_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()): raise ApiError(409, "finalize_in_progress", "최종 요약이 이미 처리 중입니다.", retryable=True, action="retry_later")
     try:

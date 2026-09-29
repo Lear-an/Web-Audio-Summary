@@ -237,7 +237,7 @@ def test_next_chunk_automatically_restores_session_after_process_restart() -> No
         assert asyncio.run(store.get_session("local", session_id))["next_sequence"] == 2
 
 
-def test_capture_gap_keeps_document_incomplete_without_summary() -> None:
+def test_capture_gap_keeps_document_incomplete_with_partial_summary() -> None:
     with TestClient(app) as client:
         session_id = create_session(client)
         assert upload_chunk(client, session_id, 0).status_code == 200
@@ -252,11 +252,64 @@ def test_capture_gap_keeps_document_incomplete_without_summary() -> None:
         assert response.json()["missing_time_ranges"][0]["end_ms"] == 90_000
         document = asyncio.run(store.get_document_for_session("local", session_id))
         assert document["status"] == "incomplete"
-        assert document["summary_status"] == "not_run"
+        assert document["summary_status"] == "completed"
+        assert document["summary_scope"] == "partial"
+        assert document["summary"]["summary"]
+        assert response.json()["summary"]["summary"]
         repeated = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
         assert repeated.status_code == 200
         assert repeated.json()["saved"] is False
         assert repeated.json()["missing_time_ranges"][0]["start_ms"] == 60_000
+        assert repeated.json()["summary"]["summary"] == document["summary"]["summary"]
+
+
+def test_incomplete_document_can_generate_partial_summary_on_retry(monkeypatch) -> None:
+    original = gateway.summarize
+
+    async def unavailable(**_kwargs):
+        raise OpenAIUnavailableError()
+
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        monkeypatch.setattr(gateway, "summarize", unavailable)
+        first = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert first.status_code == 200
+        assert first.json()["saved"] is False
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "failed"
+        assert document["summary_error_code"] == "openai_overloaded"
+
+        monkeypatch.setattr(gateway, "summarize", original)
+        second = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert second.status_code == 200
+        assert second.json()["saved"] is False
+        assert second.json()["summary"]["summary"]
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "completed"
+        assert document["summary_scope"] == "partial"
+
+
+def test_incomplete_document_without_transcript_has_no_partial_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        response = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert response.status_code == 200
+        assert response.json()["summary"] is None
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "not_run"
+
+
+def test_new_transcript_clears_stale_partial_summary() -> None:
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, 0).status_code == 200
+        first = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2})
+        assert first.json()["summary"]
+        assert upload_chunk(client, session_id, 1).status_code == 200
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary"] is None
+        assert document["summary_scope"] is None
 
 
 def test_resume_clears_incomplete_ttl_from_session_and_chunks() -> None:

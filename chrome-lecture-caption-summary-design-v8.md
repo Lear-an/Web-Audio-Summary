@@ -293,6 +293,8 @@ OPENAI_QUEUE_WAIT_SECONDS=30
   "status": "incomplete|completed",
   "resume_status": "available|expired|not_needed",
   "summary_status": "not_run|processing|completed|failed|input_too_large",
+  "summary_scope": "partial|complete|null",
+  "summary_error_code": null,
   "requested_at": "datetime",
   "completed_at": null,
   "source": {
@@ -429,8 +431,8 @@ archive 순서:
 2. 업로드 중 요청 drain
 3. `0..expected_chunk_count-1` 누락 검사와 브라우저가 전달한 녹음 중단 구간(`capture_gaps`) 검사
 4. READY 청크로 부분 문서 원자적 upsert
-5. 순번 누락 또는 길이가 0보다 큰 녹음 중단 구간이 있으면 `incomplete`와 `missing_sequences`·`missing_time_ranges`를 반환하고 최종 요약 생략
-6. 두 종류의 누락이 모두 없을 때만 finalize lease 획득
+5. 순번 누락 또는 길이가 0보다 큰 녹음 중단 구간이 있으면 `incomplete`와 `missing_sequences`·`missing_time_ranges`를 유지한다. 확보된 전사가 있으면 finalize lease를 획득해 그 전사만 부분 요약하고 `summary_scope=partial`로 저장한다. 전사가 없으면 `summary_status=not_run`으로 둔다.
+6. 두 종류의 누락이 모두 없으면 finalize lease를 획득해 완전한 요약을 진행한다.
 7. 전체 한국어 자막 조합과 BSON·요약 입력 크기 검사
 8. GPT-6 Luna 최종 요약 실행. 일시적 연결·시간 초과·속도 제한은 제한된 횟수로 재시도할 수 있으며, 최종 결과는 한 번만 DB에 확정
 9. 요약 본문·요약 메타데이터·`summary_status=completed`·`status=completed`를 같은 문서의 단일 원자적 쓰기로 확정
@@ -442,7 +444,7 @@ archive 순서:
 
 최종 저장 요청은 클라이언트에서 최대 480초를 기다립니다. 서버의 GPT 요청은 건당 60초, 재시도 대기는 회당 최대 60초로 제한하고 finalize lease는 600초로 유지합니다. 캡처 종료 시 브라우저는 요청 전에 `FINALIZE_PENDING` 마커를 IndexedDB에 기록해 패널 종료·네트워크 단절 뒤에도 같은 세션을 재시도할 수 있게 합니다. `409 finalize_in_progress`, 재시도 가능한 `429`·`502`·`503` 응답은 지연 후 다시 요청하고, 할당량 소진과 영구적인 `422`는 자동 재시도하지 않습니다. 재시도 전에 완료 문서가 확인되면 기존 결과를 반환합니다.
 
-요약 실패 시 문서의 `summary_status=failed`와 `summary_error_code`를 기록합니다. 구조화 응답의 요약 본문이 비어 있는 경우 서버 검증에서 거부하고 재시도 가능한 `openai_invalid_response`로 반환합니다. DB 저장 오류를 OpenAI 오류로 바꿔 표시하지 않으며, 오류가 나도 전사 초안과 보존 청크는 유지합니다. 누락 청크 또는 실제 녹음 중단 구간이 있는 문서는 `summary_status=not_run`으로 남고 요약을 생성하지 않습니다.
+요약 실패 시 문서의 `summary_status=failed`와 `summary_error_code`를 기록합니다. 구조화 응답의 요약 본문이 비어 있는 경우 서버 검증에서 거부하고 재시도 가능한 `openai_invalid_response`로 반환합니다. DB 저장 오류를 OpenAI 오류로 바꿔 표시하지 않으며, 오류가 나도 전사 초안과 보존 청크는 유지합니다. 미완료 문서의 부분 요약은 빠진 내용을 추측하지 않으며, 문서 상태를 `completed`로 바꾸지 않습니다. 같은 전사에 대해서는 재요청해도 기존 부분 요약을 반환하고, 청크가 추가되면 오래된 부분 요약을 지운 뒤 다시 생성합니다. 기존 미완료 문서는 상세 화면의 `확보된 자막으로 부분 요약 생성`으로 같은 archive 요청을 재실행합니다.
 
 ### 8.4 문서 조회
 
@@ -689,11 +691,11 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 처리 lease가 만료돼 새 시도가 시작되면 이전 `attempt_id`의 늦은 결과가 READY 청크를 덮어쓰지 못합니다.
 - 배속 재생 시 실시간 자막과 Atlas 문서의 영상 시간값이 일치합니다.
 - 한국어·영어·혼합 강의가 스키마를 만족합니다.
-- 누락이 있으면 부분 문서만 저장되고 최종 요약은 호출되지 않습니다.
+- 누락이 있으면 미완료 문서로 유지하고 확보된 전사만 `summary_scope=partial`로 요약합니다. 전사가 없으면 요약하지 않습니다.
 - Render 재시작 후 다음 청크 요청이 Atlas 초안을 복원하며 녹음 중인 탭 스트림과 청크 순번은 유지됩니다.
 - 종료 후 보존 청크 재처리는 새 tabCapture 없이 가능하고, `saved=false`는 완료로 표시하지 않습니다.
 - 녹음 중단 구간이 있으면 순번이 모두 READY여도 `missing_time_ranges`가 있는 미완료 문서로 남습니다.
-- 모든 청크가 준비된 경우에만 최종 요약이 한 번 DB 결과로 반영됩니다.
+- 모든 청크가 준비되고 녹음 중단 구간이 없는 경우에만 완전한 최종 요약이 DB 결과로 반영됩니다.
 - 빈 문자열 또는 공백뿐인 요약은 완료로 저장하지 않습니다.
 - 60초를 넘는 GPT 응답·일시적 `502`·처리 중 `409` 뒤에도 최종 저장을 재시도하고 중복 문서를 만들지 않습니다.
 - 요약 실패 문서는 `summary_status=failed`와 원인 코드가 남으며, 재시도 성공 시 코드가 지워집니다.

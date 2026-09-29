@@ -2,6 +2,7 @@
   const { TARGET, MESSAGE, SESSION_STATE } = LectureProtocol;
   const Core = LectureCore;
   const DOCUMENTS_REQUEST_TIMEOUT_MS = 75_000;
+  const PARTIAL_SUMMARY_TIMEOUT_MS = 480_000;
 
   const elements = {
     statusBadge: document.querySelector("#statusBadge"),
@@ -41,6 +42,9 @@
     backToDocumentsButton: document.querySelector("#backToDocumentsButton"),
     documentTitle: document.querySelector("#documentTitle"),
     documentMeta: document.querySelector("#documentMeta"),
+    documentSummaryHeading: document.querySelector("#documentSummaryHeading"),
+    documentCoverage: document.querySelector("#documentCoverage"),
+    retryPartialSummaryButton: document.querySelector("#retryPartialSummaryButton"),
     documentSummary: document.querySelector("#documentSummary"),
     documentTranscript: document.querySelector("#documentTranscript")
   };
@@ -265,7 +269,9 @@
 
   function renderNotes() {
     const notes = snapshot.notes || {};
-    elements.summaryText.textContent = notes.summary || "요약이 아직 없습니다.";
+    elements.summaryText.textContent = notes.summary
+      ? `${snapshot.archivedIncomplete ? "[부분 요약: 누락된 내용 제외]\n" : ""}${notes.summary}`
+      : "요약이 아직 없습니다.";
     elements.summaryText.classList.toggle("empty-state", !notes.summary);
     renderList(elements.conceptsList, notes.concepts, "주요 개념이 아직 없습니다.");
     renderList(elements.termsList, notes.terms, "전문 용어가 아직 없습니다.");
@@ -483,7 +489,7 @@
     return Number.isNaN(date.getTime()) ? "날짜 없음" : date.toLocaleString("ko-KR");
   }
 
-  async function authenticatedDocumentRequest(path, signal) {
+  async function authenticatedDocumentRequest(path, signal, options = {}) {
     const userId = elements.userId.value.trim();
     const accessToken = elements.accessToken.value.trim();
     if (!userId || !accessToken) {
@@ -493,11 +499,13 @@
     let response;
     try {
       response = await fetch(`${LectureConfig.SERVER_BASE_URL}${path}`, {
-        method: "GET",
+        method: options.method || "GET",
         headers: {
           Authorization: `Bearer ${accessToken}`,
-          "X-User-ID": userId
+          "X-User-ID": userId,
+          ...(options.body ? { "Content-Type": "application/json" } : {})
         },
+        ...(options.body ? { body: JSON.stringify(options.body) } : {}),
         signal
       });
     } catch (error) {
@@ -597,9 +605,26 @@
         .map((segment) => `[${Core.formatClock(segment.start_ms || 0)}] ${segment.text || ""}`)
         .join("\n");
       const summary = item?.summary?.summary || (typeof item?.summary === "string" ? item.summary : "");
+      const missingCount = item?.chunk_state?.missing_sequences?.length || 0;
+      const gapCount = item?.missing_time_ranges?.length || 0;
+      const incomplete = item?.status === "incomplete";
       elements.documentTitle.textContent = item?.source?.title || "제목 없는 강의";
       elements.documentMeta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
-      elements.documentSummary.textContent = summary || "최종 요약이 생성되지 않은 문서입니다.";
+      elements.documentSummaryHeading.textContent = incomplete && summary ? "부분 요약" : "요약";
+      elements.documentCoverage.hidden = !incomplete;
+      elements.documentCoverage.textContent = incomplete
+        ? `자막 누락 청크 ${missingCount}개 · 녹음 중단 구간 ${gapCount}개. 확보된 자막만 요약할 수 있습니다.`
+        : "";
+      elements.retryPartialSummaryButton.hidden = !incomplete || Boolean(summary) || !transcript.trim() || item?.resume_status !== "available";
+      elements.retryPartialSummaryButton.dataset.sessionId = item?.session_id || "";
+      elements.retryPartialSummaryButton.dataset.documentId = item?.document_id || "";
+      elements.retryPartialSummaryButton.dataset.expectedCount = String(item?.chunk_state?.expected_chunk_count || 0);
+      elements.retryPartialSummaryButton.dataset.durationMs = String(item?.duration_ms || 0);
+      elements.retryPartialSummaryButton.dataset.sourceTitle = item?.source?.title || "";
+      elements.retryPartialSummaryButton.dataset.gaps = JSON.stringify(item?.missing_time_ranges || []);
+      elements.documentSummary.textContent = summary || (item?.summary_error_code
+        ? `부분 요약 생성에 실패했습니다 (${item.summary_error_code}). 다시 시도해 주세요.`
+        : "확보된 자막의 요약이 아직 없습니다.");
       elements.documentTranscript.textContent = transcript || "저장된 자막이 없습니다.";
       elements.documentsMessage.hidden = true;
       elements.documentDetail.hidden = false;
@@ -612,6 +637,33 @@
       throw error;
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  async function retryPartialSummary() {
+    const button = elements.retryPartialSummaryButton;
+    const sessionId = button.dataset.sessionId;
+    if (!sessionId) throw new Error("복구할 세션 ID가 없습니다.");
+    button.disabled = true;
+    button.textContent = "부분 요약을 생성하고 있습니다.";
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort("timeout"), PARTIAL_SUMMARY_TIMEOUT_MS);
+    try {
+      const result = await authenticatedDocumentRequest(`/v1/sessions/${encodeURIComponent(sessionId)}/archive`, controller.signal, {
+        method: "POST",
+        body: {
+          source_title: button.dataset.sourceTitle,
+          duration_ms: Number(button.dataset.durationMs),
+          expected_chunk_count: Number(button.dataset.expectedCount),
+          capture_gaps: JSON.parse(button.dataset.gaps || "[]")
+        }
+      });
+      await loadDocumentDetail(button.dataset.documentId);
+      if (!result?.summary) throw new Error("부분 요약을 생성하지 못했습니다. 문서 상태를 확인하고 다시 시도해 주세요.");
+    } finally {
+      clearTimeout(timeout);
+      button.disabled = false;
+      button.textContent = "확보된 자막으로 부분 요약 생성";
     }
   }
 
@@ -701,6 +753,9 @@
   });
   elements.backToDocumentsButton.addEventListener("click", () => {
     void loadDocuments();
+  });
+  elements.retryPartialSummaryButton.addEventListener("click", () => {
+    void retryPartialSummary().catch((error) => { setConnectionMessage(error.message); });
   });
   elements.searchInput.addEventListener("input", renderCaptions);
   elements.copyButton.addEventListener("click", () => {

@@ -139,6 +139,7 @@
       estimatedQueueBytes: Math.round(audioBytes() * 1.5),
       queueCount: session.queue.length + (session.processing ? 1 : 0),
       recoveryRequired: Boolean(session.recoveryRequired),
+      archivedIncomplete: Boolean(session.archivedIncomplete),
       finalizePending: Boolean(session.finalizePending),
       hasStream: Boolean(session.stream),
       mockMode: Boolean(session.mockMode),
@@ -851,7 +852,7 @@
         session.state = SESSION_STATE.STOPPED;
         session.notice = archive?.saved
           ? `최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
-          : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
+          : archive?.summary ? "누락 구간이 있어 확보된 자막의 부분 요약을 저장했습니다." : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
         session.accessToken = "";
         session.userId = "";
         broadcastSnapshot();
@@ -977,7 +978,7 @@
           session.state = SESSION_STATE.STOPPED;
           session.notice = archive?.saved
             ? "보존 청크 처리와 최종 문서 저장을 완료했습니다."
-            : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
+            : archive?.summary ? "미완료 문서에 확보된 자막의 부분 요약을 저장했습니다. 누락 구간을 확인해 주세요." : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
         } catch (error) {
           session.state = SESSION_STATE.PAUSED_ACTION;
           session.finalizePending = true;
@@ -1131,7 +1132,7 @@
       const archive = await archiveServerSessionWithRetry();
       session.notice = archive?.saved
         ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
-        : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
+        : archive?.summary ? `${reason} 미완료 문서와 확보된 자막의 부분 요약을 저장했습니다.` : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
     } catch (error) {
       session.finalizePending = true;
       await preserveSessionMarker("FINALIZE_PENDING", serializeError(error));
