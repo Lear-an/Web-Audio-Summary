@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import re
+import secrets
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -18,6 +19,7 @@ from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIQuotaExhaustedError, OpenAIRateLimitError, OpenAIUnavailableError
 from .schemas import ArchiveRequest, ArchiveResponse, ChunkResponse, DocumentListResponse, HealthResponse, SessionCreateRequest, SessionCreateResponse, SessionResumeRequest, SummaryResponse, TranscriptSegment
@@ -55,6 +57,19 @@ class SessionRecord:
 
 sessions: dict[str, SessionRecord] = {}
 session_restore_lock = asyncio.Lock()
+admin_user_lock = asyncio.Lock()
+auth_failures: dict[tuple[str, str], list[float]] = {}
+auth_failure_lock = asyncio.Lock()
+AUTH_FAILURE_WINDOW_SECONDS = 60
+AUTH_FAILURE_LIMIT = 5
+
+
+class AdminUserRequest(BaseModel):
+    user_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,64}$")
+
+
+class AdminImportRequest(AdminUserRequest):
+    token_sha256: str = Field(pattern=r"^[a-fA-F0-9]{64}$")
 
 
 def _lease_until(seconds: int): return utcnow() + timedelta(seconds=seconds)
@@ -137,7 +152,12 @@ async def expire_idle_sessions() -> None:
 async def lifespan(_: FastAPI):
     if settings.app_auth_mode == "local" and settings.generated_access_token: logger.warning("Lecture Memo local access token: %s", settings.local_access_token)
     if settings.mock_openai: logger.warning("MOCK_OPENAI=true: 실제 OpenAI API를 호출하지 않습니다.")
-    await store.initialize(); await store.scrub_source_urls(_source_metadata); await _reconcile_state()
+    await store.initialize()
+    if settings.app_auth_mode == "atlas_users":
+        for user_id, token_hash in settings.app_users.items():
+            outcome = await store.create_user({"user_id": user_id, "token_hash": token_hash, "status": "active", "created_at": utcnow(), "updated_at": utcnow()}, settings.max_registered_users)
+            if outcome == "limit": raise RuntimeError("기존 사용자 계정을 Atlas로 이관할 공간이 없습니다.")
+    await store.scrub_source_urls(_source_metadata); await _reconcile_state()
     task = asyncio.create_task(expire_idle_sessions())
     try: yield
     finally:
@@ -147,10 +167,11 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="Lecture Memo Relay", version="0.8.0", docs_url=None, redoc_url=None, lifespan=lifespan)
-if settings.allowed_extension_origins: allowed_origins, allowed_origin_regex = list(settings.allowed_extension_origins), None
+if settings.app_auth_mode == "atlas_users": allowed_origins, allowed_origin_regex = [], r"^chrome-extension://[a-p]{32}$"
+elif settings.allowed_extension_origins: allowed_origins, allowed_origin_regex = list(settings.allowed_extension_origins), None
 elif settings.app_auth_mode == "local": allowed_origins, allowed_origin_regex = [], r"^chrome-extension://[a-p]{32}$"
 else: allowed_origins, allowed_origin_regex = [], None
-app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=allowed_origin_regex, allow_credentials=False, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-User-ID"])
+app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_origin_regex=allowed_origin_regex, allow_credentials=False, allow_methods=["GET", "POST", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type", "X-User-ID", "X-Admin-Token"])
 
 
 @app.exception_handler(ApiError)
@@ -180,20 +201,116 @@ async def limit_request_size(request: Request, call_next):
 
 def _valid_origin(origin: str | None) -> bool:
     if not origin: return True
+    if settings.app_auth_mode == "atlas_users": return bool(re.fullmatch(r"chrome-extension://[a-p]{32}", origin))
     if settings.allowed_extension_origins: return origin in settings.allowed_extension_origins
     return settings.app_auth_mode == "local" and bool(re.fullmatch(r"chrome-extension://[a-p]{32}", origin))
 
 
-async def authorize(authorization: Annotated[str | None, Header()] = None, x_user_id: Annotated[str | None, Header()] = None, origin: Annotated[str | None, Header()] = None) -> AuthenticatedUser:
+def _failure_key(request: Request, identity: str) -> tuple[str, str]:
+    address = request.client.host if request.client else "unknown"
+    return address, hashlib.sha256(identity.encode()).hexdigest()
+
+
+async def _check_auth_limit(key: tuple[str, str]) -> None:
+    async with auth_failure_lock:
+        now = time.monotonic()
+        attempts = [stamp for stamp in auth_failures.get(key, []) if stamp > now - AUTH_FAILURE_WINDOW_SECONDS]
+        if attempts: auth_failures[key] = attempts
+        else: auth_failures.pop(key, None)
+        if len(attempts) >= AUTH_FAILURE_LIMIT:
+            raise ApiError(429, "authentication_rate_limited", "인증 시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.", retry_after_seconds=60)
+
+
+async def _auth_failed(key: tuple[str, str]) -> None:
+    async with auth_failure_lock:
+        if len(auth_failures) > 2048:
+            cutoff = time.monotonic() - AUTH_FAILURE_WINDOW_SECONDS
+            for old_key, stamps in list(auth_failures.items()):
+                if not stamps or stamps[-1] <= cutoff: auth_failures.pop(old_key, None)
+        auth_failures.setdefault(key, []).append(time.monotonic())
+
+
+async def authorize(request: Request, authorization: Annotated[str | None, Header()] = None, x_user_id: Annotated[str | None, Header()] = None, origin: Annotated[str | None, Header()] = None) -> AuthenticatedUser:
     if not _valid_origin(origin): raise ApiError(403, "origin_not_allowed", "허용되지 않은 확장 프로그램 origin입니다.")
     token = authorization.removeprefix("Bearer ").strip() if authorization else ""
     if settings.app_auth_mode == "local":
         if not hmac.compare_digest(token, settings.local_access_token): raise ApiError(401, "authentication_failed", "접속 토큰이 올바르지 않습니다.")
         return AuthenticatedUser("local")
-    user_id = (x_user_id or "").strip(); expected = settings.app_users.get(user_id, "")
+    user_id = (x_user_id or "").strip()
+    key = _failure_key(request, user_id)
+    await _check_auth_limit(key)
+    if settings.app_auth_mode == "atlas_users":
+        row = await store.get_user(user_id) if user_id else None
+        expected = row.get("token_hash", "") if row and row.get("status") == "active" else ""
+    else:
+        expected = settings.app_users.get(user_id, "")
     actual_hash = hashlib.sha256(token.encode()).hexdigest()
-    if not expected or not hmac.compare_digest(actual_hash, expected): raise ApiError(401, "authentication_failed", "사용자 ID 또는 접속 코드가 올바르지 않습니다.")
+    if not expected or not hmac.compare_digest(actual_hash, expected):
+        await _auth_failed(key)
+        raise ApiError(401, "authentication_failed", "사용자 ID 또는 접속 코드가 올바르지 않습니다.")
+    async with auth_failure_lock: auth_failures.pop(key, None)
     return AuthenticatedUser(user_id)
+
+
+async def authorize_admin(request: Request, x_admin_token: Annotated[str | None, Header()] = None) -> None:
+    key = _failure_key(request, "admin")
+    await _check_auth_limit(key)
+    if settings.app_auth_mode != "atlas_users" or not x_admin_token or not hmac.compare_digest(x_admin_token, settings.admin_access_token):
+        await _auth_failed(key)
+        raise ApiError(401, "authentication_failed", "관리자 인증에 실패했습니다.")
+    async with auth_failure_lock: auth_failures.pop(key, None)
+
+
+def _public_user(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: row[key] for key in ("user_id", "status", "created_at", "updated_at") if key in row}
+
+
+@app.get("/v1/admin/users", dependencies=[Depends(authorize_admin)])
+async def admin_list_users() -> dict[str, Any]:
+    return {"users": [_public_user(row) for row in await store.list_users()]}
+
+
+@app.post("/v1/admin/users", dependencies=[Depends(authorize_admin)])
+async def admin_create_user(payload: AdminUserRequest) -> dict[str, str]:
+    code = secrets.token_urlsafe(32)
+    now = utcnow()
+    async with admin_user_lock:
+        outcome = await store.create_user({"user_id": payload.user_id, "token_hash": hashlib.sha256(code.encode()).hexdigest(), "status": "active", "created_at": now, "updated_at": now}, settings.max_registered_users)
+    if outcome == "exists": raise ApiError(409, "user_exists", "이미 존재하는 사용자 ID입니다.")
+    if outcome == "limit": raise ApiError(409, "registered_user_limit", "등록 가능한 계정 수를 초과했습니다.")
+    return {"user_id": payload.user_id, "access_code": code}
+
+
+@app.post("/v1/admin/users/import", dependencies=[Depends(authorize_admin)])
+async def admin_import_user(payload: AdminImportRequest) -> dict[str, str]:
+    now = utcnow()
+    async with admin_user_lock:
+        outcome = await store.create_user({"user_id": payload.user_id, "token_hash": payload.token_sha256.lower(), "status": "active", "created_at": now, "updated_at": now}, settings.max_registered_users)
+    if outcome == "exists": raise ApiError(409, "user_exists", "이미 존재하는 사용자 ID입니다.")
+    if outcome == "limit": raise ApiError(409, "registered_user_limit", "등록 가능한 계정 수를 초과했습니다.")
+    return {"user_id": payload.user_id, "status": "active"}
+
+
+@app.post("/v1/admin/users/{user_id}/rotate", dependencies=[Depends(authorize_admin)])
+async def admin_rotate_user(user_id: str) -> dict[str, str]:
+    code = secrets.token_urlsafe(32)
+    if not await store.update_user(user_id, {"token_hash": hashlib.sha256(code.encode()).hexdigest(), "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "access_code": code}
+
+
+@app.post("/v1/admin/users/{user_id}/disable", dependencies=[Depends(authorize_admin)])
+async def admin_disable_user(user_id: str) -> dict[str, str]:
+    if not await store.update_user(user_id, {"status": "disabled", "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "status": "disabled"}
+
+
+@app.post("/v1/admin/users/{user_id}/enable", dependencies=[Depends(authorize_admin)])
+async def admin_enable_user(user_id: str) -> dict[str, str]:
+    if not await store.update_user(user_id, {"status": "active", "updated_at": utcnow()}):
+        raise ApiError(404, "user_not_found", "계정을 찾을 수 없습니다.")
+    return {"user_id": user_id, "status": "active"}
 
 
 def _canonical_url(raw: str) -> str:

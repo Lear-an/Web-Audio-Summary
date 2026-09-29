@@ -8,6 +8,7 @@ V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계�
 - OpenAI API 키는 운영자가 Render Secret으로 한 번만 설정합니다.
 - `whisper-1`이 구간 타임스탬프를 포함해 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다.
 - 사용자는 사용자 ID와 접속 코드만 입력합니다.
+- 운영자가 발급한 계정이 유효하면 설치 PC나 확장 프로그램 ID와 관계없이 모든 사용자 기능을 이용합니다. 기기 등록은 하지 않습니다.
 - 북마크 기능은 제품 UI와 신규 전사·요약 데이터 범위에서 제외합니다.
 - 청크는 60초, 겹침은 2초입니다.
 - 중간 요약 없이 캡처 종료 시 최종 요약을 한 번 생성합니다.
@@ -83,23 +84,32 @@ Render FastAPI Web Service
 
 ### 4.1 사용자 인증
 
-- 운영자가 최대 10개 계정을 등록할 수 있으며 활성 사용자 lease로 동시 사용자를 5명으로 제한합니다.
-- 사용자마다 서로 다른 충분히 긴 무작위 접속 코드를 전달합니다.
-- Render에는 평문 코드 대신 SHA-256 해시만 저장합니다.
-- 서버는 입력 코드를 해시한 뒤 상수 시간 비교를 수행합니다.
+- 운영자가 최대 10개 계정을 발급할 수 있으며 활성 사용자 lease로 동시 사용자 ID를 5개로 제한합니다. 같은 계정으로 여러 PC에서 접속할 수 있으며 PC 수는 제한하지 않습니다.
+- 사용자는 발급받은 사용자 ID와 접속 코드만 입력합니다. 설치 PC, 확장 프로그램 ID, 기기 식별자 등록은 인증 절차에 포함하지 않습니다.
+- 계정은 Atlas의 `app_users` 컬렉션에 저장합니다. `user_id`는 고유하며 문서·세션의 기존 `owner_id`와 동일한 불변 식별자입니다. 계정 상태(`active`/`disabled`), 코드 해시, 생성·수정 시각을 보관합니다.
+- 사용자마다 충분히 긴 무작위 접속 코드를 발급하고 Atlas에는 SHA-256 해시만 저장합니다. 코드는 발급·재발급 응답에 한 번만 표시하고 로그에 기록하지 않습니다.
+- 서버는 각 사용자 요청에서 Atlas 계정의 활성 상태와 코드 해시를 확인하고 상수 시간 비교를 수행합니다. Atlas 조회 실패는 인증 성공으로 처리하지 않습니다. 계정 중지와 코드 재발급은 다음 요청부터 적용합니다.
 - 인증 실패는 IP와 사용자 ID 해시 단위로 짧은 시간당 횟수를 제한합니다.
 - 모든 조회·수정·삭제 쿼리는 인증된 `owner_id` 조건을 포함합니다.
+- 계정 중지 후 기존 문서와 초안은 유지하되, 해당 계정의 조회·캡처·재개·삭제 요청을 모두 거부합니다. 코드를 재발급해도 `user_id`는 바꾸지 않으므로 기존 문서 소유권이 유지됩니다.
 
 ```dotenv
-APP_USER_1_ID=user-001
-APP_USER_1_TOKEN_SHA256=<sha256>
-# ... APP_USER_10까지
+APP_AUTH_MODE=atlas_users
+ADMIN_ACCESS_TOKEN=<관리자 전용 긴 무작위 비밀값>
 MAX_REGISTERED_USERS=10
 MAX_CONCURRENT_USERS=5
 SAFETY_IDENTIFIER_SECRET=<랜덤 비밀값>
 ```
 
-### 4.2 OpenAI 키
+### 4.2 계정 발급과 관리
+
+- 관리자는 계정 관리 명령으로 사용자 ID를 지정해 계정을 발급하고, 출력된 접속 코드를 사용자에게 전달합니다. 발급·중지·재발급·목록 확인은 관리자 전용 HTTPS API를 통해 처리하며 관리자 웹 콘솔은 만들지 않습니다.
+- 관리자 API는 일반 사용자 접속 코드와 별도의 `ADMIN_ACCESS_TOKEN`으로 보호합니다. 이 값은 Render Secret과 관리자 비밀번호 관리 도구에만 보관하고 확장 프로그램에 전달하지 않습니다. 관리자 요청도 실패 횟수를 제한하며 비밀값과 발급 코드를 로그에 남기지 않습니다.
+- 계정 발급 시 중복 사용자 ID와 등록 한도를 검사합니다. 중지된 계정을 재활성화하는 절차는 별도로 제공하며, 사용자 ID를 삭제·재사용하지 않습니다.
+- 기존 `APP_USER_n_ID/TOKEN_SHA256`은 동일한 사용자 ID와 해시로 Atlas에 한 번 이관합니다. 전환 배포 시 변수가 남아 있으면 서버 시작 시 자동 이관하고, 먼저 제거되었다면 관리자 전용 해시 이관 명령을 사용합니다. 이관·검증 후 Render의 사용자별 환경변수를 제거합니다. 기존 사용자의 문서 소유권과 접속 코드는 유지됩니다.
+- 평상시 계정 추가·중지·재발급에는 Render 설정 변경이나 재배포가 필요하지 않습니다.
+
+### 4.3 OpenAI 키
 
 - `OPENAI_API_KEY`는 Render Secret에만 저장합니다.
 - 확장 프로그램, GitHub, Atlas 문서, 로그에는 키를 저장하지 않습니다.
@@ -376,7 +386,9 @@ daily_usage:            unique(owner_id, day), (day)
 
 ## 8. API 설계
 
-모든 `/v1` 요청은 `X-User-Id`, `Authorization: Bearer <접속 코드>`를 요구합니다. 오류 응답은 `code`, `message`, `retryable`, `retry_after_seconds`, `request_id`를 공통으로 가집니다.
+사용자 `/v1` 요청은 `X-User-Id`, `Authorization: Bearer <접속 코드>`를 요구합니다. 관리자 전용 요청은 별도 관리자 비밀값을 사용합니다. 오류 응답은 `code`, `message`, `retryable`, `retry_after_seconds`, `request_id`를 공통으로 가집니다.
+
+관리자 계정 API는 계정 발급, 목록 조회, 중지, 재활성화, 접속 코드 재발급을 제공합니다. 일반 사용자 인증 경로와 분리하며 계정 발급·재발급 응답 외에는 접속 코드를 반환하지 않습니다.
 
 ### 8.1 세션과 연결 확인
 
@@ -531,7 +543,7 @@ reconciliation은 만료된 processing lease를 해제하고, 오래된 processi
 | HTTP | code | 동작 |
 |---:|---|---|
 | 401 | invalid_credentials | 입력 확인, 재시도 제한 |
-| 403 | extension_origin_not_allowed | CORS/확장 ID 확인 |
+| 403 | extension_origin_not_allowed | 일반 웹사이트 origin에서 요청했는지 확인 |
 | 404 | session_not_found | 문서 조회 후 복구 판단 |
 | 409 | chunk_conflict | 다른 오디오로 같은 순번 사용 금지 |
 | 409 | archive_in_progress | 기존 finalize 상태 조회 |
@@ -551,6 +563,8 @@ reconciliation은 만료된 processing lease를 해제하고, 오래된 processi
 ```dotenv
 MONGODB_URI=<Render Secret>
 MONGODB_DATABASE=lecture_memo
+APP_AUTH_MODE=atlas_users
+ADMIN_ACCESS_TOKEN=<Render Secret>
 OPENAI_API_KEY=<Render Secret>
 OPENAI_TRANSCRIBE_MODEL=whisper-1
 OPENAI_TEXT_MODEL=gpt-6-luna
@@ -593,11 +607,11 @@ SERVER_LIVE_CACHE_SECONDS: 180
 
 `extension/config.js`의 설정 항목이며 Render 환경변수가 아닙니다. 허용 범위는 120~300초입니다. 패널 열림 시 `/health/live` 결과를 캐시해 재호출을 억제합니다. 캡처 시작 시 `/health/ready`는 캐시와 공유하지 않고 새로 호출해 Atlas 준비를 검증합니다. 두 요청은 서로 다른 상태이며 같은 진행 중 요청으로 합치지 않습니다.
 
-### 13.2 확장 ID와 CORS
+### 13.2 확장 프로그램 연결과 CORS
 
-- 같은 개인키의 `manifest.key`로 확장 ID를 고정합니다.
-- 서버에는 실제 `chrome-extension://<고정-ID>`만 허용합니다.
-- 개발용 ID는 별도 설정하며 `*` CORS는 사용하지 않습니다.
+- 서버는 `chrome-extension://` 형식의 확장 프로그램 origin을 CORS에서 허용합니다. PC별 확장 ID를 Render에 등록하지 않습니다.
+- CORS와 `Origin` 헤더는 사용자 신원 증명이 아닙니다. 어떤 확장 ID에서 왔든 Atlas 계정 인증이 성공해야 사용자 기능을 이용할 수 있습니다.
+- 일반 웹사이트 origin은 CORS에서 허용하지 않으며, 출처가 없는 요청도 계정 또는 관리자 인증을 통과해야 합니다.
 - Render URL은 확장 운영 설정에 고정하고 사용자 입력란에 두지 않습니다.
 
 ### 13.3 Atlas Network Access
@@ -619,6 +633,16 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 `/health/ready`는 Atlas 연결과 설정을 검사하되 OpenAI 유료 요청을 만들지 않습니다. GPT 상태 시험을 위해 별도 provider API 요청을 보내지 않습니다.
 
 ## 15. 구현 순서
+
+계정 인증 전환은 기존 기능 구현과 별도로 다음 순서로 진행합니다.
+
+1. Atlas `app_users` 컬렉션, 고유 사용자 ID 인덱스, 계정 발급·조회·중지·재활성화·코드 재발급 관리 기능을 추가합니다.
+2. 기존 Render 사용자 ID와 코드 해시를 같은 ID로 이관하고, 사용자별 문서 접근과 코드 검증을 확인합니다.
+3. 사용자 인증을 Atlas 조회로 전환하고 PC별 확장 ID 제한을 제거합니다. Atlas 장애 시 인증은 실패하도록 처리합니다.
+4. 서로 다른 PC·확장 ID에서 같은 계정으로 캡처·복구·문서 조회를 검증하고, 중지·재발급이 다음 요청부터 적용되는지 확인합니다.
+5. 검증 후 Render의 `APP_USER_n_*`와 `ALLOWED_EXTENSION_ORIGINS`를 제거하고 운영 설명서를 갱신합니다.
+
+기존 V8 기능의 구현 순서는 다음과 같습니다.
 
 1. V8 환경변수와 시작 검증
 2. 최대 사용자 5명, 토큰 해시, 인증 실패 제한
@@ -682,7 +706,10 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 
 - 평문 접속 코드와 API 키가 Git·Atlas·로그에 없습니다.
 - 다른 사용자의 리소스 접근은 거부됩니다.
-- 허용하지 않은 extension origin은 거부됩니다.
+- 동일 계정은 PC나 확장 ID가 달라도 모든 사용자 기능을 이용하며 기기 등록을 요구하지 않습니다.
+- 일반 웹사이트 origin은 CORS에서 허용하지 않습니다. 허용된 확장 origin이나 출처가 없는 요청도 계정 인증 없이는 거부됩니다.
+- 계정을 중지하거나 코드를 재발급하면 이전 코드는 모든 PC에서 거부됩니다. Atlas 장애 시 인증이 우회되지 않습니다.
+- 관리자 비밀값 없이는 계정을 발급·변경할 수 없고, 계정 발급·재발급 응답 외에는 접속 코드가 표시되지 않습니다.
 - OpenAI 요청에 `store:false`와 비식별 `safety_identifier`가 포함됩니다.
 - 전사문에 삽입된 명령이 요약 지침을 바꾸지 못합니다.
 - 사용량과 추정 비용이 날짜·사용자별로 집계됩니다.
@@ -692,11 +719,10 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 | 값 | 위치 |
 |---|---|
 | Render HTTPS URL | 확장 운영 설정 |
-| 고정 Chrome 확장 ID | 서버 CORS 설정 |
 | MongoDB Atlas URI | Render Secret |
 | OpenAI API 키 | Render Secret |
-| 사용자 1~10 ID | Render 환경변수 |
-| 사용자 1~10 접속 코드 SHA-256 | Render Secret |
+| 관리자 전용 접속 비밀값 | Render Secret, 관리자 비밀번호 관리 도구 |
+| 사용자 ID·접속 코드 해시·계정 상태 | Atlas `app_users` 컬렉션 |
 | safety identifier HMAC secret | Render Secret |
 | 일일 사용자·전체 오디오 한도 | Render 환경변수, 0은 비활성 |
 

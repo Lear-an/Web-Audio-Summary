@@ -24,6 +24,7 @@ class InMemoryStore:
     kind = "memory"
 
     def __init__(self) -> None:
+        self.users: dict[str, dict[str, Any]] = {}
         self.sessions: dict[tuple[str, str], dict[str, Any]] = {}
         self.chunks: dict[tuple[str, str, int], dict[str, Any]] = {}
         self.documents: dict[tuple[str, str], dict[str, Any]] = {}
@@ -34,6 +35,25 @@ class InMemoryStore:
     async def initialize(self) -> None: pass
     async def close(self) -> None: pass
     async def ping(self) -> bool: return True
+
+    async def get_user(self, user_id: str) -> dict[str, Any] | None:
+        async with self.lock: return deepcopy(self.users.get(user_id))
+
+    async def list_users(self) -> list[dict[str, Any]]:
+        async with self.lock: return [deepcopy(self.users[key]) for key in sorted(self.users)]
+
+    async def create_user(self, value: dict[str, Any], maximum: int) -> str:
+        async with self.lock:
+            if value["user_id"] in self.users: return "exists"
+            if len(self.users) >= maximum: return "limit"
+            self.users[value["user_id"]] = deepcopy(value)
+            return "created"
+
+    async def update_user(self, user_id: str, values: dict[str, Any]) -> bool:
+        async with self.lock:
+            if user_id not in self.users: return False
+            self.users[user_id].update(deepcopy(values))
+            return True
 
     async def scrub_source_urls(self, metadata: Callable[[str], dict[str, str]]) -> None:
         async with self.lock:
@@ -213,7 +233,7 @@ class InMemoryStore:
                 if row.get("lease_until") is not None and row["lease_until"] <= now: self.service_state.pop(key, None)
 
     async def clear(self) -> None:
-        async with self.lock: self.sessions.clear(); self.chunks.clear(); self.documents.clear(); self.service_state.clear(); self.daily_usage.clear()
+        async with self.lock: self.users.clear(); self.sessions.clear(); self.chunks.clear(); self.documents.clear(); self.service_state.clear(); self.daily_usage.clear()
 
 
 class MongoStore(InMemoryStore):
@@ -228,11 +248,13 @@ class MongoStore(InMemoryStore):
         except ImportError as exc: raise RuntimeError("pymongo 패키지가 설치되지 않았습니다.") from exc
         self.client = MongoClient(self.settings.mongodb_uri, serverSelectionTimeoutMS=5000, tz_aware=True)
         db = self.client[self.settings.mongodb_database]
+        self.users = db["app_users"]
         self.sessions = db[self.settings.mongodb_session_collection]; self.chunks = db[self.settings.mongodb_chunk_collection]
         self.documents = db[self.settings.mongodb_document_collection]; self.service_state = db[self.settings.mongodb_service_state_collection]
         self.daily_usage = db[self.settings.mongodb_daily_usage_collection]
         def configure() -> None:
             self.client.admin.command("ping")
+            self.users.create_index("user_id", unique=True)
             self.sessions.create_index([("owner_id", ASCENDING), ("session_id", ASCENDING)], unique=True); self.sessions.create_index("expire_at", expireAfterSeconds=0)
             self.chunks.create_index([("owner_id", ASCENDING), ("session_id", ASCENDING), ("sequence", ASCENDING)], unique=True); self.chunks.create_index("expire_at", expireAfterSeconds=0)
             self.documents.create_index("document_id", unique=True); self.documents.create_index([("owner_id", ASCENDING), ("session_id", ASCENDING)], unique=True)
@@ -244,6 +266,21 @@ class MongoStore(InMemoryStore):
     async def ping(self) -> bool:
         try: await asyncio.to_thread(self.client.admin.command, "ping"); return True
         except Exception: return False
+    async def get_user(self, user_id: str) -> dict[str, Any] | None:
+        return public_document(await asyncio.to_thread(self.users.find_one, {"user_id": user_id}))
+    async def list_users(self) -> list[dict[str, Any]]:
+        return await asyncio.to_thread(lambda: [public_document(row) or {} for row in self.users.find().sort("user_id", 1)])
+    async def create_user(self, value: dict[str, Any], maximum: int) -> str:
+        from pymongo.errors import DuplicateKeyError
+        def create() -> str:
+            if self.users.find_one({"user_id": value["user_id"]}, {"_id": 1}): return "exists"
+            if self.users.count_documents({}) >= maximum: return "limit"
+            try: self.users.insert_one(value); return "created"
+            except DuplicateKeyError: return "exists"
+        return await asyncio.to_thread(create)
+    async def update_user(self, user_id: str, values: dict[str, Any]) -> bool:
+        result = await asyncio.to_thread(self.users.update_one, {"user_id": user_id}, {"$set": values})
+        return result.matched_count == 1
     async def scrub_source_urls(self, metadata: Callable[[str], dict[str, str]]) -> None:
         def scrub() -> None:
             for draft in self.sessions.find({}, {"source_url": 1, "canonical_url": 1}):
@@ -400,7 +437,7 @@ class MongoStore(InMemoryStore):
     async def reconcile(self, now: datetime) -> None:
         await asyncio.gather(asyncio.to_thread(self.chunks.update_many, {"status": "processing", "lease_until": {"$lte": now}}, {"$set": {"status": "retry_wait", "last_error": "processing_lease_expired"}, "$unset": {"lease_until": ""}}), asyncio.to_thread(self.service_state.delete_many, {"lease_until": {"$lte": now}}))
         await asyncio.to_thread(self.documents.update_many, {"status": "incomplete", "resume_available_until": {"$lte": now}}, {"$set": {"resume_status": "expired", "updated_at": now}})
-    async def clear(self) -> None: await asyncio.gather(asyncio.to_thread(self.sessions.delete_many, {}), asyncio.to_thread(self.chunks.delete_many, {}), asyncio.to_thread(self.documents.delete_many, {}), asyncio.to_thread(self.service_state.delete_many, {}), asyncio.to_thread(self.daily_usage.delete_many, {}))
+    async def clear(self) -> None: await asyncio.gather(asyncio.to_thread(self.users.delete_many, {}), asyncio.to_thread(self.sessions.delete_many, {}), asyncio.to_thread(self.chunks.delete_many, {}), asyncio.to_thread(self.documents.delete_many, {}), asyncio.to_thread(self.service_state.delete_many, {}), asyncio.to_thread(self.daily_usage.delete_many, {}))
 
 
 def create_store(settings: Settings) -> InMemoryStore | MongoStore:
