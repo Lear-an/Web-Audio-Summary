@@ -104,7 +104,7 @@ class Settings:
     session_idle_ttl_seconds: int = _bounded_int("SESSION_IDLE_TTL_SECONDS", 1800, 60, 86_400)
     incomplete_draft_retention_days: int = _bounded_int("DRAFT_RETENTION_DAYS", 7, 1, 90)
     processing_lease_seconds: int = _bounded_int("PROCESSING_LEASE_SECONDS", 180, 30, 900)
-    finalize_lease_seconds: int = _bounded_int("FINALIZE_LEASE_SECONDS", 180, 30, 900)
+    finalize_lease_seconds: int = _bounded_int("FINALIZE_LEASE_SECONDS", 600, 30, 900)
 
     mongodb_uri: str = os.getenv("MONGODB_URI", "").strip()
     mongodb_database: str = os.getenv("MONGODB_DATABASE", "lecture_memo").strip()

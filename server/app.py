@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIQuotaExhaustedError, OpenAIRateLimitError, OpenAIUnavailableError
+from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIInvalidResponseError, OpenAIQuotaExhaustedError, OpenAIRateLimitError, OpenAIUnavailableError
 from .schemas import ArchiveRequest, ArchiveResponse, ChunkResponse, DocumentListResponse, HealthResponse, SessionCreateRequest, SessionCreateResponse, SessionResumeRequest, SummaryResponse, TranscriptSegment
 from .settings import settings
 from .storage import create_store, utcnow
@@ -96,6 +96,7 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "missing_time_ranges": gaps},
         "missing_time_ranges": gaps,
         "summary_status": "completed" if status == "completed" else ("processing" if status == "finalize_pending" else "not_run"),
+        "summary_error_code": None,
         "summary": summary.model_dump() if summary else (existing or {}).get("summary"),
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
         "resume_status": "not_needed" if status == "completed" else "available", "resume_available_until": None if status == "completed" else draft.get("expire_at"),
@@ -390,6 +391,7 @@ def _provider_error(exc: Exception, chunk_id: str | None = None) -> ApiError:
     if isinstance(exc, OpenAIRateLimitError): return ApiError(429, "openai_rate_limited", str(exc), retryable=True, action="retry_later", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
     if isinstance(exc, OpenAIUnavailableError): return ApiError(503, "openai_overloaded", str(exc), retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
     if isinstance(exc, OpenAIInvalidRequestError): return ApiError(422, "openai_invalid_request", str(exc), retryable=False, action="keep_chunk", chunk_id=chunk_id)
+    if isinstance(exc, OpenAIInvalidResponseError): return ApiError(502, "openai_invalid_response", str(exc), retryable=True, action="retry_later", chunk_id=chunk_id)
     return ApiError(502, "openai_request_failed", "OpenAI 요청에 실패했습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id)
 
 
@@ -500,15 +502,25 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
     if not await store.claim_finalize(user.user_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()): raise ApiError(409, "finalize_in_progress", "최종 요약이 이미 처리 중입니다.", retryable=True, action="retry_later")
     try:
         interim = await _write_partial(user.user_id, session_id, status="finalize_pending", expected=expected, archive=payload); transcript = interim["transcript"]["text"]
-        await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
-        try: summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
+        try:
+            await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
+        except TimeoutError:
+            error = ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="retry_later", retry_after_seconds=15)
+            await store.update_document_for_session(user.user_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+            raise error
+        try:
+            try:
+                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
+            except Exception as exc:
+                error = _provider_error(exc)
+                await store.record_provider_state(error.code, error.retry_after_seconds)
+                await store.update_document_for_session(user.user_id, session_id, {"summary_status": "failed", "summary_error_code": error.code, "updated_at": utcnow()})
+                raise error from exc
         finally: openai_slots.release()
         doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload, summary=summary, summary_meta=summary_meta)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"summary_requests": 1}); await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
         return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), summary=summary)
     except ApiError: raise
-    except Exception as exc:
-        error = _provider_error(exc); await store.record_provider_state(error.code, error.retry_after_seconds); raise error from exc
     finally: await store.release_finalize(user.user_id, session_id)
 
 

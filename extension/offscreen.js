@@ -229,6 +229,7 @@
       );
       error.code = payload?.error?.code || "http_error";
       error.action = payload?.error?.action || null;
+      error.retryable = payload?.error?.retryable === true;
       throw error;
     }
     return payload;
@@ -267,6 +268,7 @@
       openai_rate_limited: "rate_limited",
       openai_overloaded: "overloaded",
       openai_invalid_request: "invalid_request",
+      openai_invalid_response: "request_failed",
       openai_request_failed: "request_failed"
     };
     const state = providerStates[error?.code];
@@ -1056,7 +1058,7 @@
           capture_gaps: session.gaps
         })
       },
-      60_000
+      REQUEST_TIMEOUT_MS
     );
     const payload = await assertResponse(response);
     if (payload?.summary) {
@@ -1088,8 +1090,12 @@
       } catch (error) {
         lastError = error;
         recordProviderFailure(error);
-        if (error?.status === 429 || (error?.status && error.status !== 503) || attempt >= 3) break;
-        const waitMs = Core.transientRetryDelayMs(attempt + 1);
+        const retryable = !error?.status || error?.retryable === true || (error?.status === 409 && error?.code === "finalize_in_progress");
+        if (!retryable || error?.code === "openai_quota_exhausted" || attempt >= 3) break;
+        const retryAfterSeconds = Number(error?.retryAfter);
+        const waitMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? Math.min(300_000, Math.max(1_000, retryAfterSeconds * 1_000))
+          : Core.transientRetryDelayMs(attempt + 1);
         session.notice = `최종 저장이 지연되어 ${Math.ceil(waitMs / 1000)}초 후 다시 시도합니다.`;
         broadcastSnapshot();
         await delay(waitMs);
@@ -1118,6 +1124,10 @@
     closeGap();
     session.stoppedAtEpochMs = Date.now();
     try {
+      session.finalizePending = true;
+      await preserveSessionMarker("FINALIZE_PENDING");
+      session.notice = "최종 요약과 문서를 저장하고 있습니다.";
+      broadcastSnapshot();
       const archive = await archiveServerSessionWithRetry();
       session.notice = archive?.saved
         ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`

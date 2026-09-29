@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class HealthResponse(BaseModel):
@@ -76,6 +76,13 @@ class SummaryResponse(BaseModel):
     terms: list[str] = Field(max_length=100)
     highlights: list[str] = Field(max_length=100)
     checklist: list[str] = Field(max_length=100)
+
+    @field_validator("summary")
+    @classmethod
+    def summary_must_have_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("요약 본문이 비어 있습니다.")
+        return value
 
 
 class ArchiveRequest(BaseModel):

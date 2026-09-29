@@ -120,6 +120,11 @@ class InMemoryStore:
     async def get_document_for_session(self, owner_id: str, session_id: str) -> dict[str, Any] | None:
         async with self.lock: return public_document(self.documents.get((owner_id, session_id)))
 
+    async def update_document_for_session(self, owner_id: str, session_id: str, values: dict[str, Any]) -> None:
+        async with self.lock:
+            row = self.documents.get((owner_id, session_id))
+            if row: row.update(deepcopy(values))
+
     async def list_documents(self, owner_id: str, limit: int) -> list[dict[str, Any]]:
         async with self.lock: rows = [public_document(v) for (o, _), v in self.documents.items() if o == owner_id]
         return sorted((v for v in rows if v), key=lambda v: v.get("requested_at") or v.get("created_at") or utcnow(), reverse=True)[:limit]
@@ -349,6 +354,8 @@ class MongoStore(InMemoryStore):
             return public_document(self.documents.find_one(identity)) or {}
         return await asyncio.to_thread(save)
     async def get_document_for_session(self, owner_id: str, session_id: str) -> dict[str, Any] | None: return public_document(await asyncio.to_thread(self.documents.find_one, {"owner_id": owner_id, "session_id": session_id}))
+    async def update_document_for_session(self, owner_id: str, session_id: str, values: dict[str, Any]) -> None:
+        await asyncio.to_thread(self.documents.update_one, {"owner_id": owner_id, "session_id": session_id}, {"$set": values})
     async def list_documents(self, owner_id: str, limit: int) -> list[dict[str, Any]]: return await asyncio.to_thread(lambda: [public_document(v) or {} for v in self.documents.find({"owner_id": owner_id}).sort("requested_at", -1).limit(limit)])
     async def get_document(self, owner_id: str, document_id: str) -> dict[str, Any] | None: return public_document(await asyncio.to_thread(self.documents.find_one, {"owner_id": owner_id, "document_id": document_id}))
     async def delete_document(self, owner_id: str, document_id: str) -> str | None:

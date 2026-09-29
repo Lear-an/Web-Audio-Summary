@@ -149,7 +149,7 @@ GPT-6 Luna는 이 구조에서 오디오 입력을 처리하지 않으므로 오
 - 전사문은 신뢰할 수 없는 데이터로 취급하고 전사문 안의 명령을 수행하지 않도록 시스템 지침에 명시
 - `prompt_version`, `schema_version`, `requested_model`, `resolved_model` 기록
 
-한국어 변환 출력은 `language`, `translated`, `segments[]`, `warnings[]`를 요구합니다. 최종 요약은 `summary`, `concepts`, `terms`, `highlights`, `checklist`를 요구합니다. 최종 요약 입력은 완성된 전사만 사용하며 북마크·시점 메모는 생성하거나 포함하지 않습니다.
+한국어 변환 출력은 `language`, `translated`, `segments[]`, `warnings[]`를 요구합니다. 최종 요약은 `summary`, `concepts`, `terms`, `highlights`, `checklist`를 요구하며 `summary`가 빈 문자열 또는 공백뿐이면 실패로 처리합니다. 최종 요약 입력은 완성된 전사만 사용하며 북마크·시점 메모는 생성하거나 포함하지 않습니다.
 
 엄격한 스키마 검증 실패나 반복 번역 실패가 확인된 경우에만 선택적 fallback을 허용합니다.
 
@@ -432,13 +432,17 @@ archive 순서:
 5. 순번 누락 또는 길이가 0보다 큰 녹음 중단 구간이 있으면 `incomplete`와 `missing_sequences`·`missing_time_ranges`를 반환하고 최종 요약 생략
 6. 두 종류의 누락이 모두 없을 때만 finalize lease 획득
 7. 전체 한국어 자막 조합과 BSON·요약 입력 크기 검사
-8. GPT-6 Luna 최종 요약 한 번 실행
+8. GPT-6 Luna 최종 요약 실행. 일시적 연결·시간 초과·속도 제한은 제한된 횟수로 재시도할 수 있으며, 최종 결과는 한 번만 DB에 확정
 9. 요약 본문·요약 메타데이터·`summary_status=completed`·`status=completed`를 같은 문서의 단일 원자적 쓰기로 확정
 10. 완료 저장 성공 후 세션·청크 초안 삭제
 
 신규 확장 프로그램은 archive 요청에 북마크를 보내지 않으며 서버는 전사만으로 최종 요약을 생성합니다. 이전 확장 프로그램과의 전환 기간에는 레거시 `bookmarks` 입력 필드를 선택적으로 받아도 저장하거나 OpenAI 요약에 전달하지 않습니다. 기존 완료 문서의 필드는 보존하며, 레거시 입력 허용을 제거하는 변경은 구버전 확장 프로그램 지원 종료 후 별도로 수행합니다.
 
 요약이 포함된 완료 문서가 이미 있으면 초안 정리를 다시 시도한 뒤 기존 결과를 반환합니다. finalization 도중 실패하면 자막 문서를 유지하고 `finalize_pending`과 오류 코드를 기록합니다. 요약이 없는 문서를 완료 응답으로 반환하지 않습니다.
+
+최종 저장 요청은 클라이언트에서 최대 480초를 기다립니다. 서버의 GPT 요청은 건당 60초, 재시도 대기는 회당 최대 60초로 제한하고 finalize lease는 600초로 유지합니다. 캡처 종료 시 브라우저는 요청 전에 `FINALIZE_PENDING` 마커를 IndexedDB에 기록해 패널 종료·네트워크 단절 뒤에도 같은 세션을 재시도할 수 있게 합니다. `409 finalize_in_progress`, 재시도 가능한 `429`·`502`·`503` 응답은 지연 후 다시 요청하고, 할당량 소진과 영구적인 `422`는 자동 재시도하지 않습니다. 재시도 전에 완료 문서가 확인되면 기존 결과를 반환합니다.
+
+요약 실패 시 문서의 `summary_status=failed`와 `summary_error_code`를 기록합니다. 구조화 응답의 요약 본문이 비어 있는 경우 서버 검증에서 거부하고 재시도 가능한 `openai_invalid_response`로 반환합니다. DB 저장 오류를 OpenAI 오류로 바꿔 표시하지 않으며, 오류가 나도 전사 초안과 보존 청크는 유지합니다. 누락 청크 또는 실제 녹음 중단 구간이 있는 문서는 `summary_status=not_run`으로 남고 요약을 생성하지 않습니다.
 
 ### 8.4 문서 조회
 
@@ -585,6 +589,7 @@ MAX_DOCUMENT_BYTES=12000000
 DRAFT_RETENTION_DAYS=7
 SESSION_IDLE_TTL_SECONDS=1800
 PROCESSING_LEASE_SECONDS=180
+FINALIZE_LEASE_SECONDS=600
 DAILY_AUDIO_MINUTES_LIMIT_PER_USER=0
 DAILY_AUDIO_MINUTES_LIMIT_TOTAL=0
 ```
@@ -689,6 +694,9 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 종료 후 보존 청크 재처리는 새 tabCapture 없이 가능하고, `saved=false`는 완료로 표시하지 않습니다.
 - 녹음 중단 구간이 있으면 순번이 모두 READY여도 `missing_time_ranges`가 있는 미완료 문서로 남습니다.
 - 모든 청크가 준비된 경우에만 최종 요약이 한 번 DB 결과로 반영됩니다.
+- 빈 문자열 또는 공백뿐인 요약은 완료로 저장하지 않습니다.
+- 60초를 넘는 GPT 응답·일시적 `502`·처리 중 `409` 뒤에도 최종 저장을 재시도하고 중복 문서를 만들지 않습니다.
+- 요약 실패 문서는 `summary_status=failed`와 원인 코드가 남으며, 재시도 성공 시 코드가 지워집니다.
 - `completed` 문서는 요약 본문과 요약 메타데이터를 같은 원자적 쓰기로 포함합니다.
 
 ### 복구·데이터 수명

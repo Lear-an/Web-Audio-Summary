@@ -22,8 +22,9 @@ os.environ["OPENAI_TEXT_MODEL"] = "gpt-6-luna"
 
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server.app import _absolute_segments, _source_metadata, app, auth_failures, gateway, sessions, settings, store  # noqa: E402
-from server.openai_client import OpenAIQuotaExhaustedError, OpenAIUnavailableError  # noqa: E402
+from server.app import _absolute_segments, _provider_error, _source_metadata, app, auth_failures, gateway, sessions, settings, store  # noqa: E402
+from server.openai_client import OpenAIInvalidResponseError, OpenAIQuotaExhaustedError, OpenAIUnavailableError  # noqa: E402
+from server.schemas import SummaryResponse  # noqa: E402
 from server.settings import Settings  # noqa: E402
 from server.storage import utcnow  # noqa: E402
 
@@ -527,6 +528,48 @@ def test_completed_document_is_written_with_summary_in_same_update(monkeypatch) 
         response = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
         assert response.status_code == 200
         assert len(completed_writes) == 1
+
+
+def test_blank_summary_is_rejected() -> None:
+    for value in ("", "  \n  "):
+        with pytest.raises(ValueError):
+            SummaryResponse(summary=value, concepts=[], terms=[], highlights=[], checklist=[])
+
+
+def test_provider_timeout_is_retryable() -> None:
+    assert isinstance(gateway._map_error(TimeoutError()), OpenAIUnavailableError)
+
+
+def test_invalid_provider_response_is_retryable() -> None:
+    error = _provider_error(OpenAIInvalidResponseError("빈 요약"))
+    assert error.status_code == 502
+    assert error.retryable is True
+
+
+def test_summary_failure_is_recorded_and_archive_can_retry(monkeypatch) -> None:
+    original = gateway.summarize
+
+    async def unavailable(**_kwargs):
+        raise OpenAIUnavailableError()
+
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id).status_code == 200
+        monkeypatch.setattr(gateway, "summarize", unavailable)
+        failed = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert failed.status_code == 503
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["status"] == "finalize_pending"
+        assert document["summary_status"] == "failed"
+        assert document["summary_error_code"] == "openai_overloaded"
+
+        monkeypatch.setattr(gateway, "summarize", original)
+        recovered = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1})
+        assert recovered.status_code == 200
+        assert recovered.json()["saved"] is True
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["summary_status"] == "completed"
+        assert document["summary_error_code"] is None
 
 
 def test_reconcile_expires_stale_session_after_restart() -> None:

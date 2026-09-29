@@ -109,3 +109,45 @@ test("preserved session finalizes without requesting a new tab capture stream", 
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls.map((url) => url.slice(url.lastIndexOf("/"))), ["/resume", "/archive"]);
 });
+
+test("archive retries a retryable server failure before completing", async () => {
+  let attempts = 0;
+  const removed = [];
+  const context = vm.createContext({
+    AbortController, clearTimeout, setTimeout, URL,
+    LectureCore: { transientRetryDelayMs: () => 0 },
+    LectureDiscard: {},
+    LectureConfig: { SERVER_BASE_URL: "https://example.test", OUTBOX_MAX_BYTES: 128 * 1024 * 1024 },
+    LectureOutbox: { remove: async (id) => removed.push(id) },
+    chrome: { runtime: { onMessage: { addListener: () => {} }, sendMessage: async () => ({ ok: true }) } },
+    fetch: async () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return {
+          ok: false, status: 502,
+          json: async () => ({ error: { code: "openai_request_failed", message: "일시적 오류", retryable: true } }),
+          headers: { get: () => null }
+        };
+      }
+      return {
+        ok: true, status: 200,
+        json: async () => ({ saved: true, status: "completed", document_id: "doc", summary: { summary: "복구된 요약" } }),
+        headers: { get: () => null }
+      };
+    }
+  });
+  vm.runInContext(fs.readFileSync(path.resolve(__dirname, "../../extension/protocol.js"), "utf8"), context);
+  const source = fs.readFileSync(path.resolve(__dirname, "../../extension/offscreen.js"), "utf8");
+  const instrumented = source.replace(/\}\)\(\);\s*$/, "globalThis.__setSessionForTest = (patch) => Object.assign(session, patch);\nglobalThis.__archiveForTest = archiveServerSessionWithRetry;\n})();");
+  assert.notEqual(instrumented, source);
+  vm.runInContext(instrumented, context);
+  context.__setSessionForTest({
+    serverSessionId: "session", serverBaseUrl: "https://example.test",
+    userId: "user", accessToken: "code", nextSequence: 1,
+    startedAtEpochMs: Date.now() - 60_000, stoppedAtEpochMs: Date.now()
+  });
+  const result = await context.__archiveForTest();
+  assert.equal(result.saved, true);
+  assert.equal(attempts, 2);
+  assert.deepEqual(removed, ["session:session"]);
+});
