@@ -102,6 +102,7 @@ class ArchiveResponse(BaseModel):
     chunk_count: int
     missing_sequences: list[int] = Field(default_factory=list)
     unverified_sequences: list[int] = Field(default_factory=list)
+    accepted_untranscribed_sequences: list[int] = Field(default_factory=list)
     missing_time_ranges: list[dict[str, Any]] = Field(default_factory=list)
     summary: SummaryResponse | None = None
 

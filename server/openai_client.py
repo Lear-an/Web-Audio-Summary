@@ -154,6 +154,7 @@ class OpenAIGateway:
         duration_ms: int,
         safety_identifier: str,
         language_hint: str = "auto",
+        context_text: str = "",
     ) -> TranscriptionResult:
         if self.settings.mock_openai:
             text = f"[모의 자막] 청크 {sequence}"
@@ -178,13 +179,20 @@ class OpenAIGateway:
 
         async def request() -> Any:
             english_hint = language_hint in {"en", "eng", "english"}
+            prompt = "Transcribe this lecture accurately. Preserve spoken technical terms, product names, and acronyms. Do not guess inaudible words." if english_hint else (
+                "한국어 강의를 정확히 전사하세요. 발화한 영어 기술 용어, 제품명, 약어는 원문 표기를 유지하세요. "
+                "들리지 않는 내용은 추측하지 마세요."
+            )
+            if context_text.strip():
+                prompt += (
+                    f" Previous-chunk context only; do not include words absent from this audio: {context_text.strip()[-160:]}"
+                    if english_hint else
+                    f" 앞 구간의 참고 문맥입니다. 이번 음성에 없는 말은 출력하지 마세요: {context_text.strip()[-160:]}"
+                )
             kwargs: dict[str, Any] = {
                 "file": (f"chunk-{sequence:06d}.webm", audio_bytes, mime_type),
                 "model": self.settings.openai_transcribe_model,
-                "prompt": "Transcribe this lecture accurately. Preserve spoken technical terms, product names, and acronyms. Do not guess inaudible words." if english_hint else (
-                    "한국어 강의를 정확히 전사하세요. 발화한 영어 기술 용어, 제품명, 약어는 원문 표기를 유지하세요. "
-                    "들리지 않는 내용은 추측하지 마세요."
-                ),
+                "prompt": prompt,
             }
             languages = ["ko", "en"] if language_hint in {"auto", "mixed", "ko", "kor", "korean"} else [language_hint]
             kwargs["extra_body"] = {"languages": languages}

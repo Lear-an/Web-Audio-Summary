@@ -25,6 +25,7 @@ from .openai_client import OpenAIGateway, OpenAIInvalidRequestError, OpenAIInval
 from .schemas import ArchiveRequest, ArchiveResponse, ChunkResponse, DocumentListResponse, HealthResponse, SessionCreateRequest, SessionCreateResponse, SessionResumeRequest, SummaryResponse, TranscriptSegment
 from .settings import settings
 from .storage import create_store, utcnow
+from .transcript_quality import choose_verified, current_from_review, repeated_prefix, verification_reason
 
 logger = logging.getLogger("lecture_memo")
 store = create_store(settings)
@@ -81,6 +82,7 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
     chunks = [row for row in await store.list_chunks(owner_id, session_id) if row.get("status") == "ready"]
     segments = _absolute_segments(chunks)
     unverified = [int(row["sequence"]) for row in chunks if row.get("review_required")]
+    accepted_untranscribed = [int(row["sequence"]) for row in chunks if row.get("untranscribed_after_retry")]
     now = utcnow()
     existing = await store.get_document_for_session(owner_id, session_id)
     gaps = _capture_gaps(archive.capture_gaps) if archive and archive.capture_gaps else (existing or {}).get("missing_time_ranges", [])
@@ -95,12 +97,12 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         "schema_version": 8, "document_id": draft["document_id"], "session_id": session_id, "owner_id": owner_id,
         "status": status, "source": {"url": _canonical_url(draft.get("source_url", "")), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
         "requested_at": draft.get("created_at", now), "updated_at": now, "completed_at": now if status == "completed" else None,
-        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "last_applied_sequence": max((int(row["sequence"]) for row in chunks), default=-1), "expected_chunk_count": expected, "missing_sequences": missing or [], "unverified_sequences": unverified},
-        "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "unverified_sequences": unverified, "missing_time_ranges": gaps},
+        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "last_applied_sequence": max((int(row["sequence"]) for row in chunks), default=-1), "expected_chunk_count": expected, "missing_sequences": missing or [], "unverified_sequences": unverified, "accepted_untranscribed_sequences": accepted_untranscribed},
+        "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "unverified_sequences": unverified, "accepted_untranscribed_sequences": accepted_untranscribed, "missing_time_ranges": gaps},
         "missing_time_ranges": gaps,
-        "summary_status": "completed" if status == "completed" or (keep_partial_summary and (existing or {}).get("summary")) else ("processing" if status == "finalize_pending" else "not_run"),
+        "summary_status": "completed" if summary or (keep_partial_summary and (existing or {}).get("summary")) else ("processing" if status == "finalize_pending" else "not_run"),
         "summary_error_code": None,
-        "summary_scope": "complete" if status == "completed" else ("partial" if keep_partial_summary else None),
+        "summary_scope": ("partial" if accepted_untranscribed else "complete") if status == "completed" and summary else ("partial" if keep_partial_summary else None),
         "summary": summary.model_dump() if summary else ((existing or {}).get("summary") if keep_partial_summary else None),
         "summary_provider": (existing or {}).get("summary_provider") if keep_partial_summary else None,
         "duration_ms": archive.duration_ms if archive else (existing or {}).get("duration_ms", 0),
@@ -407,15 +409,7 @@ def _absolute_segments(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _trim_repeated_prefix(previous_text: str, current_text: str) -> str:
-    previous_words = re.findall(r"\S+", previous_text)
-    current_words = list(re.finditer(r"\S+", current_text))
-    normalized_previous = [re.sub(r"\W+", "", word).casefold() for word in previous_words]
-    normalized_current = [re.sub(r"\W+", "", match.group()).casefold() for match in current_words]
-    for count in range(min(len(previous_words), len(current_words), 8), 0, -1):
-        repeated = normalized_current[:count]
-        if count < len(current_words) and (count >= 2 or sum(map(len, repeated)) >= 8) and all(repeated) and normalized_previous[-count:] == repeated:
-            return current_text[current_words[count].start():].strip()
-    return current_text
+    return repeated_prefix(previous_text, current_text)
 
 
 def _dedupe_chunk_boundary(segments: list[dict[str, Any]], previous: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -477,7 +471,7 @@ async def resume_session(session_id: str, _payload: SessionResumeRequest, user: 
 
 
 @app.post("/v1/sessions/{session_id}/chunks", response_model=ChunkResponse)
-async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], capture_start_ms: Annotated[int, Form(ge=0)], capture_end_ms: Annotated[int, Form(ge=1)], video_start_ms: Annotated[int, Form(ge=0)], playback_rate: Annotated[float, Form(gt=0, le=16)], overlap_ms: Annotated[int, Form(ge=0)], mime_type: Annotated[str, Form()], audio: Annotated[UploadFile, File()], audio_signal_status: Annotated[Literal["quiet", "non_silent", "unknown"], Form()] = "unknown", review_retry: Annotated[bool, Form()] = False, review_handling_version: Annotated[int, Form(ge=0)] = 0, user: AuthenticatedUser = Depends(authorize)) -> ChunkResponse:
+async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], capture_start_ms: Annotated[int, Form(ge=0)], capture_end_ms: Annotated[int, Form(ge=1)], video_start_ms: Annotated[int, Form(ge=0)], playback_rate: Annotated[float, Form(gt=0, le=16)], overlap_ms: Annotated[int, Form(ge=0)], mime_type: Annotated[str, Form()], audio: Annotated[UploadFile, File()], audio_signal_status: Annotated[Literal["quiet", "non_silent", "unknown"], Form()] = "unknown", review_retry: Annotated[bool, Form()] = False, review_handling_version: Annotated[int, Form(ge=0)] = 0, review_audio: Annotated[UploadFile | None, File()] = None, review_duration_ms: Annotated[int, Form(ge=0, le=30000)] = 0, user: AuthenticatedUser = Depends(authorize)) -> ChunkResponse:
     record = await _active_record(user, session_id); audio_bytes = await audio.read(settings.max_chunk_bytes + 1)
     if not audio_bytes or len(audio_bytes) > settings.max_chunk_bytes: raise ApiError(413, "chunk_too_large", "오디오 청크가 비어 있거나 너무 큽니다.", action="keep_chunk")
     duration_ms = capture_end_ms - capture_start_ms
@@ -490,6 +484,7 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
             raise ApiError(422, "empty_transcript_unverified", "전사 확인 필요: 확장 프로그램을 새로고침한 뒤 보존 청크를 다시 처리해 주세요.", action="keep_chunk", chunk_id=chunk_id)
         if old and old.get("status") == "ready" and review_retry and old.get("review_required"):
             if old.get("audio_sha256") != digest: raise ApiError(409, "chunk_conflict", "같은 순번의 청크 내용이 다릅니다.", action="keep_chunk")
+            retry_attempts = 0
             for transcription_attempt in range(2):
                 await _check_daily_budget(user.user_id, duration_ms, chunk_id)
                 try:
@@ -504,13 +499,21 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
                 finally:
                     openai_slots.release()
                     await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": duration_ms, "transcription_requests": 1})
+                    retry_attempts += 1
                 if result.original_text.strip(): break
             else:
-                return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in old.get("segments", [])], review_required=True)
+                segments = old.get("segments", [])
+                replaced = await store.replace_review_chunk(user.user_id, session_id, sequence, digest, {"review_required": False, "untranscribed_after_retry": True, "review_attempt_count": retry_attempts, "updated_at": utcnow()})
+                if not replaced: raise ApiError(409, "chunk_conflict", "검토 청크 상태가 변경되었습니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
+                await _write_partial(user.user_id, session_id)
+                return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in segments])
             segments = [v.model_dump() for v in result.transcript.segments]
             previous = await store.get_chunk(user.user_id, session_id, sequence - 1) if sequence else None
             segments = _dedupe_chunk_boundary(segments, previous)
-            replaced = await store.replace_review_chunk(user.user_id, session_id, sequence, digest, {"segments": segments, "review_required": False, "original_text": result.original_text, "detected_language": result.language, "provider_request_id": result.provider_request_id, "resolved_model": result.resolved_model, "usage": result.usage, "updated_at": utcnow()})
+            if result.language in {"ko", "unknown"}:
+                for segment in segments:
+                    segment["original_text"] = None
+            replaced = await store.replace_review_chunk(user.user_id, session_id, sequence, digest, {"segments": segments, "review_required": False, "untranscribed_after_retry": False, "review_attempt_count": retry_attempts, "detected_language": result.language, "provider_request_id": result.provider_request_id, "resolved_model": result.resolved_model, "usage": result.usage, "updated_at": utcnow()})
             if not replaced: raise ApiError(409, "chunk_conflict", "검토 청크 상태가 변경되었습니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
             await _write_partial(user.user_id, session_id)
             return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in segments])
@@ -532,27 +535,62 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
                 await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
             await _write_partial(user.user_id, session_id)
             return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in cached.get("segments", [])], review_required=bool(cached.get("review_required")))
+        previous = await store.get_chunk(user.user_id, session_id, sequence - 1) if sequence else None
+        previous_segments = (previous or {}).get("segments") or []
+        previous_text = str(previous_segments[-1].get("text") or "") if previous_segments else ""
+        verification = None
+        verification_attempted = False
+        first_result = None
         for transcription_attempt in range(2):
+            use_wider = False
+            retry_bytes = audio_bytes
+            retry_duration = duration_ms
+            if transcription_attempt and review_audio and previous_text:
+                wider = await review_audio.read(settings.max_chunk_bytes + 1)
+                use_wider = bool(wider and len(wider) <= settings.max_chunk_bytes and 15_000 < review_duration_ms <= 30_000)
+                if use_wider:
+                    retry_bytes = wider
+                    retry_duration = review_duration_ms
             try:
-                await _check_daily_budget(user.user_id, duration_ms, chunk_id)
+                await _check_daily_budget(user.user_id, retry_duration, chunk_id)
             except ApiError as error:
+                if first_result is not None and first_result.original_text.strip():
+                    break
                 await store.finish_chunk(claim, {"status": "blocked", "last_error": error.code})
                 raise
             try:
                 await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
             except TimeoutError:
+                if first_result is not None and first_result.original_text.strip():
+                    break
                 await store.finish_chunk(claim, {"status": "retry_wait", "last_error": "ai_backpressure"}); raise ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=15)
             provider_exception = None
             try:
-                result = await gateway.transcribe(audio_bytes=audio_bytes, mime_type=mime_type, sequence=sequence, duration_ms=duration_ms, safety_identifier=_safety_id(user.user_id), language_hint=record.language)
+                if transcription_attempt:
+                    verification_attempted = True
+                candidate = await gateway.transcribe(audio_bytes=retry_bytes, mime_type=mime_type, sequence=sequence, duration_ms=retry_duration, safety_identifier=_safety_id(user.user_id), language_hint=record.language, context_text=previous_text if transcription_attempt and not use_wider else "")
             except Exception as exc:
                 provider_exception = exc
             finally:
                 openai_slots.release()
-            await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": duration_ms, "transcription_requests": 1})
+            await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": retry_duration, "transcription_requests": 1})
             if provider_exception is not None:
+                if first_result is not None and first_result.original_text.strip():
+                    break
                 error = _provider_error(provider_exception, chunk_id); await store.record_provider_state(error.code, error.retry_after_seconds); await store.finish_chunk(claim, {"status": "retry_wait" if error.retryable else "blocked", "last_error": error.code}); raise error from provider_exception
-            if result.original_text.strip() or audio_signal_status == "quiet":
+            if transcription_attempt == 0:
+                first_result = candidate
+                result = candidate
+                verification = verification_reason(candidate.original_text, audio_signal_status, duration_ms, previous_text)
+                if verification is None:
+                    break
+                continue
+            reviewed_text = current_from_review(previous_text, candidate.original_text) if use_wider else candidate.original_text
+            if reviewed_text is not None and (not use_wider or candidate.language in {"ko", "unknown"}) and choose_verified(first_result.original_text, reviewed_text, verification or ""):
+                result = candidate
+                if use_wider:
+                    result.original_text = reviewed_text
+                    result.transcript.segments = [TranscriptSegment(relative_start_ms=0, relative_end_ms=max(1, duration_ms), text=reviewed_text, original_text=reviewed_text, uncertain=True)]
                 break
         review_required = not result.original_text.strip() and audio_signal_status != "quiet"
         if review_required and review_handling_version < 1:
@@ -561,9 +599,11 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
         segments = [v.model_dump() for v in result.transcript.segments]
         if review_required:
             segments = [TranscriptSegment(relative_start_ms=0, relative_end_ms=max(1, duration_ms), text="...", original_text="", uncertain=True).model_dump()]
-        previous = await store.get_chunk(user.user_id, session_id, sequence - 1) if sequence else None
         segments = _dedupe_chunk_boundary(segments, previous)
-        saved = await store.finish_chunk(claim, {"status": "ready", "segments": segments, "review_required": review_required, "timestamp_uncertain": True, "silence_confirmed": not result.original_text.strip() and audio_signal_status == "quiet", "detected_language": result.language, "original_text": result.original_text, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-gpt-v1", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
+        if result.language in {"ko", "unknown"}:
+            for segment in segments:
+                segment["original_text"] = None
+        saved = await store.finish_chunk(claim, {"status": "ready", "segments": segments, "review_required": review_required, "timestamp_uncertain": True, "silence_confirmed": not result.original_text.strip() and audio_signal_status == "quiet", "detected_language": result.language, "verification_reason": verification, "verification_attempted": verification_attempted, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-gpt-v2", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
         if not saved:
             raise ApiError(409, "chunk_processing", "다른 처리 시도가 이 청크를 갱신했습니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
         await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
@@ -576,7 +616,7 @@ async def _summarize_incomplete(owner_id: str, session_id: str, document: dict[s
     transcript = "\n".join(
         segment.get("text", "")
         for segment in document.get("transcript", {}).get("segments", [])
-        if not segment.get("review_required") and segment.get("text", "").strip()
+        if not segment.get("review_required") and segment.get("text", "").strip() not in {"", "..."}
     )
     if not transcript.strip() or (document.get("summary_scope") == "partial" and document.get("summary")):
         return document
@@ -618,9 +658,9 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
     if payload.duration_ms > settings.max_session_duration_seconds * 1000:
         raise ApiError(422, "session_too_long", "세션 길이가 운영 상한을 초과했습니다.", action="keep_chunks")
     existing = await store.get_document_for_session(user.user_id, session_id)
-    if existing and existing.get("status") == "completed" and existing.get("summary"):
+    if existing and existing.get("status") == "completed":
         await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
-        return ArchiveResponse(saved=True, status="completed", document_id=existing["document_id"], chunk_count=existing.get("chunk_state", {}).get("ready_count", 0), summary=existing["summary"])
+        return ArchiveResponse(saved=True, status="completed", document_id=existing["document_id"], chunk_count=existing.get("chunk_state", {}).get("ready_count", 0), accepted_untranscribed_sequences=existing.get("chunk_state", {}).get("accepted_untranscribed_sequences", []), summary=existing.get("summary"))
     draft = await _owned_draft(user, session_id); chunks = [v for v in await store.list_chunks(user.user_id, session_id) if v.get("status") == "ready"]
     expected = max(payload.expected_chunk_count, max((int(v["sequence"]) for v in chunks), default=-1) + 1); present = {int(v["sequence"]) for v in chunks}; missing = [v for v in range(expected) if v not in present]
     unverified = [int(v["sequence"]) for v in chunks if v.get("review_required")]
@@ -632,11 +672,16 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
             doc = await _summarize_incomplete(user.user_id, session_id, doc)
         finally:
             sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
-        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, unverified_sequences=unverified, missing_time_ranges=gaps, summary=doc.get("summary"))
+        return ArchiveResponse(saved=False, status="incomplete", document_id=doc["document_id"], chunk_count=len(chunks), missing_sequences=missing, unverified_sequences=unverified, accepted_untranscribed_sequences=doc["chunk_state"]["accepted_untranscribed_sequences"], missing_time_ranges=gaps, summary=doc.get("summary"))
     attempt_id = str(uuid.uuid4())
     if not await store.claim_finalize(user.user_id, session_id, attempt_id, _lease_until(settings.finalize_lease_seconds), utcnow()): raise ApiError(409, "finalize_in_progress", "최종 요약이 이미 처리 중입니다.", retryable=True, action="retry_later")
     try:
-        interim = await _write_partial(user.user_id, session_id, status="finalize_pending", expected=expected, archive=payload); transcript = interim["transcript"]["text"]
+        interim = await _write_partial(user.user_id, session_id, status="finalize_pending", expected=expected, archive=payload)
+        transcript = "\n".join(segment.get("text", "") for segment in interim["transcript"]["segments"] if segment.get("text", "").strip() not in {"", "..."})
+        if not transcript.strip():
+            doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload)
+            await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
+            return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), accepted_untranscribed_sequences=doc["chunk_state"]["accepted_untranscribed_sequences"])
         try:
             await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
         except TimeoutError:
@@ -645,7 +690,7 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
             raise error
         try:
             try:
-                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id))
+                summary, summary_meta = await gateway.summarize(transcript=transcript, safety_identifier=_safety_id(user.user_id), partial=bool(interim["chunk_state"]["accepted_untranscribed_sequences"]))
             except Exception as exc:
                 error = _provider_error(exc)
                 await store.record_provider_state(error.code, error.retry_after_seconds)
@@ -654,7 +699,7 @@ async def archive_session(session_id: str, payload: ArchiveRequest, user: Authen
         finally: openai_slots.release()
         doc = await _write_partial(user.user_id, session_id, status="completed", expected=expected, archive=payload, summary=summary, summary_meta=summary_meta)
         await store.record_usage(user.user_id, utcnow().date().isoformat(), {"summary_requests": 1}); await store.delete_drafts(user.user_id, session_id); sessions.pop(session_id, None); await store.release_user_lease(user.user_id)
-        return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), summary=summary)
+        return ArchiveResponse(saved=True, status="completed", document_id=doc["document_id"], chunk_count=len(chunks), accepted_untranscribed_sequences=doc["chunk_state"]["accepted_untranscribed_sequences"], summary=summary)
     except ApiError: raise
     finally: await store.release_finalize(user.user_id, session_id)
 
