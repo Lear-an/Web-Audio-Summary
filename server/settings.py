@@ -48,12 +48,12 @@ def _users() -> dict[str, str]:
     return result
 
 
-_chunk_seconds = _bounded_int("AUDIO_CHUNK_SECONDS", 60, 15, 180)
-_overlap_seconds = _bounded_int("AUDIO_CHUNK_OVERLAP_SECONDS", 2, 0, 30)
+_chunk_seconds = _bounded_int("AUDIO_CHUNK_SECONDS", 15, 15, 180)
+_overlap_seconds = _bounded_int("AUDIO_CHUNK_OVERLAP_SECONDS", 1, 0, 30)
 if _overlap_seconds >= _chunk_seconds:
     raise ValueError("AUDIO_CHUNK_OVERLAP_SECONDS는 AUDIO_CHUNK_SECONDS보다 작아야 합니다.")
 
-_audio_bits_per_second = _bounded_int("AUDIO_BITS_PER_SECOND", 128_000, 32_000, 512_000)
+_audio_bits_per_second = _bounded_int("AUDIO_BITS_PER_SECOND", 64_000, 32_000, 512_000)
 _estimated_chunk_bytes = (
     ((_chunk_seconds + _overlap_seconds) * _audio_bits_per_second + 7) // 8 * 125 // 100
 ) + 65_536
@@ -72,7 +72,7 @@ _configured_local_token = os.getenv("LOCAL_ACCESS_TOKEN", "").strip()
 @dataclass(frozen=True, slots=True)
 class Settings:
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "").strip()
-    openai_transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1").strip()
+    openai_transcribe_model: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-transcribe").strip()
     openai_text_model: str = os.getenv("OPENAI_TEXT_MODEL", "gpt-6-luna").strip()
     openai_text_fallback_model: str = os.getenv("OPENAI_TEXT_FALLBACK_MODEL", "gpt-5.6-terra").strip()
     text_fallback_enabled: bool = _as_bool(os.getenv("TEXT_FALLBACK_ENABLED"), False)
@@ -103,7 +103,7 @@ class Settings:
 
     session_idle_ttl_seconds: int = _bounded_int("SESSION_IDLE_TTL_SECONDS", 1800, 60, 86_400)
     incomplete_draft_retention_days: int = _bounded_int("DRAFT_RETENTION_DAYS", 7, 1, 90)
-    processing_lease_seconds: int = _bounded_int("PROCESSING_LEASE_SECONDS", 180, 30, 900)
+    processing_lease_seconds: int = _bounded_int("PROCESSING_LEASE_SECONDS", 360, 30, 900)
     finalize_lease_seconds: int = _bounded_int("FINALIZE_LEASE_SECONDS", 600, 30, 900)
 
     mongodb_uri: str = os.getenv("MONGODB_URI", "").strip()
@@ -118,11 +118,8 @@ class Settings:
     daily_audio_minutes_limit_total: int = _bounded_int("DAILY_AUDIO_MINUTES_LIMIT_TOTAL", 0, 0, 1_000_000)
 
     def __post_init__(self) -> None:
-        if self.openai_transcribe_model != "whisper-1":
-            raise ValueError(
-                "OPENAI_TRANSCRIBE_MODEL은 whisper-1이어야 합니다. "
-                "현재 전사 요청의 구간 타임스탬프는 whisper-1에서만 지원됩니다."
-            )
+        if self.openai_transcribe_model != "gpt-transcribe":
+            raise ValueError("OPENAI_TRANSCRIBE_MODEL은 gpt-transcribe여야 합니다.")
         if self.app_auth_mode not in {"local", "multi_user", "atlas_users"}:
             raise ValueError("APP_AUTH_MODE는 local, multi_user 또는 atlas_users여야 합니다.")
         if self.app_auth_mode == "multi_user" and not self.app_users:

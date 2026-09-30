@@ -11,7 +11,7 @@ services:
       - key: OPENAI_API_KEY
         sync: false
       - key: OPENAI_TRANSCRIBE_MODEL
-        value: whisper-1
+        value: gpt-transcribe
       - key: OPENAI_TEXT_MODEL
         value: gpt-6-luna
       - key: SAFETY_IDENTIFIER_SECRET
@@ -27,9 +27,11 @@ services:
       - key: MOCK_OPENAI
         value: "false"
       - key: AUDIO_CHUNK_SECONDS
-        value: "60"
+        value: "15"
       - key: AUDIO_CHUNK_OVERLAP_SECONDS
-        value: "2"
+        value: "1"
+      - key: AUDIO_BITS_PER_SECOND
+        value: "64000"
       - key: MAX_CHUNK_BYTES
         value: "6000000"
       - key: MAX_REQUEST_BYTES

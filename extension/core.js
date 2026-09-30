@@ -220,6 +220,13 @@
     return Math.min(15 * 60_000, Math.max(5 * 60_000, count * 60_000));
   }
 
+  function classifyAudioActivity(sampleCount, audibleCount, durationMs, failedCount = 0) {
+    if (audibleCount > 0) return "non_silent";
+    const expectedSamples = Math.floor(Math.max(0, durationMs) / 50);
+    if (failedCount > 0 || sampleCount < Math.max(3, Math.floor(expectedSamples * 0.75))) return "unknown";
+    return "quiet";
+  }
+
   return Object.freeze({
     normalizeText,
     diceSimilarity,
@@ -234,6 +241,7 @@
     isRetryableStatus,
     isSessionResumeRequired,
     transientRetryDelayMs,
-    queueDrainTimeoutMs
+    queueDrainTimeoutMs,
+    classifyAudioActivity
   });
 });

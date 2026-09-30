@@ -105,6 +105,14 @@ class InMemoryStore:
             current.update(deepcopy(values))
             return True
 
+    async def replace_review_chunk(self, owner_id: str, session_id: str, sequence: int, audio_sha256: str, values: dict[str, Any]) -> bool:
+        async with self.lock:
+            current = self.chunks.get((owner_id, session_id, sequence))
+            if not current or current.get("status") != "ready" or not current.get("review_required") or current.get("audio_sha256") != audio_sha256:
+                return False
+            current.update(deepcopy(values))
+            return True
+
     async def list_chunks(self, owner_id: str, session_id: str) -> list[dict[str, Any]]:
         async with self.lock: rows = [public_document(v) for k, v in self.chunks.items() if k[:2] == (owner_id, session_id)]
         return sorted((v for v in rows if v), key=lambda v: v["sequence"])
@@ -116,6 +124,26 @@ class InMemoryStore:
                 return public_document(self.documents[key]) or {}
             self.documents[key] = {**self.documents.get(key, {}), **deepcopy(value)}
             return public_document(self.documents[key]) or {}
+
+    async def append_document_chunk(self, owner_id: str, session_id: str, sequence: int, segments: list[dict[str, Any]], text: str, delta_bytes: int, maximum_bytes: int) -> bool:
+        async with self.lock:
+            row = self.documents.get((owner_id, session_id))
+            if not row or row.get("status") != "incomplete" or row.get("transcript", {}).get("last_applied_sequence") != sequence - 1:
+                return False
+            if int(row.get("document_bytes", maximum_bytes)) + delta_bytes > maximum_bytes:
+                return False
+            transcript = row["transcript"]
+            transcript["segments"].extend(deepcopy(segments))
+            transcript["text"] += ("\n" if transcript["text"] and text else "") + text
+            transcript["ready_chunk_count"] += 1
+            transcript["last_applied_sequence"] = sequence
+            transcript["expected_chunk_count"] = None
+            transcript["missing_sequences"] = []
+            row["chunk_state"]["ready_count"] += 1
+            row["chunk_state"]["expected_chunk_count"] = None
+            row["chunk_state"]["missing_sequences"] = []
+            row.update({"summary": None, "summary_provider": None, "summary_scope": None, "summary_status": "not_run", "summary_error_code": None, "document_bytes": int(row["document_bytes"]) + delta_bytes, "updated_at": utcnow()})
+            return True
 
     async def get_document_for_session(self, owner_id: str, session_id: str) -> dict[str, Any] | None:
         async with self.lock: return public_document(self.documents.get((owner_id, session_id)))
@@ -331,6 +359,10 @@ class MongoStore(InMemoryStore):
         query = {"owner_id": claim["owner_id"], "session_id": claim["session_id"], "sequence": claim["sequence"], "status": "processing", "attempt_id": claim["attempt_id"]}
         result = await asyncio.to_thread(self.chunks.update_one, query, {"$set": deepcopy(values)})
         return bool(result.matched_count)
+    async def replace_review_chunk(self, owner_id: str, session_id: str, sequence: int, audio_sha256: str, values: dict[str, Any]) -> bool:
+        query = {"owner_id": owner_id, "session_id": session_id, "sequence": sequence, "status": "ready", "review_required": True, "audio_sha256": audio_sha256}
+        result = await asyncio.to_thread(self.chunks.update_one, query, {"$set": deepcopy(values)})
+        return bool(result.matched_count)
     async def list_chunks(self, owner_id: str, session_id: str) -> list[dict[str, Any]]:
         return await asyncio.to_thread(lambda: [public_document(v) or {} for v in self.chunks.find({"owner_id": owner_id, "session_id": session_id}).sort("sequence", 1)])
     async def upsert_document(self, value: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +385,31 @@ class MongoStore(InMemoryStore):
                         self.documents.update_one({**identity, "status": {"$ne": "completed"}}, {"$set": deepcopy(value)})
             return public_document(self.documents.find_one(identity)) or {}
         return await asyncio.to_thread(save)
+    async def append_document_chunk(self, owner_id: str, session_id: str, sequence: int, segments: list[dict[str, Any]], text: str, delta_bytes: int, maximum_bytes: int) -> bool:
+        append_text: Any = {"$literal": text}
+        if text:
+            append_text = {"$cond": [{"$eq": [{"$ifNull": ["$transcript.text", ""]}, ""]}, {"$literal": text}, {"$literal": "\n" + text}]}
+        query = {"owner_id": owner_id, "session_id": session_id, "status": "incomplete", "transcript.last_applied_sequence": sequence - 1, "document_bytes": {"$lte": maximum_bytes - delta_bytes}}
+        update = [{"$set": {
+            "transcript.segments": {"$concatArrays": [{"$ifNull": ["$transcript.segments", []]}, {"$literal": deepcopy(segments)}]},
+            "transcript.text": {"$concat": [{"$ifNull": ["$transcript.text", ""]}, append_text]},
+            "transcript.ready_chunk_count": {"$add": [{"$ifNull": ["$transcript.ready_chunk_count", 0]}, 1]},
+            "transcript.last_applied_sequence": sequence,
+            "transcript.expected_chunk_count": None,
+            "transcript.missing_sequences": [],
+            "chunk_state.ready_count": {"$add": [{"$ifNull": ["$chunk_state.ready_count", 0]}, 1]},
+            "chunk_state.expected_chunk_count": None,
+            "chunk_state.missing_sequences": [],
+            "summary": None,
+            "summary_provider": None,
+            "summary_scope": None,
+            "summary_status": "not_run",
+            "summary_error_code": None,
+            "document_bytes": {"$add": ["$document_bytes", delta_bytes]},
+            "updated_at": utcnow(),
+        }}]
+        result = await asyncio.to_thread(self.documents.update_one, query, update)
+        return bool(result.matched_count)
     async def get_document_for_session(self, owner_id: str, session_id: str) -> dict[str, Any] | None: return public_document(await asyncio.to_thread(self.documents.find_one, {"owner_id": owner_id, "session_id": session_id}))
     async def update_document_for_session(self, owner_id: str, session_id: str, values: dict[str, Any]) -> None:
         await asyncio.to_thread(self.documents.update_one, {"owner_id": owner_id, "session_id": session_id}, {"$set": values})

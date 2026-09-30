@@ -5,8 +5,8 @@
   const Discard = LectureDiscard;
   const Config = LectureConfig;
 
-  const DEFAULT_WINDOW_MS = 60_000;
-  const DEFAULT_OVERLAP_MS = 2_000;
+  const DEFAULT_WINDOW_MS = 15_000;
+  const DEFAULT_OVERLAP_MS = 1_000;
   const MIN_PARTIAL_CHUNK_MS = 1_000;
   const SOFT_LIMIT = 96 * 1024 * 1024;
   const HARD_LIMIT = Config.OUTBOX_MAX_BYTES;
@@ -40,11 +40,13 @@
       stream: null,
       audioContext: null,
       sourceNode: null,
+      analyserNode: null,
       mimeType: "",
       windowMs: DEFAULT_WINDOW_MS,
       windowIntervalMs: DEFAULT_WINDOW_MS - DEFAULT_OVERLAP_MS,
       overlapMs: DEFAULT_OVERLAP_MS,
       maxChunkBytes: 6_000_000,
+      maxRequestBytes: 6_500_000,
       startedAtEpochMs: null,
       captureOriginPerf: null,
       stoppedAtEpochMs: null,
@@ -52,6 +54,8 @@
       schedulerGeneration: 0,
       nextSequence: 0,
       activeRecorders: new Map(),
+      reviewRecorders: new Map(),
+      reviewClips: new Map(),
       queue: [],
       queuedBytes: 0,
       inFlightBytes: 0,
@@ -65,6 +69,7 @@
       notes: emptyNotes(),
       documentId: null,
       finalizePending: false,
+      reviewCount: 0,
       archivedIncomplete: false,
       videoState: {
         hasVideo: false,
@@ -141,6 +146,7 @@
       recoveryRequired: Boolean(session.recoveryRequired),
       archivedIncomplete: Boolean(session.archivedIncomplete),
       finalizePending: Boolean(session.finalizePending),
+      reviewCount: session.reviewCount,
       hasStream: Boolean(session.stream),
       mockMode: Boolean(session.mockMode),
       providerStatus: { ...session.providerStatus },
@@ -247,6 +253,7 @@
     session.overlapMs = Math.round(overlapSeconds * 1000);
     session.windowIntervalMs = session.windowMs - session.overlapMs;
     session.maxChunkBytes = Math.max(100_000, Number(payload.max_chunk_bytes) || 6_000_000);
+    session.maxRequestBytes = Math.max(session.maxChunkBytes, Number(payload.max_request_bytes) || 6_500_000);
     session.mockMode = Boolean(payload.mock_mode);
     session.providerStatus = {
       state: session.mockMode ? "mock_mode" : "not_checked",
@@ -339,7 +346,7 @@
     );
   }
 
-  async function restoreRecoverableOutbox() {
+  async function restoreRecoverableOutbox(includeReview = false) {
     await Outbox.markExpired();
     const latest = await Outbox.latestRecoverable(session.sourceUrl);
     if (!latest) return false;
@@ -347,7 +354,7 @@
       session.serverSessionId = latest.sessionId;
       const expiredRecords = await Outbox.listSession(latest.sessionId);
       session.queue = expiredRecords.filter((record) => record.kind !== "session");
-      session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.blob?.size || chunk.size || 0), 0);
+      session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.size || chunk.blob?.size || 0), 0);
       session.state = SESSION_STATE.PAUSED_ACTION;
       session.notice = "72시간이 지난 보존 청크가 있습니다. 내보내기 후 폐기하거나 세션을 정리해 주세요.";
       return true;
@@ -363,22 +370,24 @@
       session.archivedIncomplete = marker.state === "INCOMPLETE";
       session.gaps = Array.isArray(marker.gaps) ? marker.gaps : [];
     }
-    const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED"].includes(record.state));
-    if (marker?.state === "INCOMPLETE" && pending.length === 0) {
+    const reviewRecords = records.filter((record) => record.kind === "chunk" && record.state === "REVIEW");
+    session.reviewCount = reviewRecords.length;
+    const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED", "REVIEW"].includes(record.state));
+    if (marker?.state === "INCOMPLETE" && pending.length === 0 && reviewRecords.length === 0) {
       await Outbox.remove(marker.id);
       session.serverSessionId = null;
       session.archivedIncomplete = false;
       session.notice = "이전 미완료 문서는 서버에 남아 있습니다. 새 캡처를 시작합니다.";
       return false;
     }
-    session.queue = pending.map((record) => ({ ...record, unavailableAttempts: record.unavailableAttempts || 0 }));
+    session.queue = [...pending, ...(includeReview ? reviewRecords : [])].map((record) => ({ ...record, reviewRetry: record.state === "REVIEW", unavailableAttempts: record.unavailableAttempts || 0 }));
     session.queue.sort((left, right) => left.sequence - right.sequence);
-    session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.blob?.size || chunk.size || 0), 0);
+    session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.size || chunk.blob?.size || 0), 0);
     session.nextSequence = Math.max(
       session.nextSequence,
       ...records.filter((record) => record.kind !== "session").map((record) => Number(record.sequence) + 1)
     );
-    session.notice = `보존된 세션과 청크 ${pending.length}개를 복구했습니다.`;
+    session.notice = `보존된 세션과 청크 ${session.queue.length}개를 복구했습니다.`;
     for (const chunk of session.queue.filter((record) => Core.isSessionResumeRequired(record))) {
       chunk.state = "PENDING";
       await Outbox.updateState(chunk.id, "PENDING", "서버 세션 복원 완료");
@@ -387,6 +396,10 @@
     if (pending.some((record) => record.state === "NEEDS_ACTION")) {
       session.state = SESSION_STATE.PAUSED_ACTION;
       session.notice = "사용자 조치가 필요한 원본 청크가 보존되어 있습니다.";
+    }
+    if (!includeReview && reviewRecords.length > 0 && pending.length === 0) {
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = `전사 확인이 필요한 청크 ${reviewRecords.length}개가 보존되어 있습니다. 원본을 내보내거나 재전사해 주세요.`;
     }
     if (!session.finalizePending && !session.archivedIncomplete) await preserveSessionMarker("ACTIVE");
     return true;
@@ -417,7 +430,10 @@
 
     session.audioContext = new AudioContext();
     session.sourceNode = session.audioContext.createMediaStreamSource(session.stream);
-    session.sourceNode.connect(session.audioContext.destination);
+    session.analyserNode = session.audioContext.createAnalyser();
+    session.analyserNode.fftSize = 2048;
+    session.sourceNode.connect(session.analyserNode);
+    session.analyserNode.connect(session.audioContext.destination);
     await session.audioContext.resume();
   }
 
@@ -483,6 +499,10 @@
       videoStartMs: Math.round(estimateVideoTimeMs()),
       playbackRate: Number(session.videoState?.playbackRate) || 1,
       overlapMs: firstAfterReset ? 0 : session.overlapMs,
+      activitySamples: 0,
+      audibleSamples: 0,
+      failedActivitySamples: 0,
+      activityTimer: null,
       stopTimer: null,
       donePromise: deferred.promise,
       resolveDone: deferred.resolve
@@ -499,13 +519,84 @@
 
     session.activeRecorders.set(sequence, context);
     recorder.start();
+    // A separate window spans this chunk and the following one. The server
+    // uses it only when the next chunk needs a second transcription.
+    try {
+      startReviewWindow(sequence + 1, context.captureStartMs);
+    } catch {
+      session.reviewRecorders.delete(sequence + 1);
+      session.reviewClips.delete(sequence + 1);
+    }
+    if (session.analyserNode) {
+      const waveform = new Float32Array(session.analyserNode.fftSize);
+      const sample = () => {
+        try {
+          session.analyserNode.getFloatTimeDomainData(waveform);
+          let squared = 0;
+          let peak = 0;
+          for (const value of waveform) {
+            squared += value * value;
+            peak = Math.max(peak, Math.abs(value));
+          }
+          context.activitySamples += 1;
+          if (Math.sqrt(squared / waveform.length) >= 0.001 || peak >= 0.005) context.audibleSamples += 1;
+        } catch {
+          context.failedActivitySamples += 1;
+        }
+      };
+      sample();
+      context.activityTimer = setInterval(sample, 50);
+    }
     context.stopTimer = setTimeout(() => stopRecorder(context), session.windowMs);
     broadcastSnapshot();
+  }
+
+  function startReviewWindow(targetSequence, captureStartMs) {
+    const recorder = new MediaRecorder(session.stream, {
+      mimeType: session.mimeType,
+      audioBitsPerSecond: 64_000
+    });
+    const deferred = createDeferred();
+    const context = {
+      recorder,
+      parts: [],
+      captureStartMs,
+      stopTimer: null,
+      donePromise: deferred.promise,
+      resolveDone: deferred.resolve
+    };
+    session.reviewRecorders.set(targetSequence, context);
+    session.reviewClips.set(targetSequence, deferred.promise);
+    recorder.addEventListener("dataavailable", (event) => {
+      if (event.data?.size > 0) context.parts.push(event.data);
+    });
+    recorder.addEventListener("stop", () => {
+      clearTimeout(context.stopTimer);
+      session.reviewRecorders.delete(targetSequence);
+      const durationMs = Math.max(0, Math.round(performance.now() - session.captureOriginPerf) - captureStartMs);
+      deferred.resolve({
+        blob: new Blob(context.parts, { type: recorder.mimeType || session.mimeType }),
+        durationMs,
+        captureStartMs
+      });
+      context.parts.length = 0;
+    }, { once: true });
+    recorder.addEventListener("error", () => stopRecorder(context), { once: true });
+    try {
+      recorder.start();
+      context.stopTimer = setTimeout(() => stopRecorder(context), session.windowMs + session.windowIntervalMs);
+    } catch {
+      session.reviewRecorders.delete(targetSequence);
+      session.reviewClips.delete(targetSequence);
+      deferred.resolve(null);
+    }
   }
 
   function stopRecorder(context) {
     if (!context) return;
     clearTimeout(context.stopTimer);
+    if (context.activityTimer) clearInterval(context.activityTimer);
+    context.activityTimer = null;
     if (context.recorder.state !== "inactive") {
       try {
         context.recorder.stop();
@@ -517,6 +608,7 @@
 
   async function finalizeRecorder(context) {
     clearTimeout(context.stopTimer);
+    if (context.activityTimer) clearInterval(context.activityTimer);
     session.activeRecorders.delete(context.sequence);
     const captureEndMs = Math.max(context.captureStartMs, Math.round(performance.now() - session.captureOriginPerf));
     const durationMs = captureEndMs - context.captureStartMs;
@@ -524,6 +616,13 @@
 
     try {
       if (durationMs >= MIN_PARTIAL_CHUNK_MS && blob.size > 0) {
+      const reviewPromise = session.reviewClips.get(context.sequence);
+      const review = reviewPromise ? await reviewPromise : null;
+      session.reviewClips.delete(context.sequence);
+      const reviewBlob = review && Math.abs(context.captureStartMs - review.captureStartMs - session.windowIntervalMs) < 2_000
+        && review.durationMs > session.windowMs && review.durationMs <= 30_000 && review.blob.size > 0
+        && review.blob.size <= session.maxChunkBytes
+        && review.blob.size + blob.size + 8_192 < session.maxRequestBytes ? review.blob : null;
       const oversized = blob.size > session.maxChunkBytes;
       if (blob.size > session.maxChunkBytes) {
         session.state = SESSION_STATE.PAUSED_ACTION;
@@ -537,13 +636,16 @@
         sourceUrl: session.sourceUrl,
         sequence: context.sequence,
         blob,
-        size: blob.size,
+        reviewBlob,
+        reviewDurationMs: reviewBlob ? review.durationMs : 0,
+        size: blob.size + (reviewBlob?.size || 0),
         captureStartMs: context.captureStartMs,
         captureEndMs,
         durationMs,
         videoStartMs: context.videoStartMs,
         playbackRate: context.playbackRate,
         overlapMs: context.overlapMs,
+        audioSignalStatus: Core.classifyAudioActivity(context.activitySamples, context.audibleSamples, durationMs, context.failedActivitySamples),
         mimeType: blob.type || session.mimeType,
         unavailableAttempts: 0,
         state: oversized ? "NEEDS_ACTION" : "PENDING",
@@ -555,20 +657,20 @@
         const estimate = await navigator.storage?.estimate?.();
         if (
           estimate?.quota &&
-          Number(estimate.usage || 0) + blob.size > Number(estimate.quota)
+          Number(estimate.usage || 0) + chunk.size > Number(estimate.quota)
         ) {
           throw new Error("브라우저 저장 공간이 부족합니다.");
         }
         await Outbox.put(chunk, Config.OUTBOX_MAX_BYTES);
         session.queue.push(chunk);
         session.queue.sort((left, right) => left.sequence - right.sequence);
-        session.queuedBytes += blob.size;
+        session.queuedBytes += chunk.size;
       } catch (error) {
         session.state = SESSION_STATE.PAUSED_ACTION;
         session.notice = `오디오 보관 한도에 도달했습니다: ${serializeError(error)}`;
         cancelWindowScheduler();
         session.queue.push(chunk);
-        session.queuedBytes += blob.size;
+        session.queuedBytes += chunk.size;
       }
       }
     } finally {
@@ -582,8 +684,11 @@
 
   async function stopAllRecorders() {
     const contexts = [...session.activeRecorders.values()];
+    const reviews = [...session.reviewRecorders.values()];
     for (const context of contexts) stopRecorder(context);
-    await Promise.allSettled(contexts.map((context) => context.donePromise));
+    for (const context of reviews) stopRecorder(context);
+    await Promise.allSettled([...contexts, ...reviews].map((context) => context.donePromise));
+    session.reviewClips.clear();
   }
 
   function openGap(reason) {
@@ -651,8 +756,8 @@
     }
 
     const chunk = session.queue.shift();
-    session.queuedBytes -= chunk.blob.size;
-    session.inFlightBytes = chunk.blob.size;
+    session.queuedBytes -= chunk.size || chunk.blob.size;
+    session.inFlightBytes = chunk.size || chunk.blob.size;
     session.inFlightChunk = chunk;
     session.processing = true;
     let nextProcessingDelayMs = 75;
@@ -668,7 +773,14 @@
       if (session.stats.recentLatenciesMs.length > 100) session.stats.recentLatenciesMs.shift();
       applyTranscriptResponse(chunk, response);
       recordProviderSuccess();
-      await Outbox.remove(chunk.id);
+      if (response?.review_required) {
+        await Outbox.updateState(chunk.id, "REVIEW", "전사 결과가 두 번 비었습니다. 원본을 확인하거나 명시적으로 재전사해 주세요.");
+        if (!chunk.reviewRetry) session.reviewCount += 1;
+        session.notice = `청크 ${chunk.sequence}은 전사 결과가 없어 ...으로 표시했습니다. 원본 오디오는 보존했습니다.`;
+      } else {
+        await Outbox.remove(chunk.id);
+        if (chunk.reviewRetry) session.reviewCount = Math.max(0, session.reviewCount - 1);
+      }
     } catch (error) {
       recordProviderFailure(error);
       const quotaExhausted = error?.code === "openai_quota_exhausted" || (error?.status === 429 && (!error?.code || error.code === "http_error"));
@@ -676,7 +788,7 @@
       const retryable = !error?.status || error?.status === 503 || Core.isRetryableStatus(error?.status) || rateLimited;
       if (error?.code === "session_resume_required") {
         session.queue.unshift(chunk);
-        session.queuedBytes += chunk.blob.size;
+        session.queuedBytes += chunk.size || chunk.blob.size;
         await Outbox.updateState(chunk.id, "RETRY_WAIT", "서버 세션 자동 복원 중");
         try {
           await resumeServerSession(session.serverSessionId);
@@ -698,7 +810,7 @@
         }
       } else if (quotaExhausted || retryable) {
         session.queue.unshift(chunk);
-        session.queuedBytes += chunk.blob.size;
+        session.queuedBytes += chunk.size || chunk.blob.size;
         chunk.unavailableAttempts = (chunk.unavailableAttempts || 0) + 1;
         const retryAfterSeconds = Number(error?.retryAfter);
         nextProcessingDelayMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
@@ -721,7 +833,7 @@
         );
         chunk.state = requiresSessionResume ? "SESSION_RESUME_REQUIRED" : "NEEDS_ACTION";
         session.queue.unshift(chunk);
-        session.queuedBytes += chunk.blob.size;
+        session.queuedBytes += chunk.size || chunk.blob.size;
         session.state = SESSION_STATE.PAUSED_ACTION;
         session.recoveryRequired = requiresSessionResume;
         session.notice = `청크 ${chunk.sequence}을 원본 보존 상태로 전환했습니다: ${serializeError(error)}`;
@@ -779,12 +891,19 @@
   async function uploadChunk(chunk) {
     const form = new FormData();
     form.append("audio", chunk.blob, `chunk-${chunk.sequence}.webm`);
+    if (chunk.reviewBlob instanceof Blob && chunk.reviewDurationMs > 15_000) {
+      form.append("review_audio", chunk.reviewBlob, `review-${chunk.sequence}.webm`);
+      form.append("review_duration_ms", String(chunk.reviewDurationMs));
+    }
     form.append("sequence", String(chunk.sequence));
     form.append("capture_start_ms", String(chunk.captureStartMs));
     form.append("capture_end_ms", String(chunk.captureEndMs));
     form.append("video_start_ms", String(chunk.videoStartMs));
     form.append("playback_rate", String(chunk.playbackRate));
     form.append("overlap_ms", String(chunk.overlapMs));
+    form.append("audio_signal_status", chunk.audioSignalStatus || "unknown");
+    form.append("review_handling_version", "1");
+    form.append("review_retry", String(Boolean(chunk.reviewRetry)));
     form.append("mime_type", chunk.mimeType);
 
     const response = await fetchWithTimeout(
@@ -806,6 +925,7 @@
           end_ms: Math.round(chunk.videoStartMs + relativeEnd * chunk.playbackRate),
           text: String(segment.text || "").trim(),
           uncertain: Boolean(segment.uncertain),
+          review_required: Boolean(segment.review_required || response?.review_required),
           status: "final"
         };
       })
@@ -839,9 +959,9 @@
       await navigator.storage?.persist?.().catch(() => false);
       const resumed = await restoreRecoverableOutbox();
       if (!resumed) await createServerSession();
-      if ((session.finalizePending || session.archivedIncomplete) && session.queue.length > 0) {
+      if ((session.finalizePending || session.archivedIncomplete) && (session.queue.length > 0 || session.reviewCount > 0)) {
         session.state = SESSION_STATE.PAUSED_ACTION;
-        session.notice = "종료된 세션의 보존 청크가 있습니다. '보존 청크 처리'를 눌러 주세요.";
+        session.notice = "종료된 세션의 보존 청크가 있습니다. 원본을 내보내거나 '보존 청크 처리'를 눌러 주세요.";
         broadcastSnapshot();
         return { ok: true, snapshot: publicSnapshot() };
       }
@@ -851,7 +971,7 @@
         const archive = await archiveServerSessionWithRetry();
         session.state = SESSION_STATE.STOPPED;
         session.notice = archive?.saved
-          ? `최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
+          ? `최종 자막${archive.summary ? "과 요약을" : "을"} 저장했습니다.${archive.accepted_untranscribed_sequences?.length ? ` 전사되지 않은 청크 ${archive.accepted_untranscribed_sequences.length}개는 ...으로 남겼습니다.` : ""} 문서 ID: ${archive.document_id}`
           : archive?.summary ? "누락 구간이 있어 확보된 자막의 부분 요약을 저장했습니다." : "처리되지 않은 청크가 있어 미완료 세션으로 유지했습니다.";
         session.accessToken = "";
         session.userId = "";
@@ -956,7 +1076,7 @@
       return { ok: false, error: "사용자 ID와 접속 코드를 입력해 주세요.", snapshot: publicSnapshot() };
     }
     try {
-      const restored = await restoreRecoverableOutbox();
+      const restored = await restoreRecoverableOutbox(true);
       if (!restored) return { ok: false, error: "처리할 보존 청크가 없습니다.", snapshot: publicSnapshot() };
       if (session.queue.some((chunk) => chunk.state === "EXPIRED")) {
         return { ok: false, error: "72시간 보존 기간이 지났습니다. 원본 오디오를 내보내 확인해 주세요.", snapshot: publicSnapshot() };
@@ -977,7 +1097,8 @@
           const archive = await archiveServerSessionWithRetry();
           session.state = SESSION_STATE.STOPPED;
           session.notice = archive?.saved
-            ? "보존 청크 처리와 최종 문서 저장을 완료했습니다."
+            ? `보존 청크 처리와 최종 문서 저장을 완료했습니다.${archive.accepted_untranscribed_sequences?.length ? ` 전사되지 않은 청크 ${archive.accepted_untranscribed_sequences.length}개는 ...으로 남겼습니다.` : ""}`
+            : archive?.unverified_sequences?.length ? `전사 확인 필요 청크 ${archive.unverified_sequences.length}개를 원본과 함께 보존했습니다.${archive?.summary ? " 확보된 자막만 부분 요약했습니다." : " 요약할 자막은 아직 없습니다."}`
             : archive?.summary ? "미완료 문서에 확보된 자막의 부분 요약을 저장했습니다. 누락 구간을 확인해 주세요." : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
         } catch (error) {
           session.state = SESSION_STATE.PAUSED_ACTION;
@@ -1020,6 +1141,7 @@
     const deadline = Date.now() + waitMs;
     let lastNoticeAt = 0;
     while ((session.queue.length > 0 || session.processing) && Date.now() < deadline) {
+      if (!session.processing && [SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)) break;
       if (!session.processing) scheduleQueueProcessing();
       if (Date.now() - lastNoticeAt >= 1_000) {
         const pending = session.queue.length + (session.processing ? 1 : 0);
@@ -1039,10 +1161,26 @@
 
     const pendingCount = session.queue.length + (session.processing ? 1 : 0);
     if (pendingCount > 0) {
-      session.notice = `종료 대기시간을 초과했습니다. 청크 ${pendingCount}개는 IndexedDB에 보존됩니다.`;
+      if (![SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)) session.notice = `종료 대기시간을 초과했습니다. 청크 ${pendingCount}개는 IndexedDB에 보존됩니다.`;
       broadcastSnapshot();
     }
     return { drained: pendingCount === 0, pendingCount };
+  }
+
+  async function retryReviewChunksBeforeArchive() {
+    if (!session.serverSessionId || session.reviewCount <= 0) return { drained: true, pendingCount: 0 };
+    const records = await Outbox.listSession(session.serverSessionId);
+    const reviews = records.filter((record) => record.kind === "chunk" && record.state === "REVIEW" && record.blob instanceof Blob);
+    for (const record of reviews) {
+      if (session.queue.some((queued) => queued.id === record.id)) continue;
+      session.queue.push({ ...record, reviewRetry: true });
+      session.queuedBytes += record.size || record.blob.size;
+    }
+    if (session.queue.length === 0) return { drained: true, pendingCount: 0 };
+    session.notice = `전사되지 않은 청크 ${reviews.length}개를 종료 전 최대 2회씩 다시 확인하고 있습니다.`;
+    broadcastSnapshot();
+    scheduleQueueProcessing(0);
+    return waitForQueueDrain();
   }
 
   async function archiveServerSession() {
@@ -1078,7 +1216,7 @@
     if (payload?.saved) {
       await Outbox.remove(`${session.serverSessionId}:session`);
     } else {
-      await preserveSessionMarker("INCOMPLETE", `누락 청크: ${(payload?.missing_sequences || []).join(", ")}; 녹음 누락 구간: ${(payload?.missing_time_ranges || []).length}`);
+      await preserveSessionMarker("INCOMPLETE", `누락 청크: ${(payload?.missing_sequences || []).join(", ")}; 전사 확인 필요: ${(payload?.unverified_sequences || []).join(", ")}; 녹음 누락 구간: ${(payload?.missing_time_ranges || []).length}`);
     }
     return payload;
   }
@@ -1119,9 +1257,12 @@
     broadcastSnapshot();
 
     await stopAllRecorders();
-    const drainResult = processingWasBlocked
+    let drainResult = processingWasBlocked
       ? { drained: false, pendingCount: session.queue.length + (session.processing ? 1 : 0) }
       : await waitForQueueDrain();
+    if (drainResult.drained && !processingWasBlocked && session.reviewCount > 0) {
+      drainResult = await retryReviewChunksBeforeArchive();
+    }
     closeGap();
     session.stoppedAtEpochMs = Date.now();
     try {
@@ -1131,7 +1272,8 @@
       broadcastSnapshot();
       const archive = await archiveServerSessionWithRetry();
       session.notice = archive?.saved
-        ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
+        ? `${reason} 자막${archive.summary ? "과 요약을" : "을"} 저장했습니다.${archive.accepted_untranscribed_sequences?.length ? ` 전사되지 않은 청크 ${archive.accepted_untranscribed_sequences.length}개는 ...으로 남겼습니다.` : ""} 문서 ID: ${archive.document_id}`
+        : archive?.unverified_sequences?.length ? `${reason} 전사 확인 필요 청크 ${archive.unverified_sequences.length}개를 원본과 함께 보존했습니다.${archive?.summary ? " 확보된 자막만 부분 요약했습니다." : " 요약할 자막은 아직 없습니다."}`
         : archive?.summary ? `${reason} 미완료 문서와 확보된 자막의 부분 요약을 저장했습니다.` : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
     } catch (error) {
       session.finalizePending = true;
@@ -1161,6 +1303,10 @@
       session.sourceNode?.disconnect();
     } catch {}
     session.sourceNode = null;
+    try {
+      session.analyserNode?.disconnect();
+    } catch {}
+    session.analyserNode = null;
     if (session.audioContext && session.audioContext.state !== "closed") {
       try {
         await session.audioContext.close();

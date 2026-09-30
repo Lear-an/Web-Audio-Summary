@@ -67,8 +67,8 @@ function readyResponse() {
       status: "ok",
       mock_mode: false,
       storage: "mongodb",
-      chunk_seconds: 60,
-      chunk_overlap_seconds: 2,
+      chunk_seconds: 15,
+      chunk_overlap_seconds: 1,
       max_chunk_bytes: 6_000_000
     })
   };

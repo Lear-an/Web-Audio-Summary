@@ -1,21 +1,21 @@
-# Chrome 강의 자막·요약 노트 설계서 v8
+# Chrome 강의 자막·요약 노트 설계서 v8 — GPT 전사 전환안
 
 ## 1. 문서 목적과 운영 전제
 
-V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계입니다. Chrome 확장 프로그램이 영상 탭의 오디오를 수집하고, Render의 FastAPI 서버가 OpenAI API로 전사·한국어 변환·최종 요약을 수행하며, MongoDB Atlas에 영상 요청별 문서를 저장합니다.
+V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계입니다. Chrome 확장 프로그램이 영상 탭의 오디오를 수집하고, Render의 FastAPI 서버가 OpenAI API로 전사·한국어 변환·최종 요약을 수행하며, MongoDB Atlas에 영상 요청별 문서를 저장합니다. GPT 전사·15초 청크·1초 겹침·부분 문서 증분 반영과 `ko/en` 언어 힌트는 로컬 코드와 Render 설정 파일에 반영했습니다. 빈 전사 응답의 침묵 판별·1회 즉시 재전사·`...` 표시·원본 보존과 종료 시 최대 2회 재전사 후 확정 절차도 로컬 코드에 반영하고 모의 응답으로 시험했습니다. 새 전사 경로의 실제 OpenAI·Atlas 통합 시험과 Render·Atlas 무료 플랜 부하 시험은 아직 완료되지 않았으며, 이번 변경의 Render 배포는 별도 단계입니다. 동시 사용 가능 범위는 무료 플랜 부하 시험 결과로 결정합니다.
 
 - 등록 가능 계정은 기본 **10명**, 실제 동시 활성 사용자는 **5명**입니다. 두 제한은 별도 설정입니다.
 - OpenAI API 키는 운영자가 Render Secret으로 한 번만 설정합니다.
-- `whisper-1`이 구간 타임스탬프를 포함해 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다.
+- `gpt-transcribe`가 한국어 중심 오디오를 전사하고, GPT-6 Luna(`gpt-6-luna`)가 필요한 비한국어 자막 변환과 종료 시 최종 요약을 담당합니다. GPT 전사는 구간 타임스탬프를 반환하지 않으므로 청크 단위의 대략적인 시각만 표시합니다.
 - 사용자는 사용자 ID와 접속 코드만 입력합니다.
 - 운영자가 발급한 계정이 유효하면 설치 PC나 확장 프로그램 ID와 관계없이 모든 사용자 기능을 이용합니다. 기기 등록은 하지 않습니다.
 - 북마크 기능은 제품 UI와 신규 전사·요약 데이터 범위에서 제외합니다.
-- 청크는 60초, 겹침은 2초입니다.
+- 청크는 15초, 겹침은 1초, 시작 간격은 14초입니다.
 - 중간 요약 없이 캡처 종료 시 최종 요약을 한 번 생성합니다.
 - 실패 오디오는 브라우저 IndexedDB에 72시간 보존합니다.
 - 중단된 요청도 지금까지의 전사를 영상별 부분 문서로 남깁니다.
 - 사이드 패널을 열 때 비동기 `/health/live`로 Render 연결을 확인하고, 캡처 시작 시 `/health/ready`로 Atlas 저장소 준비를 확인합니다. GPT 상태는 실제 AI 처리 응답으로만 표시합니다.
-- Render 무료 Web Service와 Atlas를 사용하며 배포는 관리자가 수동 실행합니다.
+- Render 무료 Web Service와 Atlas 무료 클러스터를 기준으로 설계·부하 검증하며 배포는 관리자가 수동 실행합니다.
 
 회원가입, 결제, 관리자 웹 콘솔, 대규모 분산 작업 큐는 범위에서 제외합니다.
 
@@ -25,7 +25,7 @@ V8은 V7의 GPT 기반 구조를 운영 가능한 형태로 구체화한 설계�
 |---|---|---|
 | 사용자 한도 | 7명 단일 한도 | **등록 10명 / 동시 활성 5명 분리** |
 | 부분 문서 저장 | 종료·중단 시 중심 | **READY 청크 ACK 전에 동일 문서에 write-through upsert** |
-| 오디오 시간축 | overlap 정의가 모호함 | **60초 창, 58초 stride, media timeline 기준** |
+| 오디오 시간축 | overlap 정의가 모호함 | **15초 창·14초 stride, media timeline 기준으로 구현** |
 | 부분 문서 보존 | 7일 후 문서도 TTL 삭제 가능 | 문서는 유지하고 재개용 초안만 7일 후 만료 |
 | 청크 번호 | 1 기반 표현과 구현의 0 기반 혼재 | **0 기반 통일** |
 | 종료 범위 | `expected_end_sequence` | `expected_chunk_count` |
@@ -47,7 +47,7 @@ Chrome 영상 탭
        ├─ tabCapture + MediaRecorder
        ├─ 패널 열림: 비차단 `/health/live` 연결 확인, 최근 2~5분 결과 재사용
        ├─ 캡처 시작: `/health/ready` 저장소 준비 확인
-       ├─ 60초 WebM/Opus 청크, 2초 overlap
+       ├─ 15초 WebM/Opus 청크, 1초 overlap
        ├─ IndexedDB outbox (최대 128 MiB, 72시간)
        └─ HTTPS + 사용자 인증
                  │
@@ -56,7 +56,7 @@ Render FastAPI Web Service
   ├─ 사용자 인증·소유권 격리
   ├─ 최대 동시 사용자 5명
   ├─ 청크 검증·영속 lease·재시도 분류
-  ├─ OpenAI Whisper-1 전사 (구간 타임스탬프)
+  ├─ OpenAI GPT-Transcribe 전사 (청크 단위의 대략적 시각)
   ├─ OpenAI GPT-6 Luna 한국어 변환·최종 요약
   └─ MongoDB Atlas
        ├─ lecture_sessions
@@ -70,7 +70,7 @@ Render FastAPI Web Service
 |---|---|
 | 확장 프로그램 | 오디오 캡처, outbox 보존, 순차 업로드, 사용자 UI |
 | FastAPI | 인증, 검증, 큐 제어, OpenAI 호출, 상태 전이, 저장 |
-| Whisper-1 (`whisper-1`) | 원언어 전사와 세그먼트 타임스탬프 |
+| GPT-Transcribe (`gpt-transcribe`) | 한국어 중심 원언어 전사; 청크별 텍스트와 감지 언어 반환 |
 | GPT-6 Luna (`gpt-6-luna`) | 비한국어 전사의 한국어 변환, 종료 시 최종 요약 |
 | Atlas | 처리 상태, 전사, 부분·완료 문서, 공급자 상태, 사용량 |
 
@@ -120,27 +120,47 @@ SAFETY_IDENTIFIER_SECRET=<랜덤 비밀값>
 
 ### 5.1 언어 처리
 
-- 한국어 음성은 전사 결과를 한국어 자막으로 사용합니다.
-- 비한국어 음성은 원문을 보존하고 GPT-6 Luna로 자연스러운 한국어 자막을 만듭니다.
+- 한국어 강의를 기본 입력으로 삼고, 감지 언어가 한국어이면 전사 결과를 한국어 자막으로 사용합니다. 기술 용어·제품명·영어 약어는 가능한 한 발화한 표기로 남깁니다.
+- 한국어 중심·혼합 강의의 `gpt-transcribe` 요청에는 `languages=["ko", "en"]` 힌트와 한국어 강의 맥락의 `prompt`를 보냅니다. 언어 힌트는 예상 입력 언어이며 출력을 두 언어로 강제하거나 번역을 지시하지 않습니다. 영어 기술 용어는 발화한 표기로 보존합니다.
+- `keywords`는 사용하지 않습니다. 정확도 개선은 음성 대조 평가, 경계 보존, 의심 구간 재전사에 집중합니다.
+- 감지 언어 응답의 `languages[]`를 파싱합니다. 결과가 비거나 불확실하다는 이유만으로 한국어 전사를 번역하지 않습니다. 명확히 비한국어로 판정된 강의만 원문을 보존하고 GPT-6 Luna로 자연스러운 한국어 자막을 만듭니다.
 - 혼합 언어의 코드·제품명·고유명사는 가능한 한 원문 표기를 유지합니다.
 - 번역 reasoning effort는 `none`, 최종 요약은 `low`가 기본입니다.
 - 한국어·영어·혼합 기술 강의 검증 코퍼스로 품질 회귀 테스트를 합니다.
 
 ### 5.2 전사 요청
 
-`whisper-1` 요청 계약:
+`gpt-transcribe` 요청 계약(로컬 구현, 실제 API 검증 대기):
 
 - 확장자가 있는 파일명(예: `chunk-000012.webm`)과 `audio/webm` MIME을 전달합니다.
-- `response_format=verbose_json`을 사용합니다.
-- `timestamp_granularities=["segment"]`를 요청합니다.
-- `timestamp_granularities=["segment"]`는 `whisper-1`에서만 지원됩니다. `gpt-transcribe`와 이 요청을 조합하면 OpenAI가 422로 거부하므로, 모델과 요청 파라미터를 함께 변경해야 합니다.
-- 현재 구현은 구간 타임스탬프에 의존하므로 운영 설정에서 `OPENAI_TRANSCRIBE_MODEL=whisper-1`을 사용합니다.
-- 세그먼트 타임스탬프가 없으면 청크 전체를 coarse segment 하나로 저장하고 `timestamp_uncertain=true`로 표시합니다.
-- 브라우저 청크 시각을 서버 기준 절대 자막 시각으로 변환합니다.
+- `model=gpt-transcribe`를 사용합니다. Whisper 전용 `response_format=verbose_json`·`timestamp_granularities`와 단일 `language` 요청·응답 가정을 제거합니다.
+- 응답의 `text`와 `languages[]`를 검증합니다. `text` 누락·비문자열이나 잘못된 `languages` 형식은 공급자 응답 오류로 처리합니다. `languages=[]`는 언어 판정 불확실을 뜻하며 침묵 근거로 사용하지 않습니다. 사용자에게 보이는 자막의 원문과 공급자 메타데이터는 기존 청크 계약으로 변환합니다.
+- 단어·문장 시각을 추정 사실처럼 저장하지 않습니다. 내용이 있는 청크는 청크 전체 구간의 coarse segment 하나로 저장하고 `uncertain=true` 및 청크 메타데이터의 `timestamp_uncertain=true`를 기록합니다. 문장별 강제 정렬 모델은 Render에서 실행하지 않습니다.
+- 브라우저의 청크 시작 시각과 재생 배속으로 coarse segment의 절대 영상 시각을 계산합니다. 실시간 표시 지연은 최소 청크 종료 시점과 API 응답 시간의 합으로 취급합니다.
+- 1초 겹침 구간의 중복 문구는 인접 청크에서 공백 기준 세 단어 이상이 같은 순서로 일치하고 정규화한 길이가 12자 이상일 때만 다음 청크의 접두를 제거합니다. 짧거나 애매한 반복은 남깁니다. 확정 자막 하나만 저장하며 한국어 청크의 별도 원문 복사본을 저장하지 않습니다. 비한국어 번역에는 원어 원문을 유지합니다.
+
+#### 자막 정확도 평가와 조건부 검증
+
+1. 서로 다른 한국어 강의에서 빠른 발화, 영어 기술 용어, 배경음, 조용한 발화, 청크 경계를 포함한 20~30개의 짧은 표본을 고릅니다. 사람이 원음을 듣고 `reference`를 작성하고 현행 자막을 `hypothesis`로 기록합니다. `category`는 `speech`·`boundary`·`terminology`·`noisy`·`quiet` 등을 사용합니다.
+2. `tools/evaluate_transcripts.py`에 JSONL 표본을 넣어 공백·문장부호를 제외한 글자 오류율(CER), 음성 구간의 빈 전사 수, 유형별 오류율을 산출합니다. 동일 표본으로 변경 전후를 비교합니다. 경계에서 문장 전체가 삭제되거나 중복된 사례도 사람이 별도로 확인합니다. 실제 음성 표본의 수집·평가 수치는 아직 없습니다.
+3. 비무음 청크의 첫 전사가 비었거나 지나치게 짧거나, 인접 청크와 긴 문구가 반복되거나, 긴 문장이 종결 부호 없이 끝나면 검증 전사를 최대 한 번 수행합니다. 검증 후보가 첫 전사와 충분히 일치하며 더 완전할 때만 교체합니다. 두 후보가 상충하면 첫 전사를 유지합니다. 빈 결과가 두 번 이어지면 기존 `...` 검토 흐름을 사용합니다.
+4. 브라우저는 인접한 두 청크를 덮는 최대 29초 WebM 검증 녹음을 별도로 만들어 다음 청크의 업로드에 함께 보냅니다. 서버는 1차 결과가 의심스러울 때만 이 녹음을 GPT에 전사 요청합니다. 앞 청크의 확정 자막으로 검증 전사에서 현재 청크 부분을 안전하게 찾지 못하면 첫 전사를 유지합니다. 첫 청크·재생 중단 직후처럼 인접 녹음이 없으면 원래 15초 오디오를 앞 문장 맥락과 함께 다시 전사합니다. 검증 녹음은 서버에 보존하지 않으며 브라우저 outbox에서 해당 청크가 ACK되면 삭제합니다.
+5. 검증 전사에는 추가 음성 시간과 API 요청을 일일 사용량에 반영합니다. 29초 녹음은 오디오를 얻기 위해 매 청크 업로드하지만 GPT 호출은 의심 청크에만 수행합니다. 이 방식은 브라우저 인코딩·IndexedDB·업로드 사용량을 늘리므로 실제 환경에서 대기 시간과 저장 한도를 검증합니다.
+
+평가 실행 예: `.\.venv\Scripts\python.exe tools/evaluate_transcripts.py samples.jsonl`. 입력은 줄마다 `{"reference":"사람이 들은 문장","hypothesis":"저장된 자막","category":"boundary"}` 형식입니다. 이 평가는 녹음 품질과 시간 정렬을 자동 판정하지 않으므로 사람이 원음을 듣고 표본을 확인해야 합니다.
+
+#### 빈 전사 응답 처리(로컬 구현, 실제 음성 검증 대기)
+
+1. 브라우저는 기존 `AudioContext`에서 녹음 청크별 음량을 가볍게 측정하고 `quiet`·`non_silent`·`unknown` 중 하나를 오디오와 함께 outbox에 보존해 서버에 전달합니다. 충분한 측정값이 있고 청크 전체가 보수적으로 정한 무음 기준 아래일 때만 `quiet`로 분류합니다. 측정 누락·기존 확장 프로그램 요청은 `unknown`입니다. 음량은 음성 판정이 아니므로 음악·배경음이 있는 청크를 무음으로 단정하지 않습니다. 문턱값과 측정 범위는 실제 한국어 강의·조용한 발화·음악 자료로 검증합니다.
+2. 정상 형식의 GPT 응답에서 `text`가 공백뿐이고 오디오가 `quiet`이면 침묵 청크로 `ready` 저장합니다. 자막 세그먼트는 비우고 침묵 판정 근거를 청크 메타데이터에 기록합니다. 세션 순번과 부분 문서 반영이 끝난 뒤에만 ACK를 반환합니다. 이 경우 재전사하지 않습니다.
+3. `text`가 공백뿐인데 오디오가 `non_silent` 또는 `unknown`이면 검증 오디오가 있을 때 그 구간을, 없을 때 원래 청크를 **최대 한 번만** 추가 전사합니다. 두 번째 응답에 현재 청크의 내용이 확인되면 정상 저장합니다. 다시 비어 있거나 검증 녹음에서 현재 청크를 안전하게 분리할 수 없으면 `review_required=true`인 READY 청크와 청크 전체 구간의 `...` 세그먼트를 저장합니다. 화면에는 `...`만 표시하고 다음 순번으로 진행합니다. 이는 실제 무음 확정이 아니라 전사 확인 필요 상태입니다. 서버 응답에도 `review_required=true`를 넣어 확장이 ACK 후에도 IndexedDB 원본을 `REVIEW` 상태로 보존하게 합니다.
+4. `text`가 누락되거나 형식이 잘못된 응답은 침묵으로 처리하지 않습니다. 첫 전사에 내용이 있으면 선택적인 검증 전사가 실패하거나 한도에 걸려도 첫 결과를 보존합니다. 첫 전사도 비어 있으면 기존 오류·`...` 처리를 따릅니다. 추가 전사 요청도 호출·오디오 사용량 및 비용 기록에 포함하고, 사용자·전체 일일 한도를 넘지 않도록 검사합니다.
+
+전사 확인 필요 청크는 순번 처리를 위해 READY로 계산하고 원본을 브라우저 `REVIEW` 상태로 보존합니다. 캡처 종료 시 일반 청크 전송을 마친 뒤 각 `REVIEW` 청크를 `review_retry=true`로 자동 재전사합니다. 서버는 이 종료 단계에서 청크당 최대 두 번 요청합니다. 한 번이라도 내용이 확인되면 `...`을 교체합니다. 두 번 모두 비면 `...`을 그대로 두고 `untranscribed_after_retry=true`로 확정하며 원본을 삭제합니다. 해당 순번은 `accepted_untranscribed_sequences`에 기록하고 요약 입력에서는 `...`을 제외합니다. 다른 누락이나 녹음 중단 구간이 없으면 문서를 완료할 수 있습니다. 확보된 발화가 있으면 `summary_scope=partial`로 요약하고, 전부 `...`인 문서는 요약 없이 완료합니다. API 오류·할당량 초과·오디오 전송 실패는 빈 전사 두 번으로 취급하지 않고 원본과 미완료 상태를 보존합니다. 이전에 종료되어 `REVIEW`가 남은 세션은 `보존 청크 처리`로 동일한 2회 제한과 확정 절차를 진행합니다.
 
 ### 5.3 한국어 변환과 최종 요약
 
-GPT-6 Luna는 이 구조에서 오디오 입력을 처리하지 않으므로 오디오 전사는 타임스탬프를 제공하는 `whisper-1`이 담당하고, 번역·요약은 Responses API로 호출합니다.
+GPT-6 Luna는 이 구조에서 오디오 입력을 처리하지 않습니다. 오디오 전사는 `gpt-transcribe`, 필요한 비한국어 자막 변환과 최종 요약은 GPT-6 Luna의 Responses API가 담당합니다.
 
 - `model=gpt-6-luna`
 - `store=false`
@@ -175,9 +195,9 @@ fallback은 향후 선택 기능이며 현재 코드에는 호출 로직이 구�
 ### 6.1 운영 설정
 
 ```dotenv
-AUDIO_CHUNK_SECONDS=60
-AUDIO_CHUNK_OVERLAP_SECONDS=2
-AUDIO_BITS_PER_SECOND=128000
+AUDIO_CHUNK_SECONDS=15
+AUDIO_CHUNK_OVERLAP_SECONDS=1
+AUDIO_BITS_PER_SECOND=64000
 MIN_AUDIO_CHUNK_SECONDS=15
 MAX_AUDIO_CHUNK_SECONDS=180
 MAX_CHUNK_BYTES=6000000
@@ -199,18 +219,20 @@ MAX_SESSION_DURATION_SECONDS=14400
 - `sequence`는 **0부터 시작**합니다.
 - 종료 시 `expected_chunk_count`는 생성된 전체 청크 개수입니다.
 - 유효 범위는 `0 <= sequence < expected_chunk_count`입니다.
-- 각 청크는 길이 60초, 시작 간격(stride)은 58초입니다. `media_start_ms`는 영상 시간축 기준이며 서버는 이를 절대 자막 시각의 기준으로 사용합니다.
+- 각 청크는 길이 15초, 시작 간격(stride)은 14초입니다. 한 시간 녹음은 끝 청크 처리 방식에 따라 약 257~258개의 청크를 만듭니다. `media_start_ms`는 영상 시간축 기준이며 서버는 이를 절대 자막 시각의 기준으로 사용합니다.
 - 절대 자막 시각은 `round(media_start_ms + relative_ms × playback_rate)`로 계산합니다. 겹침 판정 범위도 `overlap_ms × playback_rate`로 환산해 배속 재생 시 화면 자막과 Atlas 문서가 같은 영상 시각을 사용합니다.
-- overlap 구간에서 정규화한 직전·현재 세그먼트가 같으면 현재 세그먼트를 제거합니다. 원문이 달라 자동 병합이 불확실한 경우 둘 다 보존합니다.
+- GPT 전사 결과의 coarse segment는 청크 안의 세부 발화 시각을 보장하지 않습니다. overlap 구간에서 청크 전체 텍스트가 완전히 같을 때만 제거하는 기존 세그먼트 규칙은 충분하지 않으므로, 인접 청크의 접미·접두 중복을 별도로 비교합니다. 원문이 달라 자동 병합이 불확실한 경우 둘 다 보존하고 누락·중복 가능성을 검증합니다.
 
 ```text
 CAPTURED → UPLOADING → ACKED
+              ├─ REVIEW (ACK 뒤 원본 보존·종료 시 자동 재전사)
               ├─ RETRY_WAIT
               ├─ QUOTA_PAUSED
               └─ FAILED_PERMANENT
 ```
 
-ACK를 받은 청크만 브라우저에서 삭제합니다. 일시 실패와 quota pause의 오디오는 72시간 보존합니다. 사용자별 128 MiB 상한 전에 캡처를 중지하고 내보내기 또는 폐기를 안내합니다.
+일반 ACK를 받은 청크만 브라우저에서 삭제합니다. `review_required=true` 응답을 받은 청크는 ACK되더라도 원본을 `REVIEW`로 72시간 보존합니다. 일시 실패와 quota pause의 오디오도 보존합니다. 사용자별 128 MiB 상한 전에 캡처를 중지하고 내보내기 또는 폐기를 안내합니다.
+`REVIEW` 청크는 일반 전송 반복 대상에서 제외하고 종료 단계에서 한 번만 재처리 큐에 넣습니다. 서버는 오디오 해시와 `review_required` 상태를 검사한 뒤 성공한 재전사 또는 두 번의 빈 결과 확정을 기존 청크에 반영하고 부분 문서를 재구성합니다. 종료 대기 중 다른 청크에서 영구 오류가 발생하면 해당 오류 안내를 주기적인 대기 문구로 덮지 않습니다.
 
 ### 6.3 서버 동시성
 
@@ -225,6 +247,7 @@ OPENAI_QUEUE_WAIT_SECONDS=30
 - 프로세스 전체 OpenAI 동시 호출은 3개로 시작하고 부하 테스트 후 조정합니다.
 - semaphore를 30초 안에 얻지 못하면 `ai_backpressure`를 반환하고 오디오는 outbox에 남깁니다.
 - 메모리 semaphore는 처리량 제어용이며 중복 방지 수단이 아닙니다.
+- 15초·1초 조건의 유입률은 사용자당 약 1/14 청크/초, 동시 사용자 5명일 때 약 0.36 청크/초입니다. OpenAI 동시 호출 3개만 놓고 보면 평균 슬롯 점유 시간이 약 8.4초를 넘을 때 지속 대기열이 생길 수 있으므로, 공급자 응답과 저장 지연을 포함한 실측으로 판단합니다.
 
 ## 7. Atlas 데이터 모델
 
@@ -268,14 +291,15 @@ OPENAI_QUEUE_WAIT_SECONDS=30
   "original_text": "...",
   "korean_text": "...",
   "segments": [],
-  "timestamp_uncertain": false,
+  "review_required": false,
+  "timestamp_uncertain": true,
   "attempt_id": "uuid",
   "lease_until": "datetime",
   "attempt_count": 1,
   "provider_request_id": "...",
-  "requested_model": "whisper-1",
+  "requested_model": "gpt-transcribe",
   "resolved_model": "...",
-  "prompt_version": "transcribe-v1",
+  "prompt_version": "transcribe-gpt-v1",
   "schema_version": 1,
   "expire_at": "datetime"
 }
@@ -310,8 +334,10 @@ OPENAI_QUEUE_WAIT_SECONDS=30
     "text": "...",
     "segments": [],
     "ready_chunk_count": 2,
+    "last_applied_sequence": 1,
     "expected_chunk_count": 3,
-    "missing_sequences": [2]
+    "missing_sequences": [2],
+    "unverified_sequences": []
   },
   "summary": null,
   "requested_model": "gpt-6-luna",
@@ -324,7 +350,9 @@ OPENAI_QUEUE_WAIT_SECONDS=30
 }
 ```
 
-READY 청크가 생길 때마다 서버는 같은 `document_id`의 부분 문서를 upsert합니다. 이 upsert가 성공한 뒤에만 브라우저에 ACK를 반환합니다. 부분 문서는 **7일 후에도 삭제하지 않습니다**. 7일 후 재개용 세션·청크 초안만 TTL 대상으로 삼고 문서는 `resume_status=expired`로 표시합니다.
+READY 청크가 생길 때마다 서버는 같은 `document_id`의 부분 문서를 갱신합니다. 현재 로컬 코드는 첫 청크·검토 필요 청크·복구 시 전체 READY 청크를 재조회해 문서를 구성하고, 이후 정상 순번은 `sequence`와 마지막 반영 순번을 조건으로 증분 반영합니다. 청크 저장·세션 순번·부분 문서 반영이 확인된 뒤에만 브라우저에 ACK를 반환합니다. 일반 ACK에서는 원본을 삭제하지만 `review_required=true` ACK에서는 원본을 보존합니다. 재전송에서는 이미 반영된 순번을 중복 추가하지 않고, 검토 청크를 명시적으로 재전사해 성공하면 해당 세그먼트를 교체하고 문서를 재구성합니다. 부분 문서는 **7일 후에도 삭제하지 않습니다**. 7일 후 재개용 세션·청크 초안만 TTL 대상으로 삼고 문서는 `resume_status=expired`로 표시합니다.
+
+Atlas 무료 클러스터에서는 청크 수 증가에 따른 문서 재작성량과 저장 크기를 함께 측정합니다. 과거 방식처럼 매 청크마다 누적 전사를 모두 다시 쓴다면, 한 시간의 약 257개 청크에서 세그먼트 반영량 합계가 약 3.3만 건으로 증가합니다. 현재 증분 반영의 실제 Atlas 동작과 성능은 무료 플랜 시험에서 검증해야 합니다.
 
 북마크는 신규 문서 스키마와 신규 archive 결과에 포함하지 않습니다. 기존 Atlas 문서에 이미 존재하는 `bookmarks` 필드는 마이그레이션으로 삭제하지 않고 레거시 데이터로 보존하며, 새 확장 프로그램 UI에서는 표시하지 않습니다.
 
@@ -418,6 +446,7 @@ POST /v1/sessions/{session_id}/chunks
 ```
 
 업로드는 `(session_id, sequence, audio_sha256)`로 멱등 처리합니다. 동일 순번·동일 해시는 기존 결과를 반환하고, 동일 순번·다른 해시는 `409 chunk_conflict`를 반환합니다.
+청크 업로드에는 오디오와 함께 브라우저가 측정한 무음 근거를 전달합니다. 이 값은 인증 수단이나 GPT 결과의 대체물이 아니며, 빈 전사 응답을 보수적으로 분류할 때만 사용합니다. 새 확장은 `review_handling_version=1`을 보내 원본 보존 응답을 처리할 수 있음을 알립니다. 두 번 빈 전사의 응답은 `segments=[{"text":"...", ...}]`와 `review_required=true`를 포함합니다. 확장은 다음 청크로 진행하지만 원본 오디오는 `REVIEW`로 보존합니다. 구버전 확장이 이 기능을 알리지 않으면 서버는 기존 422를 반환해 원본을 삭제하지 않게 합니다. 종료 단계 재전사는 동일 해시의 원본과 `review_retry=true`를 보내며, 두 번 모두 비면 서버는 `review_required=false`, `untranscribed_after_retry=true`, `review_attempt_count=2`로 확정합니다.
 
 ### 8.3 종료와 복구
 
@@ -431,8 +460,8 @@ archive 순서:
 2. 업로드 중 요청 drain
 3. `0..expected_chunk_count-1` 누락 검사와 브라우저가 전달한 녹음 중단 구간(`capture_gaps`) 검사
 4. READY 청크로 부분 문서 원자적 upsert
-5. 순번 누락 또는 길이가 0보다 큰 녹음 중단 구간이 있으면 `incomplete`와 `missing_sequences`·`missing_time_ranges`를 유지한다. 확보된 전사가 있으면 finalize lease를 획득해 그 전사만 부분 요약하고 `summary_scope=partial`로 저장한다. 전사가 없으면 `summary_status=not_run`으로 둔다.
-6. 두 종류의 누락이 모두 없으면 finalize lease를 획득해 완전한 요약을 진행한다.
+5. 순번 누락, 아직 재전사되지 않은 `unverified_sequences`, 길이가 0보다 큰 녹음 중단 구간 중 하나라도 있으면 `incomplete`를 유지한다. 두 번 재전사해도 빈 청크는 `accepted_untranscribed_sequences`로 기록하고 `unverified_sequences`에서 제외한다. 확보된 전사가 있으면 `...`을 제외한 전사만 요약하고, 전사가 전혀 없으면 `summary_status=not_run`으로 완료할 수 있다.
+6. 세 종류의 미확인·누락이 모두 없으면 finalize lease를 획득해 완전한 요약을 진행한다.
 7. 전체 한국어 자막 조합과 BSON·요약 입력 크기 검사
 8. GPT-6 Luna 최종 요약 실행. 일시적 연결·시간 초과·속도 제한은 제한된 횟수로 재시도할 수 있으며, 최종 결과는 한 번만 DB에 확정
 9. 요약 본문·요약 메타데이터·`summary_status=completed`·`status=completed`를 같은 문서의 단일 원자적 쓰기로 확정
@@ -555,6 +584,7 @@ reconciliation은 만료된 processing lease를 해제하고, 오래된 processi
 | 409 | archive_in_progress | 기존 finalize 상태 조회 |
 | 413 | chunk_too_large | outbox 보존, 설정 확인 |
 | 422 | invalid_chunk_metadata | 메타데이터 수정 전 재시도 금지 |
+| 200 | review_required | `...` 표시, 원본 `REVIEW` 보존, 다음 청크 처리 |
 | 429 | provider_rate_limited | Retry-After 후 재시도 |
 | 429 | provider_quota_exhausted | 공급자 pause, 자동 반복 중단 |
 | 429 | operator_budget_limit | 예산 한도, outbox 보존 |
@@ -572,7 +602,7 @@ MONGODB_DATABASE=lecture_memo
 APP_AUTH_MODE=atlas_users
 ADMIN_ACCESS_TOKEN=<Render Secret>
 OPENAI_API_KEY=<Render Secret>
-OPENAI_TRANSCRIBE_MODEL=whisper-1
+OPENAI_TRANSCRIBE_MODEL=gpt-transcribe
 OPENAI_TEXT_MODEL=gpt-6-luna
 OPENAI_TRANSCRIBE_TIMEOUT_SECONDS=90
 OPENAI_TEXT_TIMEOUT_SECONDS=60
@@ -581,16 +611,16 @@ OPENAI_MAX_IN_FLIGHT=3
 OPENAI_QUEUE_WAIT_SECONDS=30
 MAX_CONCURRENT_USERS=5
 MOCK_OPENAI=false
-AUDIO_CHUNK_SECONDS=60
-AUDIO_CHUNK_OVERLAP_SECONDS=2
-AUDIO_BITS_PER_SECOND=128000
+AUDIO_CHUNK_SECONDS=15
+AUDIO_CHUNK_OVERLAP_SECONDS=1
+AUDIO_BITS_PER_SECOND=64000
 MAX_CHUNK_BYTES=6000000
 MAX_REQUEST_BYTES=6500000
 MAX_SESSION_DURATION_SECONDS=14400
 MAX_DOCUMENT_BYTES=12000000
 DRAFT_RETENTION_DAYS=7
 SESSION_IDLE_TTL_SECONDS=1800
-PROCESSING_LEASE_SECONDS=180
+PROCESSING_LEASE_SECONDS=360
 FINALIZE_LEASE_SECONDS=600
 DAILY_AUDIO_MINUTES_LIMIT_PER_USER=0
 DAILY_AUDIO_MINUTES_LIMIT_TOTAL=0
@@ -649,7 +679,7 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 4. 서로 다른 PC·확장 ID에서 같은 계정으로 캡처·복구·문서 조회를 검증하고, 중지·재발급이 다음 요청부터 적용되는지 확인합니다.
 5. 검증 후 Render의 `APP_USER_n_*`와 `ALLOWED_EXTENSION_ORIGINS`를 제거하고 운영 설명서를 갱신합니다.
 
-기존 V8 기능의 구현 순서는 다음과 같습니다.
+기존 V8 기능의 구현 이력은 다음과 같습니다. 아래의 `whisper-1` 항목은 이전 구현의 이력이며 현재 전사 모델을 뜻하지 않습니다.
 
 1. V8 환경변수와 시작 검증
 2. 최대 사용자 5명, 토큰 해시, 인증 실패 제한
@@ -665,7 +695,17 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 12. 사이드 패널 `/health/live` Render 확인, `/health/ready` 저장소 확인, 실제 GPT 처리 결과의 독립 상태 표시
 13. 시작·조회·재개·종료 reconciliation
 14. 혼합형 사이드 패널, 인증 정보 접기·변경, 북마크 제외 및 구버전 payload 호환, IndexedDB 복구·삭제 확인
-15. 5명 동시 부하·중단·재시작·quota 테스트 후 수동 배포
+15. 5명 동시 부하·중단·재시작·quota 시험과 수동 배포는 아직 미실행
+
+`gpt-transcribe` 전환안의 구현·판정 순서는 다음과 같습니다. 2~4번의 로컬 코드 변경과 모의 응답 기반 기본 시험은 진행했습니다. 1번의 실제 음성 코퍼스 검증, 5~7번의 실제 공급자·무료 플랜 시험과 운영 전환은 미실행입니다.
+
+1. 한국어 강의·영어 기술 용어·혼합 발화·침묵·청크 경계의 음성 자료와 기대 전사문을 준비합니다. 전사 정확도와 중복·누락을 현행 방식과 비교합니다.
+2. 모델 설정 검사, GPT 전사 요청·`text`/`languages[]` 응답 변환, 불확실한 coarse segment, 한국어/비한국어 변환 분기를 구현합니다.
+3. 15초 청크·1초 겹침과 인접 청크 중복 문구 처리, 배속 영상 시각 변환, 확장 프로그램의 표시·outbox 재시도를 구현·검증합니다.
+4. Atlas 부분 문서 증분 반영과 순번 기반 멱등 복구를 구현합니다. 청크 READY·부분 문서 갱신 성공 전 ACK 금지, 최종 요약의 완전한 전사 입력 조건을 유지합니다.
+5. 한국어 기능 시험과 모의 OpenAI 응답의 지연·실패 주입을 통과한 뒤, 실제 GPT 요청으로 응답 형식·전사 품질·청크 처리 지연·비용을 소규모 검증합니다.
+6. Render 무료 Web Service와 Atlas 무료 클러스터에서 1명→3명→5명 동시 사용을 단계적으로 시험합니다. 15초·1초 실제 간격으로 청크를 보내고 유휴 후 기동, 429/503/timeout, 재시작·복구, 종료·부분/완료 요약을 포함합니다.
+7. 처리 대기열과 오류가 안정적이고 문서가 완성되는 경우에만 운영 전환을 승인합니다. Render 설정 변경과 수동 배포는 별도 실행 단계입니다.
 
 ## 16. 검증 기준
 
@@ -685,7 +725,15 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 캡처·복구 중에는 사용자 인증 정보를 수정할 수 없습니다.
 - 사이드 패널에 북마크 UI가 없고 신규 최종 요약은 전사만 입력으로 사용합니다.
 - 레거시 확장 프로그램의 `bookmarks`는 최종 요약·신규 문서에 반영하지 않으며 기존 Atlas 문서를 삭제·변경하지 않습니다.
-- 60초 청크·2초 overlap과 0 기반 누락 검사가 정확합니다.
+- 15초 청크·1초 overlap, 14초 시작 간격과 0 기반 누락 검사가 정확합니다.
+- GPT 전사 응답의 `text`·`languages[]`를 처리하고 Whisper 전용 타임스탬프 파라미터를 보내지 않습니다. 한국어 또는 감지 불확실 청크가 `unknown`이라는 이유로 불필요하게 번역되지 않습니다.
+- 한국어 중심 요청은 `languages=["ko", "en"]`를 보내며 `keywords` 없이 전사합니다.
+- 사람 정답 전사문과 동일 구간의 자막을 비교해 전체·유형별 CER와 음성 구간의 빈 전사 수를 측정합니다. 실제 강의 데이터로 변경 전후 경계 누락·중복과 처리 시간을 검증합니다.
+- 의심 청크에 한해 최대 한 번 검증 전사를 수행하며, 인접한 약 29초 오디오가 있으면 앞 청크의 확정 자막으로 현재 부분을 찾아 비교합니다. 확신할 수 없는 후보로 기존 자막을 덮어쓰지 않습니다.
+- 무음으로 확인된 빈 응답은 재전사 없이 빈 READY 청크로 저장하고, 음량이 있거나 측정이 불확실한 빈 응답은 추가 전사를 최대 한 번만 수행합니다. 두 번 모두 비면 `...`과 `review_required`를 저장하고 다음 청크를 처리하되 원본은 `REVIEW`로 보존합니다. 응답 형식 오류와 `languages=[]`를 침묵으로 오인하지 않습니다.
+- 종료 시 `REVIEW` 청크마다 최대 두 번 재전사합니다. 두 번 모두 정상적인 빈 응답이면 `...`을 유지한 채 검토 상태를 해제하고, 원본을 삭제한 뒤 문서를 완료할 수 있습니다. API 실패나 일일 한도 초과는 빈 응답으로 세지 않습니다.
+- 청크당 coarse segment의 `uncertain`·`timestamp_uncertain` 값이 정확하며 문장별 시각을 제공한다고 표시하지 않습니다.
+- 인접 청크의 1초 겹침에서 중복·누락과 강의 용어의 절단을 한국어·혼합 강의 자료로 검사합니다. 모호한 문구는 임의로 제거하지 않습니다.
 - 동일 청크 재전송은 OpenAI 결과를 중복 저장하지 않습니다.
 - 청크가 READY로 저장된 직후 세션 순번 또는 부분 문서 저장이 실패해도, 재전송 시 두 상태를 복구한 뒤에만 ACK합니다.
 - 처리 lease가 만료돼 새 시도가 시작되면 이전 `attempt_id`의 늦은 결과가 READY 청크를 덮어쓰지 못합니다.
@@ -697,7 +745,7 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 녹음 중단 구간이 있으면 순번이 모두 READY여도 `missing_time_ranges`가 있는 미완료 문서로 남습니다.
 - 모든 청크가 준비되고 녹음 중단 구간이 없는 경우에만 완전한 최종 요약이 DB 결과로 반영됩니다.
 - 빈 문자열 또는 공백뿐인 요약은 완료로 저장하지 않습니다.
-- 60초를 넘는 GPT 응답·일시적 `502`·처리 중 `409` 뒤에도 최종 저장을 재시도하고 중복 문서를 만들지 않습니다.
+- 청크 간격보다 늦는 GPT 응답·일시적 `502`·처리 중 `409` 뒤에도 최종 저장을 재시도하고 중복 문서를 만들지 않습니다.
 - 요약 실패 문서는 `summary_status=failed`와 원인 코드가 남으며, 재시도 성공 시 코드가 지워집니다.
 - `completed` 문서는 요약 본문과 요약 메타데이터를 같은 원자적 쓰기로 포함합니다.
 
@@ -724,6 +772,14 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 - 전사문에 삽입된 명령이 요약 지침을 바꾸지 못합니다.
 - 사용량과 추정 비용이 날짜·사용자별로 집계됩니다.
 
+### Render·Atlas 무료 플랜 부하 판정
+
+- 실제 무료 플랜에서 먼저 모의 전사 응답에 실측 GPT 지연 분포를 주입해 OpenAI 과금 없이 서버·Atlas 경로를 시험하고, 소규모 실제 GPT 호출로 응답 형식과 공급자 지연을 별도 확인합니다. 즉시 응답하는 모의 모드의 성공만으로 실제 처리량을 판정하지 않습니다.
+- 1명·3명·5명 동시 사용자별로 청크 업로드→ACK 지연의 p50/p95, OpenAI 슬롯 대기, 브라우저 outbox 길이, `ai_backpressure`·429·503·timeout 비율을 기록합니다. 지속 시험에서 대기열이 계속 증가하거나 세션 종료 후 READY 청크가 남으면 불합격입니다.
+- Render 프로세스의 메모리 사용량·재시작·응답 시간을 보고 512 MB 제한 안에서 안정적인지 확인합니다. 유휴 15분 뒤 첫 요청의 기동 지연은 지속 처리 지연과 분리해 기록합니다.
+- Atlas의 저장 공간, 읽기·쓰기 작업량, 인증 조회, 청크/부분 문서 갱신 지연과 쓰기 오류를 관찰합니다. 무료 클러스터의 512 MB 저장 제한과 초당 최대 100회 작업을 초과하지 않도록 실제 측정과 장기 저장량 추정을 함께 확인합니다. 테스트 자료는 운영 문서와 분리하고 종료 후 정리합니다.
+- 완료 판정은 모든 순번의 단 한 번 반영, 부분 문서 복구, 최종 요약의 누락 없는 입력, 사용자 소유권 격리, 장시간 녹음 후 문서 크기 한도를 포함합니다. 5명 동시 상태에서 측정된 지연이나 오류가 기준을 만족하지 못하면 사용자 한도·청크 처리 방식 등을 다시 설계한 뒤 재시험합니다.
+
 ## 17. 운영자가 입력할 값
 
 | 값 | 위치 |
@@ -740,16 +796,20 @@ Render outbound IP 대역이 고정·보장되는지 현재 요금제 문서를 
 
 2026-09-28 OpenAI 공개 표준 가격(입력 272K 토큰 이하) 기준 GPT-6 Luna는 입력 100만 토큰당 $0.10, 캐시 입력 $0.01, 캐시 쓰기 $0.125, 출력 $0.50입니다. 이전 GPT-5.6 Luna 가격($0.20 입력·$1.20 출력)과 비교하면 입력 단가는 50%, 출력 단가는 약 58% 낮습니다. 예시로 입력·출력 각 100만 토큰이면 $0.60이며, 이전 모델의 $1.40보다 $0.80 저렴합니다. 한 요청의 입력이 272K 토큰을 넘으면 입력·캐시 요금은 2배, 출력은 1.5배가 적용됩니다.
 
-오디오 전사는 Whisper-1의 별도 음성 전사 단가가 적용되고 GPT-6 Luna 단가가 적용되지 않습니다. 이전 월 총액 추정은 GPT-5.6 Luna 가격을 전제로 했으므로 더 이상 기준으로 사용하지 않습니다. 실제 월 비용은 전사 분량과 번역·요약 입력/출력 토큰 사용량을 `daily_usage`에 기록한 뒤 다시 산정하며, Render와 Atlas 비용은 별도입니다.
+오디오 전사는 `gpt-transcribe`의 공개 추정 단가인 음성 분당 $0.0045를 기준으로 산정하며 GPT-6 Luna의 텍스트 단가를 적용하지 않습니다. 15초 청크·1초 겹침은 긴 녹음에서 전송 음성량을 약 15/14배로 늘리므로 강의 한 시간의 기본 전사비는 재시도 제외 약 $0.289입니다. 100시간이면 약 $28.93입니다. 의심 청크 비율이 20%이고 모두 29초 검증 전사를 사용한다면 추가 처리 음성량은 기본 대비 약 39%, 40%라면 약 77%입니다. 이는 예시 비율이며 실제 비율은 평가 코퍼스와 사용량 기록으로 확인합니다. 검증 오디오 업로드는 호출 여부와 관계없이 브라우저 인코딩·전송량을 늘립니다. 번역·요약 비용, 공급자 재시도, 실제 청구 방식은 별도이며 운영 비용은 사용량 기록과 청구 내역으로 검증합니다. Render와 Atlas는 무료 플랜의 자원·사용 한도 안에서 운영 가능한지 부하 테스트로 판정합니다.
 
 ## 19. 공식 참고 문서
 
 - OpenAI GPT-6 Luna: https://developers.openai.com/api/docs/models/gpt-6-luna
 - OpenAI GPT-5.6 Luna (가격 비교 참고): https://developers.openai.com/api/docs/models/gpt-5.6-luna
 - OpenAI Audio Transcriptions API: https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create
+- OpenAI 파일 전사 및 타임스탬프 지원: https://developers.openai.com/api/docs/guides/speech-to-text
+- OpenAI 전사 가격: https://developers.openai.com/api/docs/pricing
 - OpenAI Responses API: https://developers.openai.com/api/reference/resources/responses/methods/create
 - OpenAI 데이터 제어: https://developers.openai.com/api/docs/guides/your-data
 - Render Python 배포: https://render.com/docs/deploy-fastapi
 - Render 무료 인스턴스: https://render.com/docs/free
+- Render 무료 Web Service 사양: https://render.com/docs/compute-plans
+- MongoDB Atlas 무료 플랜: https://www.mongodb.com/pricing
 - MongoDB Atlas Network Access: https://www.mongodb.com/docs/atlas/security/ip-access-list/
 - MongoDB TTL 인덱스: https://www.mongodb.com/docs/manual/core/index-ttl/
