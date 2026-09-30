@@ -105,6 +105,14 @@ class InMemoryStore:
             current.update(deepcopy(values))
             return True
 
+    async def replace_review_chunk(self, owner_id: str, session_id: str, sequence: int, audio_sha256: str, values: dict[str, Any]) -> bool:
+        async with self.lock:
+            current = self.chunks.get((owner_id, session_id, sequence))
+            if not current or current.get("status") != "ready" or not current.get("review_required") or current.get("audio_sha256") != audio_sha256:
+                return False
+            current.update(deepcopy(values))
+            return True
+
     async def list_chunks(self, owner_id: str, session_id: str) -> list[dict[str, Any]]:
         async with self.lock: rows = [public_document(v) for k, v in self.chunks.items() if k[:2] == (owner_id, session_id)]
         return sorted((v for v in rows if v), key=lambda v: v["sequence"])
@@ -349,6 +357,10 @@ class MongoStore(InMemoryStore):
         query = {"owner_id": value["owner_id"], "session_id": value["session_id"], "sequence": value["sequence"]}; await asyncio.to_thread(self.chunks.update_one, query, {"$set": deepcopy(value)}, upsert=True)
     async def finish_chunk(self, claim: dict[str, Any], values: dict[str, Any]) -> bool:
         query = {"owner_id": claim["owner_id"], "session_id": claim["session_id"], "sequence": claim["sequence"], "status": "processing", "attempt_id": claim["attempt_id"]}
+        result = await asyncio.to_thread(self.chunks.update_one, query, {"$set": deepcopy(values)})
+        return bool(result.matched_count)
+    async def replace_review_chunk(self, owner_id: str, session_id: str, sequence: int, audio_sha256: str, values: dict[str, Any]) -> bool:
+        query = {"owner_id": owner_id, "session_id": session_id, "sequence": sequence, "status": "ready", "review_required": True, "audio_sha256": audio_sha256}
         result = await asyncio.to_thread(self.chunks.update_one, query, {"$set": deepcopy(values)})
         return bool(result.matched_count)
     async def list_chunks(self, owner_id: str, session_id: str) -> list[dict[str, Any]]:

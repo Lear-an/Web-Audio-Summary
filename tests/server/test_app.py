@@ -110,7 +110,7 @@ def create_session(client: TestClient) -> str:
     return response.json()["session_id"]
 
 
-def upload_chunk(client: TestClient, session_id: str, sequence: int = 0, audio_signal_status: str = "unknown"):
+def upload_chunk(client: TestClient, session_id: str, sequence: int = 0, audio_signal_status: str = "unknown", review_retry: bool = False, review_handling_version: int = 1):
     return client.post(
         f"/v1/sessions/{session_id}/chunks",
         headers=HEADERS,
@@ -122,6 +122,8 @@ def upload_chunk(client: TestClient, session_id: str, sequence: int = 0, audio_s
             "playback_rate": "1.0",
             "overlap_ms": "0" if sequence == 0 else "1000",
             "audio_signal_status": audio_signal_status,
+            "review_retry": str(review_retry).lower(),
+            "review_handling_version": str(review_handling_version),
             "mime_type": "audio/webm;codecs=opus",
         },
         files={"audio": (f"chunk-{sequence}.webm", b"webm-test-data", "audio/webm")},
@@ -256,25 +258,101 @@ def test_non_silent_empty_transcript_retries_once_and_counts_both_calls(monkeypa
         assert usage["transcription_requests"] == 2
 
 
-def test_unknown_empty_transcript_blocks_without_ack(monkeypatch) -> None:
+def test_unknown_empty_transcript_marks_review_and_allows_next_chunk(monkeypatch) -> None:
+    calls = []
+    summary_inputs = []
+
+    async def transcribe(**kwargs):
+        calls.append(kwargs)
+        if kwargs["sequence"] == 0:
+            return TranscriptionResult(transcript=TranscriptPayload(segments=[]), language="unknown", original_text="", provider_request_id=None, resolved_model="gpt-transcribe", usage={})
+        text = "다음 청크의 발화"
+        return TranscriptionResult(transcript=TranscriptPayload(segments=[TranscriptSegment(relative_start_ms=0, relative_end_ms=kwargs["duration_ms"], text=text, original_text=text, uncertain=True)]), language="ko", original_text=text, provider_request_id=None, resolved_model="gpt-transcribe", usage={})
+
+    async def summarize(*, transcript, **_kwargs):
+        summary_inputs.append(transcript)
+        return SummaryResponse(summary="확보된 발화의 부분 요약입니다."), {}
+
+    monkeypatch.setattr(gateway, "transcribe", transcribe)
+    monkeypatch.setattr(gateway, "summarize", summarize)
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        response = upload_chunk(client, session_id)
+        assert response.status_code == 200
+        assert response.json()["review_required"] is True
+        assert response.json()["segments"][0]["text"] == "..."
+        assert len(calls) == 2
+        saved = asyncio.run(store.get_chunk("local", session_id, 0))
+        assert saved["status"] == "ready"
+        assert saved["review_required"] is True
+        assert saved["silence_confirmed"] is False
+        assert upload_chunk(client, session_id, 1).status_code == 200
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["chunk_state"]["unverified_sequences"] == [0]
+        assert document["transcript"]["text"] == "...\n다음 청크의 발화"
+        archived = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 2, "duration_ms": 30_000})
+        assert archived.status_code == 200
+        assert archived.json()["status"] == "incomplete"
+        assert archived.json()["unverified_sequences"] == [0]
+        assert summary_inputs == ["다음 청크의 발화"]
+        assert store.daily_usage[("local", utcnow().date().isoformat())]["transcription_requests"] == 3
+
+
+def test_explicit_review_retry_replaces_placeholder_and_can_complete(monkeypatch) -> None:
     calls = []
 
     async def transcribe(**kwargs):
         calls.append(kwargs)
+        text = "복구된 발화" if len(calls) == 3 else ""
+        segments = [TranscriptSegment(relative_start_ms=0, relative_end_ms=kwargs["duration_ms"], text=text, original_text=text, uncertain=True)] if text else []
+        return TranscriptionResult(transcript=TranscriptPayload(segments=segments), language="ko", original_text=text, provider_request_id=None, resolved_model="gpt-transcribe", usage={})
+
+    monkeypatch.setattr(gateway, "transcribe", transcribe)
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, audio_signal_status="non_silent").json()["review_required"] is True
+        first_archive = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1, "duration_ms": 15_000})
+        assert first_archive.json()["unverified_sequences"] == [0]
+        retried = upload_chunk(client, session_id, audio_signal_status="non_silent", review_retry=True)
+        assert retried.status_code == 200
+        assert retried.json()["review_required"] is False
+        assert retried.json()["segments"][0]["text"] == "복구된 발화"
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["chunk_state"]["unverified_sequences"] == []
+        assert document["transcript"]["text"] == "복구된 발화"
+        completed = client.post(f"/v1/sessions/{session_id}/archive", headers=HEADERS, json={"expected_chunk_count": 1, "duration_ms": 15_000})
+        assert completed.json()["saved"] is True
+
+
+def test_later_empty_chunk_is_recorded_as_unverified(monkeypatch) -> None:
+    async def transcribe(**kwargs):
+        text = "앞 청크의 발화" if kwargs["sequence"] == 0 else ""
+        segments = [TranscriptSegment(relative_start_ms=0, relative_end_ms=kwargs["duration_ms"], text=text, original_text=text, uncertain=True)] if text else []
+        return TranscriptionResult(transcript=TranscriptPayload(segments=segments), language="ko", original_text=text, provider_request_id=None, resolved_model="gpt-transcribe", usage={})
+
+    monkeypatch.setattr(gateway, "transcribe", transcribe)
+    with TestClient(app) as client:
+        session_id = create_session(client)
+        assert upload_chunk(client, session_id, 0).status_code == 200
+        second = upload_chunk(client, session_id, 1, audio_signal_status="non_silent")
+        assert second.status_code == 200
+        assert second.json()["review_required"] is True
+        document = asyncio.run(store.get_document_for_session("local", session_id))
+        assert document["chunk_state"]["unverified_sequences"] == [1]
+        assert document["transcript"]["segments"][-1]["review_required"] is True
+
+
+def test_legacy_extension_keeps_audio_when_review_ack_is_unsupported(monkeypatch) -> None:
+    async def transcribe(**_kwargs):
         return TranscriptionResult(transcript=TranscriptPayload(segments=[]), language="unknown", original_text="", provider_request_id=None, resolved_model="gpt-transcribe", usage={})
 
     monkeypatch.setattr(gateway, "transcribe", transcribe)
     with TestClient(app) as client:
         session_id = create_session(client)
-        response = upload_chunk(client, session_id)
+        response = upload_chunk(client, session_id, audio_signal_status="non_silent", review_handling_version=0)
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "empty_transcript_unverified"
-        assert response.json()["error"]["retryable"] is False
-        assert len(calls) == 2
-        saved = asyncio.run(store.get_chunk("local", session_id, 0))
-        assert saved["status"] == "blocked"
-        assert asyncio.run(store.get_document_for_session("local", session_id)) is None
-        assert store.daily_usage[("local", utcnow().date().isoformat())]["transcription_requests"] == 2
+        assert asyncio.run(store.get_chunk("local", session_id, 0))["status"] == "blocked"
 
 
 def test_legacy_bookmarks_are_ignored_but_existing_document_field_is_preserved() -> None:

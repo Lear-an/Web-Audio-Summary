@@ -66,6 +66,7 @@
       notes: emptyNotes(),
       documentId: null,
       finalizePending: false,
+      reviewCount: 0,
       archivedIncomplete: false,
       videoState: {
         hasVideo: false,
@@ -142,6 +143,7 @@
       recoveryRequired: Boolean(session.recoveryRequired),
       archivedIncomplete: Boolean(session.archivedIncomplete),
       finalizePending: Boolean(session.finalizePending),
+      reviewCount: session.reviewCount,
       hasStream: Boolean(session.stream),
       mockMode: Boolean(session.mockMode),
       providerStatus: { ...session.providerStatus },
@@ -340,7 +342,7 @@
     );
   }
 
-  async function restoreRecoverableOutbox() {
+  async function restoreRecoverableOutbox(includeReview = false) {
     await Outbox.markExpired();
     const latest = await Outbox.latestRecoverable(session.sourceUrl);
     if (!latest) return false;
@@ -364,22 +366,24 @@
       session.archivedIncomplete = marker.state === "INCOMPLETE";
       session.gaps = Array.isArray(marker.gaps) ? marker.gaps : [];
     }
-    const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED"].includes(record.state));
-    if (marker?.state === "INCOMPLETE" && pending.length === 0) {
+    const reviewRecords = records.filter((record) => record.kind === "chunk" && record.state === "REVIEW");
+    session.reviewCount = reviewRecords.length;
+    const pending = records.filter((record) => record.kind !== "session" && !["ACKED", "EXPIRED", "REVIEW"].includes(record.state));
+    if (marker?.state === "INCOMPLETE" && pending.length === 0 && reviewRecords.length === 0) {
       await Outbox.remove(marker.id);
       session.serverSessionId = null;
       session.archivedIncomplete = false;
       session.notice = "이전 미완료 문서는 서버에 남아 있습니다. 새 캡처를 시작합니다.";
       return false;
     }
-    session.queue = pending.map((record) => ({ ...record, unavailableAttempts: record.unavailableAttempts || 0 }));
+    session.queue = [...pending, ...(includeReview ? reviewRecords : [])].map((record) => ({ ...record, reviewRetry: record.state === "REVIEW", unavailableAttempts: record.unavailableAttempts || 0 }));
     session.queue.sort((left, right) => left.sequence - right.sequence);
     session.queuedBytes = session.queue.reduce((sum, chunk) => sum + Number(chunk.blob?.size || chunk.size || 0), 0);
     session.nextSequence = Math.max(
       session.nextSequence,
       ...records.filter((record) => record.kind !== "session").map((record) => Number(record.sequence) + 1)
     );
-    session.notice = `보존된 세션과 청크 ${pending.length}개를 복구했습니다.`;
+    session.notice = `보존된 세션과 청크 ${session.queue.length}개를 복구했습니다.`;
     for (const chunk of session.queue.filter((record) => Core.isSessionResumeRequired(record))) {
       chunk.state = "PENDING";
       await Outbox.updateState(chunk.id, "PENDING", "서버 세션 복원 완료");
@@ -388,6 +392,10 @@
     if (pending.some((record) => record.state === "NEEDS_ACTION")) {
       session.state = SESSION_STATE.PAUSED_ACTION;
       session.notice = "사용자 조치가 필요한 원본 청크가 보존되어 있습니다.";
+    }
+    if (!includeReview && reviewRecords.length > 0 && pending.length === 0) {
+      session.state = SESSION_STATE.PAUSED_ACTION;
+      session.notice = `전사 확인이 필요한 청크 ${reviewRecords.length}개가 보존되어 있습니다. 원본을 내보내거나 재전사해 주세요.`;
     }
     if (!session.finalizePending && !session.archivedIncomplete) await preserveSessionMarker("ACTIVE");
     return true;
@@ -700,7 +708,14 @@
       if (session.stats.recentLatenciesMs.length > 100) session.stats.recentLatenciesMs.shift();
       applyTranscriptResponse(chunk, response);
       recordProviderSuccess();
-      await Outbox.remove(chunk.id);
+      if (response?.review_required) {
+        await Outbox.updateState(chunk.id, "REVIEW", "전사 결과가 두 번 비었습니다. 원본을 확인하거나 명시적으로 재전사해 주세요.");
+        if (!chunk.reviewRetry) session.reviewCount += 1;
+        session.notice = `청크 ${chunk.sequence}은 전사 결과가 없어 ...으로 표시했습니다. 원본 오디오는 보존했습니다.`;
+      } else {
+        await Outbox.remove(chunk.id);
+        if (chunk.reviewRetry) session.reviewCount = Math.max(0, session.reviewCount - 1);
+      }
     } catch (error) {
       recordProviderFailure(error);
       const quotaExhausted = error?.code === "openai_quota_exhausted" || (error?.status === 429 && (!error?.code || error.code === "http_error"));
@@ -818,6 +833,8 @@
     form.append("playback_rate", String(chunk.playbackRate));
     form.append("overlap_ms", String(chunk.overlapMs));
     form.append("audio_signal_status", chunk.audioSignalStatus || "unknown");
+    form.append("review_handling_version", "1");
+    form.append("review_retry", String(Boolean(chunk.reviewRetry)));
     form.append("mime_type", chunk.mimeType);
 
     const response = await fetchWithTimeout(
@@ -839,6 +856,7 @@
           end_ms: Math.round(chunk.videoStartMs + relativeEnd * chunk.playbackRate),
           text: String(segment.text || "").trim(),
           uncertain: Boolean(segment.uncertain),
+          review_required: Boolean(segment.review_required || response?.review_required),
           status: "final"
         };
       })
@@ -872,9 +890,9 @@
       await navigator.storage?.persist?.().catch(() => false);
       const resumed = await restoreRecoverableOutbox();
       if (!resumed) await createServerSession();
-      if ((session.finalizePending || session.archivedIncomplete) && session.queue.length > 0) {
+      if ((session.finalizePending || session.archivedIncomplete) && (session.queue.length > 0 || session.reviewCount > 0)) {
         session.state = SESSION_STATE.PAUSED_ACTION;
-        session.notice = "종료된 세션의 보존 청크가 있습니다. '보존 청크 처리'를 눌러 주세요.";
+        session.notice = "종료된 세션의 보존 청크가 있습니다. 원본을 내보내거나 '보존 청크 처리'를 눌러 주세요.";
         broadcastSnapshot();
         return { ok: true, snapshot: publicSnapshot() };
       }
@@ -989,7 +1007,7 @@
       return { ok: false, error: "사용자 ID와 접속 코드를 입력해 주세요.", snapshot: publicSnapshot() };
     }
     try {
-      const restored = await restoreRecoverableOutbox();
+      const restored = await restoreRecoverableOutbox(true);
       if (!restored) return { ok: false, error: "처리할 보존 청크가 없습니다.", snapshot: publicSnapshot() };
       if (session.queue.some((chunk) => chunk.state === "EXPIRED")) {
         return { ok: false, error: "72시간 보존 기간이 지났습니다. 원본 오디오를 내보내 확인해 주세요.", snapshot: publicSnapshot() };
@@ -1011,6 +1029,7 @@
           session.state = SESSION_STATE.STOPPED;
           session.notice = archive?.saved
             ? "보존 청크 처리와 최종 문서 저장을 완료했습니다."
+            : archive?.unverified_sequences?.length ? `전사 확인 필요 청크 ${archive.unverified_sequences.length}개를 원본과 함께 보존했습니다.${archive?.summary ? " 확보된 자막만 부분 요약했습니다." : " 요약할 자막은 아직 없습니다."}`
             : archive?.summary ? "미완료 문서에 확보된 자막의 부분 요약을 저장했습니다. 누락 구간을 확인해 주세요." : "보존 청크를 처리했지만 서버 문서가 미완료 상태입니다. 누락 구간을 확인해 주세요.";
         } catch (error) {
           session.state = SESSION_STATE.PAUSED_ACTION;
@@ -1053,6 +1072,7 @@
     const deadline = Date.now() + waitMs;
     let lastNoticeAt = 0;
     while ((session.queue.length > 0 || session.processing) && Date.now() < deadline) {
+      if (!session.processing && [SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)) break;
       if (!session.processing) scheduleQueueProcessing();
       if (Date.now() - lastNoticeAt >= 1_000) {
         const pending = session.queue.length + (session.processing ? 1 : 0);
@@ -1072,7 +1092,7 @@
 
     const pendingCount = session.queue.length + (session.processing ? 1 : 0);
     if (pendingCount > 0) {
-      session.notice = `종료 대기시간을 초과했습니다. 청크 ${pendingCount}개는 IndexedDB에 보존됩니다.`;
+      if (![SESSION_STATE.PAUSED_QUOTA, SESSION_STATE.PAUSED_ACTION].includes(session.state)) session.notice = `종료 대기시간을 초과했습니다. 청크 ${pendingCount}개는 IndexedDB에 보존됩니다.`;
       broadcastSnapshot();
     }
     return { drained: pendingCount === 0, pendingCount };
@@ -1111,7 +1131,7 @@
     if (payload?.saved) {
       await Outbox.remove(`${session.serverSessionId}:session`);
     } else {
-      await preserveSessionMarker("INCOMPLETE", `누락 청크: ${(payload?.missing_sequences || []).join(", ")}; 녹음 누락 구간: ${(payload?.missing_time_ranges || []).length}`);
+      await preserveSessionMarker("INCOMPLETE", `누락 청크: ${(payload?.missing_sequences || []).join(", ")}; 전사 확인 필요: ${(payload?.unverified_sequences || []).join(", ")}; 녹음 누락 구간: ${(payload?.missing_time_ranges || []).length}`);
     }
     return payload;
   }
@@ -1165,6 +1185,7 @@
       const archive = await archiveServerSessionWithRetry();
       session.notice = archive?.saved
         ? `${reason} 최종 자막과 요약을 저장했습니다. 문서 ID: ${archive.document_id}`
+        : archive?.unverified_sequences?.length ? `${reason} 전사 확인 필요 청크 ${archive.unverified_sequences.length}개를 원본과 함께 보존했습니다.${archive?.summary ? " 확보된 자막만 부분 요약했습니다." : " 요약할 자막은 아직 없습니다."}`
         : archive?.summary ? `${reason} 미완료 문서와 확보된 자막의 부분 요약을 저장했습니다.` : `${reason} 처리되지 않은 청크를 보존한 미완료 세션으로 저장했습니다.`;
     } catch (error) {
       session.finalizePending = true;

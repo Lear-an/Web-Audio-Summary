@@ -93,12 +93,12 @@
     const active = isRunning();
     const retryingQuota = snapshot.state === SESSION_STATE.PAUSED_QUOTA;
     const recoveringSession = Boolean(snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION);
-    const processingPreserved = Boolean(!snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state));
-    elements.startButton.textContent = processingPreserved ? "보존 청크 처리" : (recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작"));
+    const processingPreserved = Boolean(!snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending || snapshot.reviewCount > 0) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state));
+    elements.startButton.textContent = processingPreserved ? (snapshot.queueCount > 0 ? "보존 청크 처리" : "보존 청크 재전사") : (recoveringSession ? "서버 세션 복구" : (retryingQuota ? "처리 다시 시도" : "캡처 시작"));
     elements.startButton.disabled = startActionPending || (active && !recoveringSession && !retryingQuota && !processingPreserved);
     elements.stopButton.disabled = !active || snapshot.state === SESSION_STATE.STOPPING;
     const needsAction = snapshot.state === SESSION_STATE.PAUSED_ACTION;
-    elements.exportPreservedButton.hidden = !(snapshot.queueCount > 0);
+    elements.exportPreservedButton.hidden = !(snapshot.queueCount > 0 || snapshot.reviewCount > 0);
     elements.discardButton.hidden = !needsAction;
     elements.userId.disabled = active && !needsAction;
     elements.accessToken.disabled = active && !needsAction;
@@ -236,13 +236,14 @@
       time.className = "timestamp";
       time.type = "button";
       time.textContent = Core.formatClock(caption.start_ms);
+      if (caption.uncertain && !caption.review_required) time.title = "문장별 시각 정렬이 없어 청크 시작 시각을 표시합니다.";
       time.addEventListener("click", () => seekTo(caption.start_ms));
       const text = document.createElement("div");
-      text.className = `caption-text ${caption.uncertain ? "uncertain" : ""}`;
+      text.className = "caption-text";
       appendHighlightedText(text, caption.text, query);
       const state = document.createElement("span");
       state.className = "empty-state";
-      state.textContent = caption.uncertain ? "불확실" : "";
+      state.textContent = caption.uncertain && !caption.review_required ? "시간 대략" : "";
       row.append(time, text, state);
       fragment.append(row);
     }
@@ -601,21 +602,23 @@
       const item = await authenticatedDocumentRequest(`/v1/documents/${encodeURIComponent(documentId)}`, controller.signal);
       if (controller !== documentsRequestController) return;
       const segments = Array.isArray(item?.transcript?.segments) ? item.transcript.segments : [];
+      const hasSummarizableText = segments.some((segment) => !segment.review_required && String(segment.text || "").trim()) || (segments.length === 0 && Boolean(String(item?.transcript?.text || "").trim()));
       const transcript = item?.transcript?.text || segments
         .map((segment) => `[${Core.formatClock(segment.start_ms || 0)}] ${segment.text || ""}`)
         .join("\n");
       const summary = item?.summary?.summary || (typeof item?.summary === "string" ? item.summary : "");
       const missingCount = item?.chunk_state?.missing_sequences?.length || 0;
       const gapCount = item?.missing_time_ranges?.length || 0;
+      const unverifiedCount = item?.chunk_state?.unverified_sequences?.length || 0;
       const incomplete = item?.status === "incomplete";
       elements.documentTitle.textContent = item?.source?.title || "제목 없는 강의";
       elements.documentMeta.textContent = `${documentStatusLabel(item?.status)} · ${formatDocumentDate(item?.updated_at || item?.requested_at)}`;
       elements.documentSummaryHeading.textContent = incomplete && summary ? "부분 요약" : "요약";
       elements.documentCoverage.hidden = !incomplete;
       elements.documentCoverage.textContent = incomplete
-        ? `자막 누락 청크 ${missingCount}개 · 녹음 중단 구간 ${gapCount}개. 확보된 자막만 요약할 수 있습니다.`
+        ? `자막 누락 청크 ${missingCount}개 · 전사 확인 필요 ${unverifiedCount}개 · 녹음 중단 구간 ${gapCount}개. 확보된 자막만 요약할 수 있습니다.`
         : "";
-      elements.retryPartialSummaryButton.hidden = !incomplete || Boolean(summary) || !transcript.trim() || item?.resume_status !== "available";
+      elements.retryPartialSummaryButton.hidden = !incomplete || Boolean(summary) || !hasSummarizableText || item?.resume_status !== "available";
       elements.retryPartialSummaryButton.dataset.sessionId = item?.session_id || "";
       elements.retryPartialSummaryButton.dataset.documentId = item?.document_id || "";
       elements.retryPartialSummaryButton.dataset.expectedCount = String(item?.chunk_state?.expected_chunk_count || 0);
@@ -702,7 +705,7 @@
   }
 
   elements.startButton.addEventListener("click", () => {
-    const processingPreserved = !snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state);
+    const processingPreserved = !snapshot.hasStream && (snapshot.queueCount > 0 || snapshot.finalizePending || snapshot.reviewCount > 0) && [SESSION_STATE.STOPPED, SESSION_STATE.ERROR, SESSION_STATE.PAUSED_ACTION].includes(snapshot.state);
     const action = processingPreserved
       ? processPreservedChunks
       : (snapshot.recoveryRequired && snapshot.hasStream && snapshot.state === SESSION_STATE.PAUSED_ACTION)

@@ -66,6 +66,7 @@ class ChunkResponse(BaseModel):
     sequence: int
     segments: list[TranscriptSegment]
     acked: bool = True
+    review_required: bool = False
 
 
 class SummaryResponse(BaseModel):
@@ -100,6 +101,7 @@ class ArchiveResponse(BaseModel):
     document_id: str | None = None
     chunk_count: int
     missing_sequences: list[int] = Field(default_factory=list)
+    unverified_sequences: list[int] = Field(default_factory=list)
     missing_time_ranges: list[dict[str, Any]] = Field(default_factory=list)
     summary: SummaryResponse | None = None
 
