@@ -5,8 +5,8 @@
   const Discard = LectureDiscard;
   const Config = LectureConfig;
 
-  const DEFAULT_WINDOW_MS = 60_000;
-  const DEFAULT_OVERLAP_MS = 2_000;
+  const DEFAULT_WINDOW_MS = 15_000;
+  const DEFAULT_OVERLAP_MS = 1_000;
   const MIN_PARTIAL_CHUNK_MS = 1_000;
   const SOFT_LIMIT = 96 * 1024 * 1024;
   const HARD_LIMIT = Config.OUTBOX_MAX_BYTES;
@@ -40,6 +40,7 @@
       stream: null,
       audioContext: null,
       sourceNode: null,
+      analyserNode: null,
       mimeType: "",
       windowMs: DEFAULT_WINDOW_MS,
       windowIntervalMs: DEFAULT_WINDOW_MS - DEFAULT_OVERLAP_MS,
@@ -417,7 +418,10 @@
 
     session.audioContext = new AudioContext();
     session.sourceNode = session.audioContext.createMediaStreamSource(session.stream);
-    session.sourceNode.connect(session.audioContext.destination);
+    session.analyserNode = session.audioContext.createAnalyser();
+    session.analyserNode.fftSize = 2048;
+    session.sourceNode.connect(session.analyserNode);
+    session.analyserNode.connect(session.audioContext.destination);
     await session.audioContext.resume();
   }
 
@@ -483,6 +487,10 @@
       videoStartMs: Math.round(estimateVideoTimeMs()),
       playbackRate: Number(session.videoState?.playbackRate) || 1,
       overlapMs: firstAfterReset ? 0 : session.overlapMs,
+      activitySamples: 0,
+      audibleSamples: 0,
+      failedActivitySamples: 0,
+      activityTimer: null,
       stopTimer: null,
       donePromise: deferred.promise,
       resolveDone: deferred.resolve
@@ -499,6 +507,26 @@
 
     session.activeRecorders.set(sequence, context);
     recorder.start();
+    if (session.analyserNode) {
+      const waveform = new Float32Array(session.analyserNode.fftSize);
+      const sample = () => {
+        try {
+          session.analyserNode.getFloatTimeDomainData(waveform);
+          let squared = 0;
+          let peak = 0;
+          for (const value of waveform) {
+            squared += value * value;
+            peak = Math.max(peak, Math.abs(value));
+          }
+          context.activitySamples += 1;
+          if (Math.sqrt(squared / waveform.length) >= 0.001 || peak >= 0.005) context.audibleSamples += 1;
+        } catch {
+          context.failedActivitySamples += 1;
+        }
+      };
+      sample();
+      context.activityTimer = setInterval(sample, 50);
+    }
     context.stopTimer = setTimeout(() => stopRecorder(context), session.windowMs);
     broadcastSnapshot();
   }
@@ -506,6 +534,8 @@
   function stopRecorder(context) {
     if (!context) return;
     clearTimeout(context.stopTimer);
+    if (context.activityTimer) clearInterval(context.activityTimer);
+    context.activityTimer = null;
     if (context.recorder.state !== "inactive") {
       try {
         context.recorder.stop();
@@ -517,6 +547,7 @@
 
   async function finalizeRecorder(context) {
     clearTimeout(context.stopTimer);
+    if (context.activityTimer) clearInterval(context.activityTimer);
     session.activeRecorders.delete(context.sequence);
     const captureEndMs = Math.max(context.captureStartMs, Math.round(performance.now() - session.captureOriginPerf));
     const durationMs = captureEndMs - context.captureStartMs;
@@ -544,6 +575,7 @@
         videoStartMs: context.videoStartMs,
         playbackRate: context.playbackRate,
         overlapMs: context.overlapMs,
+        audioSignalStatus: Core.classifyAudioActivity(context.activitySamples, context.audibleSamples, durationMs, context.failedActivitySamples),
         mimeType: blob.type || session.mimeType,
         unavailableAttempts: 0,
         state: oversized ? "NEEDS_ACTION" : "PENDING",
@@ -785,6 +817,7 @@
     form.append("video_start_ms", String(chunk.videoStartMs));
     form.append("playback_rate", String(chunk.playbackRate));
     form.append("overlap_ms", String(chunk.overlapMs));
+    form.append("audio_signal_status", chunk.audioSignalStatus || "unknown");
     form.append("mime_type", chunk.mimeType);
 
     const response = await fetchWithTimeout(
@@ -1161,6 +1194,10 @@
       session.sourceNode?.disconnect();
     } catch {}
     session.sourceNode = null;
+    try {
+      session.analyserNode?.disconnect();
+    } catch {}
+    session.analyserNode = null;
     if (session.audioContext && session.audioContext.state !== "closed") {
       try {
         await session.audioContext.close();

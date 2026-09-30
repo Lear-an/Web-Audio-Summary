@@ -12,7 +12,7 @@ import uuid
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import Depends, FastAPI, File, Form, Header, Request, UploadFile
@@ -94,7 +94,7 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
         "schema_version": 8, "document_id": draft["document_id"], "session_id": session_id, "owner_id": owner_id,
         "status": status, "source": {"url": _canonical_url(draft.get("source_url", "")), "canonical_url": draft.get("canonical_url", ""), "url_hash": draft.get("source_url_hash", ""), "host": draft.get("source_host", ""), "video_id": draft.get("source_video_id", ""), "title": (archive.source_title if archive else "") or draft.get("source_title", "")},
         "requested_at": draft.get("created_at", now), "updated_at": now, "completed_at": now if status == "completed" else None,
-        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or []},
+        "language": draft.get("language", "auto"), "transcript": {"segments": segments, "text": transcript_text, "ready_chunk_count": len(chunks), "last_applied_sequence": max((int(row["sequence"]) for row in chunks), default=-1), "expected_chunk_count": expected, "missing_sequences": missing or []},
         "chunk_state": {"ready_count": len(chunks), "expected_chunk_count": expected, "missing_sequences": missing or [], "missing_time_ranges": gaps},
         "missing_time_ranges": gaps,
         "summary_status": "completed" if status == "completed" or (keep_partial_summary and (existing or {}).get("summary")) else ("processing" if status == "finalize_pending" else "not_run"),
@@ -107,9 +107,23 @@ async def _write_partial(owner_id: str, session_id: str, *, status: str = "incom
     }
     if summary_meta is not None:
         value["summary_provider"] = {**summary_meta, "requested_model": settings.openai_text_model, "prompt_version": "summary-v2", "schema_version": 1}
-    encoded = json.dumps(value, default=str, ensure_ascii=False).encode("utf-8")
-    if len(encoded) > settings.max_document_bytes: raise ApiError(413, "document_too_large", "문서 크기가 Atlas 저장 한도를 초과합니다.")
+    value["document_bytes"] = 0
+    for _ in range(3):
+        value["document_bytes"] = len(json.dumps(value, default=str, ensure_ascii=False).encode("utf-8"))
+    if value["document_bytes"] > settings.max_document_bytes: raise ApiError(413, "document_too_large", "문서 크기가 Atlas 저장 한도를 초과합니다.")
     return await store.upsert_document(value)
+
+
+async def _append_ready_partial(owner_id: str, session_id: str, sequence: int, chunk: dict[str, Any]) -> None:
+    if sequence == 0:
+        await _write_partial(owner_id, session_id)
+        return
+    segments = _absolute_segments([chunk])
+    chunk_text = "\n".join(value["text"] for value in segments)
+    delta_bytes = len(json.dumps(segments, ensure_ascii=False).encode("utf-8")) + len(chunk_text.encode("utf-8")) + 128
+    appended = await store.append_document_chunk(owner_id, session_id, sequence, segments, chunk_text, delta_bytes, settings.max_document_bytes)
+    if not appended:
+        await _write_partial(owner_id, session_id)
 
 
 def _capture_gaps(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -390,6 +404,29 @@ def _absolute_segments(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _trim_repeated_prefix(previous_text: str, current_text: str) -> str:
+    previous_words = re.findall(r"\S+", previous_text)
+    current_words = list(re.finditer(r"\S+", current_text))
+    normalized_previous = [re.sub(r"\W+", "", word).casefold() for word in previous_words]
+    normalized_current = [re.sub(r"\W+", "", match.group()).casefold() for match in current_words]
+    for count in range(min(len(previous_words), len(current_words), 8), 0, -1):
+        repeated = normalized_current[:count]
+        if count < len(current_words) and (count >= 2 or sum(map(len, repeated)) >= 8) and all(repeated) and normalized_previous[-count:] == repeated:
+            return current_text[current_words[count].start():].strip()
+    return current_text
+
+
+def _dedupe_chunk_boundary(segments: list[dict[str, Any]], previous: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not segments or not previous or not segments[0].get("uncertain"):
+        return segments
+    prior_segments = previous.get("segments") or []
+    if not prior_segments:
+        return segments
+    first = dict(segments[0])
+    first["text"] = _trim_repeated_prefix(str(prior_segments[-1].get("text") or ""), str(first.get("text") or ""))
+    return ([first] if first["text"] else []) + segments[1:]
+
+
 def _provider_error(exc: Exception, chunk_id: str | None = None) -> ApiError:
     if isinstance(exc, OpenAIQuotaExhaustedError): return ApiError(429, "openai_quota_exhausted", str(exc), retryable=False, action="contact_operator", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
     if isinstance(exc, OpenAIRateLimitError): return ApiError(429, "openai_rate_limited", str(exc), retryable=True, action="retry_later", chunk_id=chunk_id, retry_after_seconds=exc.retry_after_seconds)
@@ -438,7 +475,7 @@ async def resume_session(session_id: str, _payload: SessionResumeRequest, user: 
 
 
 @app.post("/v1/sessions/{session_id}/chunks", response_model=ChunkResponse)
-async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], capture_start_ms: Annotated[int, Form(ge=0)], capture_end_ms: Annotated[int, Form(ge=1)], video_start_ms: Annotated[int, Form(ge=0)], playback_rate: Annotated[float, Form(gt=0, le=16)], overlap_ms: Annotated[int, Form(ge=0)], mime_type: Annotated[str, Form()], audio: Annotated[UploadFile, File()], user: AuthenticatedUser = Depends(authorize)) -> ChunkResponse:
+async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], capture_start_ms: Annotated[int, Form(ge=0)], capture_end_ms: Annotated[int, Form(ge=1)], video_start_ms: Annotated[int, Form(ge=0)], playback_rate: Annotated[float, Form(gt=0, le=16)], overlap_ms: Annotated[int, Form(ge=0)], mime_type: Annotated[str, Form()], audio: Annotated[UploadFile, File()], audio_signal_status: Annotated[Literal["quiet", "non_silent", "unknown"], Form()] = "unknown", user: AuthenticatedUser = Depends(authorize)) -> ChunkResponse:
     record = await _active_record(user, session_id); audio_bytes = await audio.read(settings.max_chunk_bytes + 1)
     if not audio_bytes or len(audio_bytes) > settings.max_chunk_bytes: raise ApiError(413, "chunk_too_large", "오디오 청크가 비어 있거나 너무 큽니다.", action="keep_chunk")
     duration_ms = capture_end_ms - capture_start_ms
@@ -454,7 +491,7 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
             await _write_partial(user.user_id, session_id)
             return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in old.get("segments", [])])
         if sequence != expected: raise ApiError(409, "sequence_gap", f"다음 청크 순번은 {expected}입니다.", retryable=True, action="retry_in_order", chunk_id=chunk_id)
-        claim = {"owner_id": user.user_id, "session_id": session_id, "sequence": sequence, "audio_sha256": digest, "attempt_id": str(uuid.uuid4()), "lease_until": _lease_until(settings.processing_lease_seconds), "capture_start_ms": capture_start_ms, "capture_end_ms": capture_end_ms, "media_start_ms": video_start_ms, "playback_rate": playback_rate, "overlap_ms": overlap_ms, "mime_type": mime_type}
+        claim = {"owner_id": user.user_id, "session_id": session_id, "sequence": sequence, "audio_sha256": digest, "attempt_id": str(uuid.uuid4()), "lease_until": _lease_until(settings.processing_lease_seconds), "capture_start_ms": capture_start_ms, "capture_end_ms": capture_end_ms, "media_start_ms": video_start_ms, "playback_rate": playback_rate, "overlap_ms": overlap_ms, "mime_type": mime_type, "audio_signal_status": audio_signal_status}
         state, cached = await store.claim_chunk(claim, now)
         if state == "conflict": raise ApiError(409, "chunk_conflict", "같은 순번의 청크 내용이 다릅니다.", action="keep_chunk")
         if state == "busy": raise ApiError(409, "chunk_processing", "같은 청크가 이미 처리 중입니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
@@ -463,27 +500,41 @@ async def process_chunk(session_id: str, sequence: Annotated[int, Form(ge=0)], c
                 await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
             await _write_partial(user.user_id, session_id)
             return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(v) for v in cached.get("segments", [])])
-        try:
-            await _check_daily_budget(user.user_id, duration_ms, chunk_id)
-        except ApiError as error:
-            await store.finish_chunk(claim, {"status": "blocked", "last_error": error.code})
-            raise
-        try:
-            await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
-        except TimeoutError:
-            await store.finish_chunk(claim, {"status": "retry_wait", "last_error": "ai_backpressure"}); raise ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=15)
-        try:
-            result = await gateway.transcribe(audio_bytes=audio_bytes, mime_type=mime_type, sequence=sequence, duration_ms=duration_ms, safety_identifier=_safety_id(user.user_id), language_hint=record.language)
-        except Exception as exc:
-            error = _provider_error(exc, chunk_id); await store.record_provider_state(error.code, error.retry_after_seconds); await store.finish_chunk(claim, {"status": "retry_wait" if error.retryable else "blocked", "last_error": error.code}); raise error from exc
-        finally: openai_slots.release()
+        for transcription_attempt in range(2):
+            try:
+                await _check_daily_budget(user.user_id, duration_ms, chunk_id)
+            except ApiError as error:
+                await store.finish_chunk(claim, {"status": "blocked", "last_error": error.code})
+                raise
+            try:
+                await asyncio.wait_for(openai_slots.acquire(), timeout=settings.openai_queue_wait_seconds)
+            except TimeoutError:
+                await store.finish_chunk(claim, {"status": "retry_wait", "last_error": "ai_backpressure"}); raise ApiError(503, "ai_backpressure", "AI 처리 대기열이 가득 찼습니다.", retryable=True, action="keep_chunk", chunk_id=chunk_id, retry_after_seconds=15)
+            provider_exception = None
+            try:
+                result = await gateway.transcribe(audio_bytes=audio_bytes, mime_type=mime_type, sequence=sequence, duration_ms=duration_ms, safety_identifier=_safety_id(user.user_id), language_hint=record.language)
+            except Exception as exc:
+                provider_exception = exc
+            finally:
+                openai_slots.release()
+            await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": duration_ms, "transcription_requests": 1})
+            if provider_exception is not None:
+                error = _provider_error(provider_exception, chunk_id); await store.record_provider_state(error.code, error.retry_after_seconds); await store.finish_chunk(claim, {"status": "retry_wait" if error.retryable else "blocked", "last_error": error.code}); raise error from provider_exception
+            if result.original_text.strip() or audio_signal_status == "quiet":
+                break
+            if transcription_attempt == 1:
+                await store.finish_chunk(claim, {"status": "blocked", "last_error": "empty_transcript_unverified"})
+                raise ApiError(422, "empty_transcript_unverified", "전사 확인 필요: 전사 결과가 두 번 비었습니다. 원본을 보존하고 확인해 주세요.", action="keep_chunk", chunk_id=chunk_id)
         segments = [v.model_dump() for v in result.transcript.segments]
-        saved = await store.finish_chunk(claim, {"status": "ready", "segments": segments, "detected_language": result.language, "original_text": result.original_text, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-v1", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
+        previous = await store.get_chunk(user.user_id, session_id, sequence - 1) if sequence else None
+        segments = _dedupe_chunk_boundary(segments, previous)
+        saved = await store.finish_chunk(claim, {"status": "ready", "segments": segments, "timestamp_uncertain": True, "silence_confirmed": not result.original_text.strip() and audio_signal_status == "quiet", "detected_language": result.language, "original_text": result.original_text, "provider_request_id": result.provider_request_id, "requested_model": settings.openai_transcribe_model, "resolved_model": result.resolved_model, "prompt_version": "transcribe-gpt-v1", "schema_version": 1, "usage": result.usage, "updated_at": utcnow(), "lease_until": None})
         if not saved:
             raise ApiError(409, "chunk_processing", "다른 처리 시도가 이 청크를 갱신했습니다.", retryable=True, action="retry_later", chunk_id=chunk_id)
-        await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1}); await _write_partial(user.user_id, session_id)
-        await store.record_usage(user.user_id, utcnow().date().isoformat(), {"audio_ms": duration_ms, "transcription_requests": 1})
-        return ChunkResponse(session_id=session_id, sequence=sequence, segments=result.transcript.segments)
+        await store.update_session(user.user_id, session_id, {"status": "processing", "next_sequence": sequence + 1})
+        ready_chunk = {**claim, "segments": segments, "sequence": sequence}
+        await _append_ready_partial(user.user_id, session_id, sequence, ready_chunk)
+        return ChunkResponse(session_id=session_id, sequence=sequence, segments=[TranscriptSegment.model_validate(value) for value in segments])
 
 
 async def _summarize_incomplete(owner_id: str, session_id: str, document: dict[str, Any]) -> dict[str, Any]:

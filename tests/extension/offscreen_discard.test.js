@@ -151,3 +151,46 @@ test("archive retries a retryable server failure before completing", async () =>
   assert.equal(attempts, 2);
   assert.deepEqual(removed, ["session:session"]);
 });
+
+test("unverified empty transcript keeps the original chunk for user action", async () => {
+  const removed = [];
+  const states = [];
+  const context = vm.createContext({
+    AbortController, Blob, FormData, clearTimeout, setTimeout, performance, URL,
+    LectureConfig: { SERVER_BASE_URL: "https://example.test", OUTBOX_MAX_BYTES: 128 * 1024 * 1024 },
+    LectureDiscard: {},
+    LectureOutbox: {
+      updateState: async (_id, state) => states.push(state),
+      remove: async (id) => removed.push(id)
+    },
+    chrome: { runtime: { onMessage: { addListener: () => {} }, sendMessage: async () => ({ ok: true }) } },
+    fetch: async (_url, options) => {
+      assert.equal(options.body.get("audio_signal_status"), "non_silent");
+      return {
+        ok: false, status: 422,
+        json: async () => ({ error: { code: "empty_transcript_unverified", message: "전사 확인 필요", retryable: false } }),
+        headers: { get: () => null }
+      };
+    }
+  });
+  const extension = path.resolve(__dirname, "../../extension");
+  vm.runInContext(fs.readFileSync(path.join(extension, "protocol.js"), "utf8"), context);
+  vm.runInContext(fs.readFileSync(path.join(extension, "core.js"), "utf8"), context);
+  const source = fs.readFileSync(path.join(extension, "offscreen.js"), "utf8");
+  const instrumented = source.replace(/\}\)\(\);\s*$/, "globalThis.__setSessionForTest = (patch) => Object.assign(session, patch);\nglobalThis.__processQueueForTest = processQueue;\nglobalThis.__snapshotForTest = publicSnapshot;\n})();");
+  vm.runInContext(instrumented, context);
+  const blob = new Blob(["audio"], { type: "audio/webm" });
+  context.__setSessionForTest({
+    state: context.LectureProtocol.SESSION_STATE.CAPTURING,
+    serverSessionId: "session", serverBaseUrl: "https://example.test", userId: "user", accessToken: "code",
+    captureOriginPerf: performance.now() - 1000,
+    queue: [{ id: "session:0", sequence: 0, blob, durationMs: 15_000, captureStartMs: 0, captureEndMs: 15_000, videoStartMs: 0, playbackRate: 1, overlapMs: 0, mimeType: "audio/webm", audioSignalStatus: "non_silent" }],
+    queuedBytes: blob.size
+  });
+  await context.__processQueueForTest();
+  const snapshot = context.__snapshotForTest();
+  assert.equal(snapshot.state, "PAUSED_ACTION");
+  assert.equal(snapshot.queueCount, 1);
+  assert.deepEqual(states, ["SENDING", "NEEDS_ACTION"]);
+  assert.deepEqual(removed, []);
+});

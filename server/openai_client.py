@@ -165,7 +165,7 @@ class OpenAIGateway:
                             relative_end_ms=max(1, duration_ms),
                             text=text,
                             original_text=text,
-                            uncertain=False,
+                            uncertain=True,
                         )
                     ]
                 ),
@@ -177,41 +177,37 @@ class OpenAIGateway:
             )
 
         async def request() -> Any:
+            english_hint = language_hint in {"en", "eng", "english"}
             kwargs: dict[str, Any] = {
                 "file": (f"chunk-{sequence:06d}.webm", audio_bytes, mime_type),
                 "model": self.settings.openai_transcribe_model,
-                "response_format": "verbose_json",
-                "timestamp_granularities": ["segment"],
+                "prompt": "Transcribe this lecture accurately. Preserve spoken technical terms, product names, and acronyms. Do not guess inaudible words." if english_hint else (
+                    "한국어 강의를 정확히 전사하세요. 발화한 영어 기술 용어, 제품명, 약어는 원문 표기를 유지하세요. "
+                    "들리지 않는 내용은 추측하지 마세요."
+                ),
             }
-            if language_hint and language_hint not in {"auto", "mixed"}:
-                kwargs["language"] = language_hint
+            languages = ["ko", "en"] if language_hint in {"auto", "mixed", "ko", "kor", "korean"} else [language_hint]
+            kwargs["extra_body"] = {"languages": languages}
             return await asyncio.wait_for(
                 self.client.audio.transcriptions.create(**kwargs),
                 timeout=self.settings.openai_transcribe_timeout_seconds,
             )
 
         response = await self._with_retry(request)
-        text = str(_value(response, "text", "") or "").strip()
-        language = str(_value(response, "language", "unknown") or "unknown").lower()
-        raw_segments = _value(response, "segments", []) or []
-        segments: list[TranscriptSegment] = []
-        for raw in raw_segments:
-            segment_text = str(_value(raw, "text", "") or "").strip()
-            if not segment_text:
-                continue
-            start_ms = max(0, round(float(_value(raw, "start", 0) or 0) * 1000))
-            end_ms = min(duration_ms, max(start_ms, round(float(_value(raw, "end", 0) or 0) * 1000)))
-            segments.append(
-                TranscriptSegment(
-                    relative_start_ms=start_ms,
-                    relative_end_ms=end_ms,
-                    text=segment_text,
-                    original_text=segment_text,
-                    uncertain=False,
-                )
-            )
-        if not segments and text:
-            segments = [
+        raw_text = _value(response, "text")
+        detected = _value(response, "languages")
+        if not isinstance(raw_text, str) or not isinstance(detected, list):
+            raise OpenAIInvalidResponseError("전사 응답의 text 또는 languages 형식이 잘못되었습니다.")
+        codes: list[str] = []
+        for item in detected:
+            code = _value(item, "code")
+            if not isinstance(code, str) or not code.strip():
+                raise OpenAIInvalidResponseError("전사 응답의 언어 코드 형식이 잘못되었습니다.")
+            codes.append(code.strip().lower())
+        text = raw_text.strip()
+        language = "ko" if "ko" in codes else (codes[0] if len(codes) == 1 else "unknown")
+        segments = (
+            [
                 TranscriptSegment(
                     relative_start_ms=0,
                     relative_end_ms=max(1, duration_ms),
@@ -220,8 +216,10 @@ class OpenAIGateway:
                     uncertain=True,
                 )
             ]
+            if text else []
+        )
         transcript = TranscriptPayload(segments=segments)
-        if language not in {"ko", "kor", "korean"} and segments:
+        if language not in {"ko", "unknown"} and segments:
             transcript = await self.translate(transcript, language, safety_identifier)
         return TranscriptionResult(
             transcript=transcript,

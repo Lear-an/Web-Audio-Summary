@@ -131,3 +131,10 @@ test("queueDrainTimeoutMs scales between five and fifteen minutes", () => {
   assert.equal(Core.queueDrainTimeoutMs(6), 360_000);
   assert.equal(Core.queueDrainTimeoutMs(20), 900_000);
 });
+
+test("classifyAudioActivity accepts only sufficiently sampled quiet audio", () => {
+  assert.equal(Core.classifyAudioActivity(240, 0, 15_000), "quiet");
+  assert.equal(Core.classifyAudioActivity(240, 1, 15_000), "non_silent");
+  assert.equal(Core.classifyAudioActivity(3, 0, 15_000), "unknown");
+  assert.equal(Core.classifyAudioActivity(240, 0, 15_000, 1), "unknown");
+});
